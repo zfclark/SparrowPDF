@@ -37,7 +37,33 @@ pub fn spawn(id: ToolId, request: ToolRequest) -> WorkerHandle {
         .spawn(move || {
             let tool = crate::tools::tool_for(id);
             let progress = Progress::new(tx.clone());
-            let result = run_tool(tool.as_ref(), &request, &progress, &cancel_for_thread);
+            // A panicking tool must not silently swallow the failure (the UI
+            // would wait for a Finished message that never arrives): catch
+            // the unwind, log it and turn it into a visible error.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_tool(tool.as_ref(), &request, &progress, &cancel_for_thread)
+            }))
+            .unwrap_or_else(|panic| {
+                let detail = panic_detail(panic.as_ref());
+                crate::engine::logging::log(
+                    "ERROR",
+                    &format!("工作线程崩溃（{}）：{detail}", id),
+                );
+                Err(crate::model::ToolError::Internal {
+                    detail: format!("处理过程中发生内部错误，已中断（详情见日志）：{detail}"),
+                })
+            });
+            match &result {
+                Ok(outcome) => {
+                    crate::engine::logging::log("INFO", &format!("任务完成（{id}）：{}", outcome.summary));
+                    for output in &outcome.outputs {
+                        crate::engine::logging::log("INFO", &format!("输出文件：{}", output.display()));
+                    }
+                }
+                Err(err) => {
+                    crate::engine::logging::log("ERROR", &format!("任务失败（{id}）：{err}"));
+                }
+            }
             let _ = tx.send(WorkerMsg::Finished(result));
         });
 
@@ -46,6 +72,17 @@ pub fn spawn(id: ToolId, request: ToolRequest) -> WorkerHandle {
     let _ = join;
 
     WorkerHandle { receiver: rx, cancel }
+}
+
+/// Best-effort panic payload extraction for logging.
+fn panic_detail(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Run a tool, converting a cancellation request into a cancelled result.

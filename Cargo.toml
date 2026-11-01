@@ -1,6 +1,6 @@
 [package]
 name = "sparrowpdf"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
@@ -28,7 +28,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
 
 [profile.release]
-panic = "abort"
+# Unwinding is required so the worker thread can catch tool panics and turn
+# them into visible, logged errors instead of crashing the whole app.
+panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "z"

@@ -61,21 +61,30 @@ impl Tool for FolderToPdf {
         progress: &Progress,
         cancel: &CancelFlag,
     ) -> Result<ToolOutcome, ToolError> {
-        let (mode, force, use_merge_spec, spec, auto_rotate) = match &req.options {
+        let (mode, force, pair_orientation, use_merge_spec, spec, auto_rotate) = match &req.options {
             ToolOptions::FolderToPdf {
                 mode,
                 force_orientation,
+                pair_orientation,
                 use_merge_spec,
                 merge_spec,
                 auto_rotate,
             } => (
                 *mode,
                 *force_orientation,
+                *pair_orientation,
                 *use_merge_spec,
                 merge_spec.clone(),
                 *auto_rotate,
             ),
-            _ => (BatchPageMode::Single, None, false, String::new(), true),
+            _ => (
+                BatchPageMode::Single,
+                None,
+                Orientation::Landscape,
+                false,
+                String::new(),
+                true,
+            ),
         };
 
         // Empty output path = default: each PDF lands inside its own folder.
@@ -138,14 +147,29 @@ impl Tool for FolderToPdf {
                     plan,
                     &images,
                     force,
+                    pair_orientation,
                     auto_rotate,
                 )?;
             }
 
             let out_path = output_path(folder, out_root.as_deref(), &mut used_names);
-            pdf_io::save_document(&mut doc, &out_path)?;
-            let expected = plans.len() as u32;
-            crate::engine::validate::assert_page_count(&out_path, expected, None)?;
+            // One unwritable / locked output must not discard the folders
+            // that do succeed: record, log, continue — surfaced as
+            // PartialSuccess at the end.
+            let saved = pdf_io::save_document(&mut doc, &out_path).and_then(|_| {
+                crate::engine::validate::assert_page_count(&out_path, plans.len() as u32, None)
+            });
+            if let Err(err) = saved {
+                crate::engine::logging::log(
+                    "ERROR",
+                    &format!("写入输出失败：{}（{err}）", out_path.display()),
+                );
+                skipped.push((
+                    folder.display_name(),
+                    format!("写入失败：{err}"),
+                ));
+                continue;
+            }
 
             outputs.push(out_path);
             total_images += images.len();
@@ -286,11 +310,45 @@ fn sequential_pairs(count: usize) -> Vec<PagePlan> {
         .collect()
 }
 
+/// Output page number (1-based) of each image, for the thumbnail preview.
+///
+/// Lenient on purpose: an invalid merge spec falls back to sequential
+/// pairing so the preview keeps working while the user types — the run
+/// itself reports the exact error.
+pub fn preview_page_numbers(
+    count: usize,
+    two_per_page: bool,
+    use_merge_spec: bool,
+    merge_spec: &str,
+) -> Vec<usize> {
+    let plans = if !two_per_page {
+        single_page_plans(count)
+    } else if use_merge_spec && !merge_spec.trim().is_empty() {
+        parse_merge_spec(merge_spec, count).unwrap_or_else(|_| sequential_pairs(count))
+    } else {
+        sequential_pairs(count)
+    };
+    let mut numbers = vec![0usize; count];
+    for (page_index, plan) in plans.iter().enumerate() {
+        match *plan {
+            PagePlan::One(i) => numbers[i] = page_index + 1,
+            PagePlan::Two(a, b) => {
+                numbers[a] = page_index + 1;
+                numbers[b] = page_index + 1;
+            }
+        }
+    }
+    numbers
+}
+
 /// Parse the merge spec (`1-2,5-6`) into page plans.
 ///
 /// * `A-B` puts images A and B on one page (order-agnostic, 1-based).
 /// * `N` keeps image N alone.
 /// * Images not mentioned in the spec are appended as single-image pages.
+/// * Plans are ordered by the earliest image they contain, so output pages
+///   follow the original image sequence (spec `2-3` yields pages
+///   [1], [2+3], [4], …) instead of jumping to the spec pairs first.
 fn parse_merge_spec(spec: &str, count: usize) -> Result<Vec<PagePlan>, ToolError> {
     let mut plans: Vec<PagePlan> = Vec::new();
     let mut used = vec![false; count];
@@ -344,6 +402,11 @@ fn parse_merge_spec(spec: &str, count: usize) -> Result<Vec<PagePlan>, ToolError
             plans.push(PagePlan::One(idx));
         }
     }
+    // Keep output pages in the images' own order, merges inline.
+    plans.sort_by_key(|plan| match plan {
+        PagePlan::One(i) => *i,
+        PagePlan::Two(a, _) => *a,
+    });
     Ok(plans)
 }
 
@@ -392,6 +455,7 @@ fn render_page(
     plan: &PagePlan,
     images: &[PathBuf],
     force: Option<Orientation>,
+    pair_orientation: Orientation,
     auto_rotate: bool,
 ) -> Result<(), ToolError> {
     match plan {
@@ -411,6 +475,7 @@ fn render_page(
                 pages_id,
                 page_index,
                 (&images[*left], &images[*right]),
+                pair_orientation,
                 auto_rotate,
             )?;
         }
@@ -418,20 +483,34 @@ fn render_page(
     Ok(())
 }
 
-/// One landscape A4 page with two portrait slots side by side.
+/// One A4 page with two image slots.
 ///
-/// With `auto_rotate`, a landscape image is turned 90° to fill its portrait
-/// slot (mirroring the single-page auto-rotation interaction).
+/// Landscape pages hold the slots side by side (portrait slots); portrait
+/// pages stack them vertically (landscape slots). With `auto_rotate`, an
+/// image whose orientation conflicts with its slot is turned 90° to fill it.
 fn add_two_image_page(
     doc: &mut Document,
     pages_id: lopdf::ObjectId,
     page_index: usize,
     (left, right): (&Path, &Path),
+    pair_orientation: Orientation,
     auto_rotate: bool,
 ) -> Result<(), ToolError> {
-    let (page_w, page_h) = (A4_HEIGHT, A4_WIDTH);
-    let slot_w = (page_w - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0;
-    let slot_h = page_h - 2.0 * SLOT_MARGIN;
+    let (page_w, page_h) = match pair_orientation {
+        Orientation::Landscape => (A4_HEIGHT, A4_WIDTH),
+        Orientation::Portrait => (A4_WIDTH, A4_HEIGHT),
+    };
+    let (slot_w, slot_h) = match pair_orientation {
+        Orientation::Landscape => (
+            (page_w - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
+            page_h - 2.0 * SLOT_MARGIN,
+        ),
+        Orientation::Portrait => (
+            page_w - 2.0 * SLOT_MARGIN,
+            (page_h - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
+        ),
+    };
+    let slot_is_landscape = slot_w > slot_h;
 
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
@@ -462,8 +541,9 @@ fn add_two_image_page(
             (px_w, px_h)
         };
 
-        // The slot is portrait; a landscape image is rotated 90° to fill it.
-        let rotate = auto_rotate && eff_w > eff_h;
+        // The image is turned when its orientation conflicts with the slot.
+        let image_is_landscape = eff_w > eff_h;
+        let rotate = auto_rotate && image_is_landscape != slot_is_landscape;
         let (fit_w, fit_h) = if rotate {
             (eff_h, eff_w)
         } else {
@@ -473,9 +553,18 @@ fn add_two_image_page(
         let draw_w = fit_w * scale;
         let draw_h = fit_h * scale;
 
-        let slot_x = SLOT_MARGIN + slot as f32 * (slot_w + SLOT_GAP);
+        let (slot_x, slot_y) = match pair_orientation {
+            Orientation::Landscape => (
+                SLOT_MARGIN + slot as f32 * (slot_w + SLOT_GAP),
+                SLOT_MARGIN,
+            ),
+            Orientation::Portrait => (
+                SLOT_MARGIN,
+                SLOT_MARGIN + slot as f32 * (slot_h + SLOT_GAP),
+            ),
+        };
         let x0 = slot_x + (slot_w - draw_w) / 2.0;
-        let y0 = SLOT_MARGIN + (slot_h - draw_h) / 2.0;
+        let y0 = slot_y + (slot_h - draw_h) / 2.0;
 
         let code = if rotate {
             rotate_cw_code(orientation)

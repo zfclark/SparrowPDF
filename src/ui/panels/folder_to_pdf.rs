@@ -26,12 +26,26 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
     });
 
     let folders: Vec<std::path::PathBuf> = form.inputs.iter().map(|f| f.path.clone()).collect();
-    preview::show_folders(ui, &folders, preview_state);
+    let numbering = match form.options_for(tool) {
+        ToolOptions::FolderToPdf {
+            mode,
+            use_merge_spec,
+            merge_spec,
+            ..
+        } => Some(preview::PageNumbering {
+            two_per_page: *mode == BatchPageMode::TwoPerPage,
+            use_merge_spec: *use_merge_spec,
+            merge_spec: merge_spec.clone(),
+        }),
+        _ => None,
+    };
+    preview::show_folders(ui, &folders, numbering.as_ref(), preview_state);
 
     theme::card(ui, "选项", |ui| {
         if let ToolOptions::FolderToPdf {
             mode,
             force_orientation,
+            pair_orientation,
             use_merge_spec,
             merge_spec,
             auto_rotate,
@@ -40,7 +54,7 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
             theme::field_row_hover(
                 ui,
                 "每页布局",
-                "每页一张：每张图片占一页；两图一页：两张图片并排占一个横向页面",
+                "每页一张：每张图片占一页；两图一页：两张图片并排占一个页面",
                 |ui| {
                     ui.radio_value(mode, BatchPageMode::Single, "每页一张");
                     ui.radio_value(mode, BatchPageMode::TwoPerPage, "两图一页");
@@ -70,8 +84,17 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
                 BatchPageMode::TwoPerPage => {
                     theme::field_row_hover(
                         ui,
+                        "页面方向",
+                        "A4 横版：两图左右并排；A4 竖版：两图上下并排",
+                        |ui| {
+                            ui.radio_value(pair_orientation, Orientation::Landscape, "A4 横版");
+                            ui.radio_value(pair_orientation, Orientation::Portrait, "A4 竖版");
+                        },
+                    );
+                    theme::field_row_hover(
+                        ui,
                         "自动旋转",
-                        "两图一页使用横向 A4；横向图片放入竖向半页时自动旋转 90°",
+                        "勾选后，图片方向与半页方向不一致时自动旋转 90° 铺满",
                         |ui| {
                             ui.checkbox(auto_rotate, "方向不匹配时旋转 90°");
                         },
@@ -88,7 +111,7 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
                         theme::field_row_hover(
                             ui,
                             "合并序号",
-                            "格式如 1-2,5-6（序号为上方预览中标注的图片编号）；范围只能包含两张，重复、为 0 或超出图片数量都会报错",
+                            "格式如 1-2,5-6；序号为图片在文件夹中的编号（悬停预览缩略图可见），输出页面按原顺序连续编号",
                             |ui| {
                                 theme::text_input(ui, merge_spec, "如 1-2,5-6");
                             },

@@ -249,6 +249,33 @@ fn extract_text_writes_page_text() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------- logging
+
+#[test]
+fn log_lines_are_appended_to_the_log_file() {
+    // Redirect the log into the workspace so the test does not depend on
+    // AppData being writable from this process.
+    let dir = std::env::var("CARGO_TARGET_TMPDIR")
+        .unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+    std::env::set_var("SPARROW_LOG_DIR", &dir);
+
+    let path = sparrowpdf::engine::logging::log_path();
+    let before = std::fs::read_to_string(&path).unwrap_or_default().lines().count();
+    sparrowpdf::engine::logging::log("TEST", "integration-log-probe");
+    let after = std::fs::read_to_string(&path).unwrap_or_default();
+    let lines: Vec<&str> = after.lines().collect();
+    assert!(
+        lines.len() > before,
+        "log file must gain a line: {}",
+        path.display()
+    );
+    assert!(
+        lines.last().unwrap().contains("integration-log-probe"),
+        "last log line must contain the probe message"
+    );
+    assert!(lines.last().unwrap().contains("[TEST]"));
+}
+
 // ---------------------------------------------------------------- model
 
 #[test]
@@ -498,6 +525,76 @@ fn folder_batch_two_per_page_merges_specified_pairs() {
         .collect();
     assert!((media_box[2] - 841.89).abs() < 0.5, "landscape width");
     assert!((media_box[3] - 595.28).abs() < 0.5, "landscape height");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn preview_page_numbers_renumber_by_output_page() {
+    use sparrowpdf::tools::folder_to_pdf::preview_page_numbers;
+    // Spec "2-3" with 5 images: pages [1], [2+3], [4], [5] — inline order,
+    // continuous page numbers, merged images share one label.
+    assert_eq!(preview_page_numbers(5, true, true, "2-3"), vec![1, 2, 2, 3, 4]);
+    // Unchecked: sequential pairs over everything.
+    assert_eq!(preview_page_numbers(5, true, false, "9-9"), vec![1, 1, 2, 2, 3]);
+    // Single mode: every image its own page, spec ignored.
+    assert_eq!(preview_page_numbers(3, false, true, "1-2"), vec![1, 2, 3]);
+    // Invalid spec: the preview falls back to sequential pairing.
+    assert_eq!(preview_page_numbers(4, true, true, "9"), vec![1, 1, 2, 2]);
+}
+
+#[test]
+fn folder_batch_two_per_page_supports_portrait_pages() {
+    let dir = scratch("folder-portrait");
+    let album = dir.join("portrait-pair");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "1.jpg", 60, 90);
+    make_image(&album, "2.jpg", 60, 90);
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir.clone());
+    if let ToolOptions::FolderToPdf {
+        mode,
+        pair_orientation,
+        ..
+    } = &mut req.options
+    {
+        *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+        *pair_orientation = sparrowpdf::tools::Orientation::Portrait;
+    }
+    let outcome = run(ToolId::FolderToPdf, &req).expect("portrait pair succeeds");
+    assert_eq!(outcome.outputs.len(), 1);
+
+    // Portrait A4 page holding both images (two /Do draw ops).
+    let doc = lopdf::Document::load(&outcome.outputs[0]).unwrap();
+    assert_eq!(doc.get_pages().len(), 1);
+    let page_id = *doc.get_pages().values().next().unwrap();
+    let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    let media_box: Vec<f64> = page
+        .get(b"MediaBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| match o {
+            lopdf::Object::Real(v) => *v as f64,
+            lopdf::Object::Integer(v) => *v as f64,
+            other => panic!("not a number: {other:?}"),
+        })
+        .collect();
+    assert!((media_box[2] - 595.28).abs() < 0.5, "portrait width");
+    assert!((media_box[3] - 841.89).abs() < 0.5, "portrait height");
+    let content_ref = page.get(b"Contents").unwrap().as_reference().unwrap();
+    let content = String::from_utf8(
+        doc.get_object(content_ref)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(content.matches(" Do").count(), 2, "both slots drawn");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

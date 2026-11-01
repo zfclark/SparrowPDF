@@ -32,6 +32,9 @@ pub struct SparrowApp {
     /// `resolve_output` never touches the filesystem more than once per
     /// directory (it runs on every readiness refresh otherwise).
     writable_cache: std::collections::BTreeMap<PathBuf, bool>,
+    /// Chosen fallback directory per unwritable source directory, so the
+    /// decision (and its log line) happens exactly once.
+    fallback_cache: std::collections::BTreeMap<PathBuf, PathBuf>,
     /// Thumbnail preview state shared by the image→PDF panels.
     preview: crate::ui::preview::PreviewState,
 }
@@ -82,6 +85,14 @@ impl SparrowApp {
                 *mode = crate::tools::BatchPageMode::TwoPerPage;
             }
         }
+        if std::env::var("SPARROW_SHOT_PAIRPORTRAIT").is_ok() {
+            if let crate::tools::ToolOptions::FolderToPdf {
+                pair_orientation, ..
+            } = form.options_mut(current)
+            {
+                *pair_orientation = crate::tools::Orientation::Portrait;
+            }
+        }
         if let Ok(spec) = std::env::var("SPARROW_SHOT_MERGESPEC") {
             if let crate::tools::ToolOptions::FolderToPdf {
                 use_merge_spec,
@@ -130,6 +141,7 @@ impl SparrowApp {
             icon: load_icon(&cc.egui_ctx),
             probe,
             writable_cache: std::collections::BTreeMap::new(),
+            fallback_cache: std::collections::BTreeMap::new(),
             preview: crate::ui::preview::PreviewState::new(),
         }
     }
@@ -218,6 +230,27 @@ impl SparrowApp {
             self.states.insert(tool_id, TaskState::Failed { error: err });
             return;
         }
+
+        // Fail fast when the chosen output location cannot be written, so the
+        // user sees a specific message immediately instead of a failure after
+        // processing.
+        if let Err(err) = preflight_output(tool_id, &request) {
+            crate::engine::logging::log(
+                "ERROR",
+                &format!("输出位置预检失败：{err}"),
+            );
+            self.states.insert(tool_id, TaskState::Failed { error: err });
+            return;
+        }
+
+        crate::engine::logging::log(
+            "INFO",
+            &format!(
+                "开始处理（{tool_id}）：输入 {} 项，输出 {}",
+                request.inputs.len(),
+                request.output.display()
+            ),
+        );
 
         self.states.insert(tool_id, TaskState::Ready);
         self.states.insert(
@@ -313,11 +346,7 @@ impl SparrowApp {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let parent = if self.dir_writable(&parent) {
-            parent
-        } else {
-            fallback_output_dir().unwrap_or(parent)
-        };
+        let parent = self.ensure_writable_dir(parent);
 
         if tool_id.is_multi_output() {
             return parent;
@@ -349,6 +378,27 @@ impl SparrowApp {
         let ok = crate::engine::pdf_io::dir_is_writable(dir);
         self.writable_cache.insert(dir.to_path_buf(), ok);
         ok
+    }
+
+    /// Return `dir` if writable, otherwise a (cached, logged-once) fallback.
+    fn ensure_writable_dir(&mut self, dir: PathBuf) -> PathBuf {
+        if self.dir_writable(&dir) {
+            return dir;
+        }
+        if let Some(cached) = self.fallback_cache.get(&dir) {
+            return cached.clone();
+        }
+        let fallback = fallback_output_dir().unwrap_or_else(|| dir.clone());
+        crate::engine::logging::log(
+            "WARN",
+            &format!(
+                "输出目录不可写，自动改存：{} -> {}",
+                dir.display(),
+                fallback.display()
+            ),
+        );
+        self.fallback_cache.insert(dir.clone(), fallback.clone());
+        fallback
     }
 
     /// Accept files dropped onto the window, filtered by the active tool.
@@ -538,6 +588,49 @@ fn home_dir() -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
         std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+/// Fail fast when the resolved output location is not writable.
+///
+/// The folder batch tool with its default (empty) output path writes into
+/// each folder itself; per-folder problems are tolerated and reported by the
+/// tool, so this check skips that case.
+fn preflight_output(
+    tool_id: ToolId,
+    request: &crate::tools::ToolRequest,
+) -> Result<(), ToolError> {
+    if request.output.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let dir = if tool_id.is_multi_output() {
+        request.output.clone()
+    } else {
+        request
+            .output
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+
+    // A not-yet-existing output directory is fine as long as its nearest
+    // existing ancestor is writable (`save_document` creates the rest).
+    let mut probe = dir.clone();
+    while !probe.as_os_str().is_empty() && !probe.is_dir() {
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            None => break,
+        }
+    }
+
+    if crate::engine::pdf_io::dir_is_writable(&probe) {
+        Ok(())
+    } else {
+        Err(ToolError::WriteFailed {
+            path: dir,
+            detail: "没有写入权限：目录可能受系统保护（如 Program Files），或需要管理员权限。请在「输出」中点击「选择输出目录…/选择输出文件…」改存到「文档」或桌面。".to_string(),
+        })
     }
 }
 

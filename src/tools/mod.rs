@@ -47,6 +47,9 @@ pub enum ToolOptions {
         mode: BatchPageMode,
         /// Page orientation for one-image-per-page mode.
         force_orientation: Option<Orientation>,
+        /// Page orientation for two-per-page mode: landscape pages hold the
+        /// two slots side by side, portrait pages stack them vertically.
+        pair_orientation: Orientation,
         /// Whether the two-per-page merge follows the user's explicit
         /// `merge_spec` instead of pairing every image sequentially.
         use_merge_spec: bool,
@@ -118,6 +121,7 @@ impl ToolOptions {
             ToolId::FolderToPdf => ToolOptions::FolderToPdf {
                 mode: BatchPageMode::Single,
                 force_orientation: None,
+                pair_orientation: Orientation::Landscape,
                 use_merge_spec: false,
                 merge_spec: String::new(),
                 auto_rotate: true,
