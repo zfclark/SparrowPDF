@@ -464,11 +464,15 @@ fn folder_batch_two_per_page_merges_specified_pairs() {
 
     let mut req = request(ToolId::FolderToPdf, vec![album], out_dir.clone());
     if let ToolOptions::FolderToPdf {
-        mode, merge_spec, ..
+        mode,
+        use_merge_spec,
+        merge_spec,
+        ..
     } = &mut req.options
     {
         *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
         // Images 2+3 share page 1; 1, 4, 5 stay single -> 4 pages.
+        *use_merge_spec = true;
         *merge_spec = "2-3".to_string();
     }
     let outcome = run(ToolId::FolderToPdf, &req).expect("batch with spec succeeds");
@@ -506,16 +510,58 @@ fn folder_batch_rejects_bad_merge_specs() {
         make_image(&album, name, 40, 20);
     }
 
-    for bad_spec in ["9", "1-3", "0"] {
+    // Empty input counts as a mistake only when the checkbox is checked.
+    for bad_spec in ["9", "1-3", "0", "", "  "] {
         let mut req = request(ToolId::FolderToPdf, vec![album.clone()], dir.join("o.pdf"));
-        if let ToolOptions::FolderToPdf { mode, merge_spec, .. } = &mut req.options {
+        if let ToolOptions::FolderToPdf {
+            mode,
+            use_merge_spec,
+            merge_spec,
+            ..
+        } = &mut req.options
+        {
             *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+            *use_merge_spec = true;
             *merge_spec = bad_spec.to_string();
         }
         match run(ToolId::FolderToPdf, &req) {
             Err(ToolError::InvalidPageRange { .. }) => {}
-            other => panic!("spec {bad_spec:?}: expected InvalidPageRange, got {:?}", other.is_ok()),
+            other => panic!(
+                "spec {bad_spec:?}: expected InvalidPageRange, got {:?}",
+                other.is_ok()
+            ),
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_without_merge_spec_pairs_everything_sequentially() {
+    let dir = scratch("folder-nospec");
+    let album = dir.join("nospec");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg"] {
+        make_image(&album, name, 80, 40);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    // Unchecked: the layout applies to everything — sequential pairs
+    // (1,2) (3,4) (5) — even if a leftover spec string is present.
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir.clone());
+    if let ToolOptions::FolderToPdf {
+        mode,
+        use_merge_spec,
+        merge_spec,
+        ..
+    } = &mut req.options
+    {
+        *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+        *use_merge_spec = false;
+        *merge_spec = "9-9".to_string(); // must be ignored
+    }
+    let outcome = run(ToolId::FolderToPdf, &req).expect("batch without spec succeeds");
+    assert_eq!(outcome.outputs.len(), 1);
+    assert_eq!(pdf_io::page_count_of(&outcome.outputs[0], None).unwrap(), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -116,10 +116,19 @@ pub const CONTROL_H: f32 = 28.0;
 pub const PRIMARY_H: f32 = 32.0;
 /// Height of the empty-input drop zone.
 pub const DROP_H: f32 = 64.0;
-/// Standard width of text / password inputs.
-pub const INPUT_W: f32 = 200.0;
+/// Minimum width of text / password inputs (narrow windows).
+pub const INPUT_MIN_W: f32 = 160.0;
+/// Upper bound so inputs don't stretch absurdly wide; within these bounds the
+/// input fills the remaining form row, which keeps placeholder text fully
+/// visible instead of being cut off with an ellipsis.
+pub const INPUT_MAX_W: f32 = 340.0;
 /// Standard width of numeric (drag) inputs.
 pub const NUMBER_W: f32 = 72.0;
+
+/// Width for a text input on the current form row.
+fn input_width(ui: &Ui) -> f32 {
+    ui.available_width().clamp(INPUT_MIN_W, INPUT_MAX_W)
+}
 
 // ---------------------------------------------------------------- components
 
@@ -259,13 +268,14 @@ fn style_input_scope(ui: &mut Ui) {
 /// one visual treatment.
 pub fn text_input(ui: &mut Ui, text: &mut String, placeholder: &str) -> egui::Response {
     let hint_color = placeholder_color(ui);
+    let width = input_width(ui);
     ui.scope(|ui| {
         style_input_scope(ui);
         ui.add(
             egui::TextEdit::singleline(text)
                 .hint_text(RichText::new(placeholder).color(hint_color))
-                .desired_width(INPUT_W)
-                .min_size(vec2(INPUT_W, CONTROL_H))
+                .desired_width(width)
+                .min_size(vec2(width, CONTROL_H))
                 .margin(Margin::symmetric(8, 0)),
         )
     })
@@ -275,14 +285,15 @@ pub fn text_input(ui: &mut Ui, text: &mut String, placeholder: &str) -> egui::Re
 /// [`text_input`] with masked characters, for password fields.
 pub fn password_input(ui: &mut Ui, text: &mut String, placeholder: &str) -> egui::Response {
     let hint_color = placeholder_color(ui);
+    let width = input_width(ui);
     ui.scope(|ui| {
         style_input_scope(ui);
         ui.add(
             egui::TextEdit::singleline(text)
                 .password(true)
                 .hint_text(RichText::new(placeholder).color(hint_color))
-                .desired_width(INPUT_W)
-                .min_size(vec2(INPUT_W, CONTROL_H))
+                .desired_width(width)
+                .min_size(vec2(width, CONTROL_H))
                 .margin(Margin::symmetric(8, 0)),
         )
     })

@@ -76,6 +76,23 @@ impl SparrowApp {
         for path in &probe.files {
             form.inputs.push(crate::model::InputFile::new(path.clone()));
         }
+        // TEMP probe option presets, for screenshotting specific UI states.
+        if std::env::var("SPARROW_SHOT_TWOPAGE").is_ok() {
+            if let crate::tools::ToolOptions::FolderToPdf { mode, .. } = form.options_mut(current) {
+                *mode = crate::tools::BatchPageMode::TwoPerPage;
+            }
+        }
+        if let Ok(spec) = std::env::var("SPARROW_SHOT_MERGESPEC") {
+            if let crate::tools::ToolOptions::FolderToPdf {
+                use_merge_spec,
+                merge_spec,
+                ..
+            } = form.options_mut(current)
+            {
+                *use_merge_spec = true;
+                *merge_spec = spec;
+            }
+        }
         let mut states = std::collections::BTreeMap::new();
         for id in ToolId::ALL {
             states.insert(id, TaskState::Idle);

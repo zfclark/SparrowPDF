@@ -61,19 +61,21 @@ impl Tool for FolderToPdf {
         progress: &Progress,
         cancel: &CancelFlag,
     ) -> Result<ToolOutcome, ToolError> {
-        let (mode, force, spec, auto_rotate) = match &req.options {
+        let (mode, force, use_merge_spec, spec, auto_rotate) = match &req.options {
             ToolOptions::FolderToPdf {
                 mode,
                 force_orientation,
+                use_merge_spec,
                 merge_spec,
                 auto_rotate,
-            } => (*mode, *force_orientation, merge_spec.clone(), *auto_rotate),
-            _ => (
-                BatchPageMode::Single,
-                None,
-                String::new(),
-                true,
+            } => (
+                *mode,
+                *force_orientation,
+                *use_merge_spec,
+                merge_spec.clone(),
+                *auto_rotate,
             ),
+            _ => (BatchPageMode::Single, None, false, String::new(), true),
         };
 
         // Empty output path = default: each PDF lands inside its own folder.
@@ -108,7 +110,21 @@ impl Tool for FolderToPdf {
 
             let plans = match mode {
                 BatchPageMode::Single => single_page_plans(images.len()),
-                BatchPageMode::TwoPerPage => parse_merge_spec(&spec, images.len())?,
+                BatchPageMode::TwoPerPage => {
+                    if use_merge_spec {
+                        // Checked: only the user-listed images merge; an
+                        // empty spec is a mistake, not a default.
+                        if spec.trim().is_empty() {
+                            return Err(ToolError::InvalidPageRange {
+                                detail: "已勾选「指定合并序号」但未输入序号：请填写（如 1-2,5-6），或取消勾选以按顺序合并".to_string(),
+                            });
+                        }
+                        parse_merge_spec(&spec, images.len())?
+                    } else {
+                        // Unchecked: original behaviour — pair everything.
+                        sequential_pairs(images.len())
+                    }
+                }
             };
 
             let mut doc = Document::with_version("1.7");
@@ -253,6 +269,21 @@ enum PagePlan {
 
 fn single_page_plans(count: usize) -> Vec<PagePlan> {
     (0..count).map(PagePlan::One).collect()
+}
+
+/// Pair every image sequentially: (1,2), (3,4), …; a trailing odd image
+/// stays alone on the last page.
+fn sequential_pairs(count: usize) -> Vec<PagePlan> {
+    (0..count)
+        .step_by(2)
+        .map(|i| {
+            if i + 1 < count {
+                PagePlan::Two(i, i + 1)
+            } else {
+                PagePlan::One(i)
+            }
+        })
+        .collect()
 }
 
 /// Parse the merge spec (`1-2,5-6`) into page plans.

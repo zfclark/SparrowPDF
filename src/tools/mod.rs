@@ -47,8 +47,12 @@ pub enum ToolOptions {
         mode: BatchPageMode,
         /// Page orientation for one-image-per-page mode.
         force_orientation: Option<Orientation>,
-        /// Two-per-page merge spec, e.g. `1-2,5-6` (1-based image numbers).
-        /// Empty means sequential pairs; images outside the spec stay alone.
+        /// Whether the two-per-page merge follows the user's explicit
+        /// `merge_spec` instead of pairing every image sequentially.
+        use_merge_spec: bool,
+        /// Merge spec, e.g. `1-2,5-6` (1-based image numbers). Only used
+        /// when [`Self::use_merge_spec`] is set; only the listed images are
+        /// merged, everything else stays one-per-page.
         merge_spec: String,
         /// Rotate an image 90° when its orientation conflicts with its slot.
         auto_rotate: bool,
@@ -114,6 +118,7 @@ impl ToolOptions {
             ToolId::FolderToPdf => ToolOptions::FolderToPdf {
                 mode: BatchPageMode::Single,
                 force_orientation: None,
+                use_merge_spec: false,
                 merge_spec: String::new(),
                 auto_rotate: true,
             },

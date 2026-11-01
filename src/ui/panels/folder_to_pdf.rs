@@ -32,6 +32,7 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
         if let ToolOptions::FolderToPdf {
             mode,
             force_orientation,
+            use_merge_spec,
             merge_spec,
             auto_rotate,
         } = form.options_mut(tool)
@@ -77,12 +78,23 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
                     );
                     theme::field_row_hover(
                         ui,
-                        "合并序号",
-                        "留空 = 按顺序每两张一页；也可指定如 1-2,5-6，未提到的图片单独成页（序号见上方预览）",
+                        "指定合并",
+                        "勾选：仅对下方输入的序号执行两两合并，其余图片单独成页；不勾选：按顺序对所有图片两两合并",
                         |ui| {
-                            theme::text_input(ui, merge_spec, "如 1-2,5-6，留空则按顺序两两合并");
+                            ui.checkbox(use_merge_spec, "指定合并序号");
                         },
                     );
+                    if *use_merge_spec {
+                        theme::field_row_hover(
+                            ui,
+                            "合并序号",
+                            "格式如 1-2,5-6（序号为上方预览中标注的图片编号）；范围只能包含两张，重复、为 0 或超出图片数量都会报错",
+                            |ui| {
+                                theme::text_input(ui, merge_spec, "如 1-2,5-6");
+                            },
+                        );
+                        theme::hint(ui, "勾选后未填写序号、格式非法或序号超出图片数量时，任务会失败并给出具体原因");
+                    }
                 }
             }
         }
