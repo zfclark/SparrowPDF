@@ -1,0 +1,281 @@
+//! PDF open/save plumbing shared by every tool.
+//!
+//! All fallible operations map onto [`ToolError`] here so individual tools never
+//! have to translate `lopdf`/`medpdf` errors themselves.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use lopdf::Document;
+use lopdf::dictionary;
+
+use crate::model::ToolError;
+
+/// Open a PDF, converting every library error into a [`ToolError`].
+///
+/// Encrypted documents are detected before decryption is attempted so the UI can
+/// distinguish "needs a password" from "the password is wrong":
+///
+/// * no password supplied and the file is encrypted -> [`ToolError::PasswordRequired`]
+/// * password supplied but rejected -> [`ToolError::WrongPassword`]
+pub fn open_document(path: &Path, password: Option<&str>) -> Result<Document, ToolError> {
+    if !path.exists() {
+        return Err(ToolError::ReadFailed {
+            path: path.to_path_buf(),
+            detail: "文件不存在".to_string(),
+        });
+    }
+
+    // First probe: does the file even parse? This also tells us whether it is
+    // encrypted without needing a password.
+    let probe = Document::load(path).map_err(|e| ToolError::ReadFailed {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+
+    if !probe.is_encrypted() {
+        return Ok(probe);
+    }
+
+    let Some(password) = password else {
+        return Err(ToolError::PasswordRequired {
+            path: path.to_path_buf(),
+        });
+    };
+
+    // Re-open with the password so lopdf decrypts object streams during the read.
+    let mut doc =
+        Document::load_with_password(path, password).map_err(|_| ToolError::WrongPassword {
+            path: path.to_path_buf(),
+        })?;
+
+    // Belt and braces: if the trailer still references /Encrypt, the password was
+    // accepted by the handler but the content was not fully decrypted.
+    if doc.is_encrypted() {
+        doc.decrypt(password).map_err(|_| ToolError::WrongPassword {
+            path: path.to_path_buf(),
+        })?;
+    }
+
+    Ok(doc)
+}
+
+/// Open a PDF that is expected to be a normal, unencrypted working document.
+///
+/// Encrypted inputs still open fine here as long as a password is provided, but
+/// the caller gets [`ToolError::PasswordRequired`] when it is missing.
+pub fn open_for_edit(path: &Path, password: Option<&str>) -> Result<Document, ToolError> {
+    open_document(path, password)
+}
+
+/// Save `doc` to `path` through a sibling temp file, so a failed write never
+/// leaves a half-written artifact behind.
+pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
+                path: parent.to_path_buf(),
+                detail: e.to_string(),
+            })?;
+        }
+    }
+
+    let tmp = temp_sibling(path);
+    doc.save(&tmp).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        ToolError::WriteFailed {
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        }
+    })?;
+
+    // `doc.save` wrote to the temp path; move it into place.
+    fs::rename(&tmp, path).or_else(|_| {
+        // Windows can refuse a cross-device rename or an existing target.
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path)
+    })
+    .map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        ToolError::WriteFailed {
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        }
+    })?;
+
+    Ok(())
+}
+
+/// A temp path next to `path`, so the final rename stays on the same volume.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output.pdf".to_string());
+    path.with_file_name(format!(".{name}.sparrowtmp"))
+}
+
+/// Number of pages, as the page tree reports it.
+pub fn page_count(doc: &Document) -> u32 {
+    doc.get_pages().len() as u32
+}
+
+/// Page count of a file on disk, without handing a `Document` to the caller.
+///
+/// This is the only page-count entry point the UI layer may use, so no `lopdf`
+/// type crosses into `ui`.
+pub fn page_count_of(path: &Path, password: Option<&str>) -> Result<u32, ToolError> {
+    let doc = open_document(path, password)?;
+    Ok(page_count(&doc))
+}
+
+/// Write a file to disk with a mapped error.
+pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
+                path: parent.to_path_buf(),
+                detail: e.to_string(),
+            })?;
+        }
+    }
+    fs::write(path, bytes).map_err(|e| ToolError::WriteFailed {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })
+}
+
+/// Parse `1-3,7` style page specs into sorted, 1-based, de-duplicated pages.
+///
+/// Unlike `medpdf::parse_page_spec`, out-of-range pages are an error rather than
+/// being silently dropped, because silently producing a 3-page file from a
+/// 5-page request would break the output assertion.
+pub fn parse_pages(spec: &str, total: u32) -> Result<Vec<u32>, ToolError> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::InvalidPageRange {
+            detail: "页码范围为空".to_string(),
+        });
+    }
+    if trimmed.eq_ignore_ascii_case("all") || trimmed == "全部" {
+        return Ok((1..=total).collect());
+    }
+
+    let mut pages: Vec<u32> = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (start, end) = match part.split_once('-') {
+            Some((a, b)) => {
+                let start = parse_page_number(a, total)?;
+                let end = if b.trim().is_empty() {
+                    total
+                } else {
+                    parse_page_number(b, total)?
+                };
+                (start, end)
+            }
+            None => {
+                let n = parse_page_number(part, total)?;
+                (n, n)
+            }
+        };
+        if start > end {
+            return Err(ToolError::InvalidPageRange {
+                detail: format!("起始页 {start} 大于结束页 {end}"),
+            });
+        }
+        for n in start..=end {
+            if !pages.contains(&n) {
+                pages.push(n);
+            }
+        }
+    }
+
+    if pages.is_empty() {
+        return Err(ToolError::InvalidPageRange {
+            detail: format!("无法从「{spec}」解析出任何页码"),
+        });
+    }
+    pages.sort_unstable();
+    Ok(pages)
+}
+
+fn parse_page_number(raw: &str, total: u32) -> Result<u32, ToolError> {
+    let n: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| ToolError::InvalidPageRange {
+            detail: format!("「{}」不是合法页码", raw.trim()),
+        })?;
+    if n == 0 {
+        return Err(ToolError::InvalidPageRange {
+            detail: "页码从 1 开始".to_string(),
+        });
+    }
+    if total > 0 && n > total {
+        return Err(ToolError::InvalidPageRange {
+            detail: format!("页码 {n} 超出总页数 {total}"),
+        });
+    }
+    Ok(n)
+}
+
+/// Current `/Rotate` of a page, normalized to 0/90/180/270.
+pub fn page_rotation(doc: &Document, page_id: lopdf::ObjectId) -> u32 {
+    medpdf::get_page_rotation(doc, page_id)
+}
+
+/// Media box of a page as `[x0, y0, x1, y1]`, defaulting to A4.
+pub fn page_media_box(doc: &Document, page_id: lopdf::ObjectId) -> [f32; 4] {
+    medpdf::get_page_media_box(doc, page_id).unwrap_or([0.0, 0.0, 595.0, 842.0])
+}
+
+/// Delete a file if it exists, ignoring errors (used when verification fails).
+pub fn remove_quietly(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+/// Create an empty document with a valid catalog and a single `/Pages` node.
+pub fn new_document() -> Document {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    doc.objects.insert(
+        pages_id,
+        lopdf::Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => Vec::<lopdf::Object>::new(),
+            "Count" => 0i64,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc
+}
+
+/// Copy the listed 1-based pages of `source` into `dest`, preserving order.
+///
+/// `medpdf::copy_page_with_cache` deep-copies every referenced object, shares
+/// resources across calls, re-parents each new page onto `dest`'s `/Pages` node
+/// and appends it to `/Kids`, so the insertion order is the output order.
+pub fn copy_pages(
+    dest: &mut Document,
+    source: &Document,
+    pages: &[u32],
+) -> Result<(), ToolError> {
+    let mut cache: std::collections::BTreeMap<lopdf::ObjectId, lopdf::ObjectId> =
+        std::collections::BTreeMap::new();
+    for page in pages {
+        medpdf::copy_page_with_cache(dest, source, *page, &mut cache).map_err(|e| {
+            ToolError::Internal {
+                detail: format!("复制第 {page} 页失败：{e}"),
+            }
+        })?;
+    }
+    Ok(())
+}

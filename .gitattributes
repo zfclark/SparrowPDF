@@ -1,0 +1,21 @@
+# Normalize line endings: everything LF in the repo.
+* text=auto eol=lf
+
+# Binary fixtures and artifacts must never be line-ending converted.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.icns binary
+*.dmg binary
+*.ico binary
+
+# Scripts keep LF so CI shells never see CRLF.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+scripts/*.bat text eol=lf
+*.ps1 text eol=lf
+
+# Windows-specific text files.
+*.rc text eol=crlf
