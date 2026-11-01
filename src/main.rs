@@ -33,7 +33,7 @@ fn main() -> eframe::Result {
             .with_inner_size(INITIAL_SIZE)
             .with_min_inner_size([760.0, 520.0])
             .with_drag_and_drop(true)
-            .with_icon(window_icon().expect("embedded icon.png must decode")),
+            .with_icon(window_icon().expect("embedded launcher icon must decode")),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

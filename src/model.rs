@@ -21,12 +21,11 @@ pub enum ToolId {
     ImageWatermark,
     Encrypt,
     PdfToImage,
-    ExtractText,
 }
 
 impl ToolId {
     /// Registry order, grouped the same way the sidebar renders them.
-    pub const ALL: [ToolId; 13] = [
+    pub const ALL: [ToolId; 12] = [
         ToolId::ImageToPdf,
         ToolId::FolderToPdf,
         ToolId::Merge,
@@ -39,7 +38,6 @@ impl ToolId {
         ToolId::ImageWatermark,
         ToolId::Encrypt,
         ToolId::PdfToImage,
-        ToolId::ExtractText,
     ];
 
     pub fn group(self) -> ToolGroup {
@@ -53,7 +51,7 @@ impl ToolId {
             | ToolId::Extract => ToolGroup::Structure,
             ToolId::TextWatermark | ToolId::ImageWatermark => ToolGroup::PageEdit,
             ToolId::Encrypt => ToolGroup::Security,
-            ToolId::PdfToImage | ToolId::ExtractText => ToolGroup::Convert,
+            ToolId::PdfToImage => ToolGroup::Convert,
         }
     }
 
@@ -71,7 +69,6 @@ impl ToolId {
             ToolId::ImageWatermark => "图片水印",
             ToolId::Encrypt => "加密与解密",
             ToolId::PdfToImage => "PDF 转图片",
-            ToolId::ExtractText => "文本提取",
         }
     }
 
@@ -90,7 +87,6 @@ impl ToolId {
             ToolId::ImageWatermark => "把图片作为水印叠加到每一页",
             ToolId::Encrypt => "AES-256 加密，或移除现有密码",
             ToolId::PdfToImage => "渲染为 PNG / JPEG，36-600 DPI",
-            ToolId::ExtractText => "提取文本层为 UTF-8 纯文本",
         }
     }
 

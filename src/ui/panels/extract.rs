@@ -7,15 +7,19 @@ use crate::tools::ToolOptions;
 use crate::ui::panels::{
     FormState, add_files_button, input_list, output_selector, password_field,
 };
+use crate::ui::preview;
 use crate::ui::theme;
 
-pub fn show(ui: &mut Ui, form: &mut FormState) {
+pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::PreviewState) {
     let tool = ToolId::Extract;
 
     theme::card(ui, "输入 PDF", |ui| {
         add_files_button(ui, tool, form);
         input_list(ui, tool, &mut form.inputs, false);
     });
+
+    let files: Vec<std::path::PathBuf> = form.inputs.iter().map(|f| f.path.clone()).collect();
+    preview::show_pdf_pages(ui, &files, preview_state);
 
     theme::card(ui, "选项", |ui| {
         if let ToolOptions::Extract { pages } = form.options_mut(tool) {

@@ -232,24 +232,64 @@ fn split_every_n_writes_expected_pages() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn extract_text_writes_page_text() {
-    let dir = scratch("extract");
-    let src = make_pdf(&dir, "t.pdf", 1, 0);
-    let out = dir.join("text.txt");
 
-    let req = request(ToolId::ExtractText, vec![src.clone()], out.clone());
-    let outcome = run(ToolId::ExtractText, &req).expect("extract succeeds");
+// ---------------------------------------------------------------- logging
+
+/// CJK watermarks are stamped as transparent bitmaps (simple PDF fonts are
+/// WinAnsi-encoded and would turn every CJK char into `?`), so the output
+/// must contain an image XObject whose SMask actually carries glyph shapes.
+#[test]
+fn text_watermark_cjk_writes_bitmap_watermark() {
+    let dir = scratch("wm-cjk");
+    let src = make_pdf(&dir, "in.pdf", 1, 0);
+    let out = dir.join("wm.pdf");
+    let mut req = request(ToolId::TextWatermark, vec![src], out.clone());
+    if let ToolOptions::TextWatermark { text, opacity, .. } = &mut req.options {
+        *text = "机密文件".to_string();
+        *opacity = 0.9;
+    }
+    let outcome = run(ToolId::TextWatermark, &req).expect("watermark succeeds");
     assert_eq!(outcome.outputs.len(), 1);
-    let body = std::fs::read_to_string(&out).unwrap();
+
+    let doc = pdf_io::open_document(&out, None).unwrap();
+    let mut found_image = false;
+    let mut glyph_coverage = 0u64;
+    for (_, object_id) in doc.objects.iter() {
+        let Ok(stream) = object_id.as_stream() else {
+            continue;
+        };
+        let dict = &stream.dict;
+        let is_image =
+            matches!(dict.get(b"Subtype"), Ok(lopdf::Object::Name(n)) if n.as_slice() == b"Image");
+        if !is_image {
+            continue;
+        }
+        // The SMask itself is a DeviceGray image XObject; the watermark tint
+        // is the DeviceRGB one carrying the SMask reference.
+        let is_gray = matches!(
+            dict.get(b"ColorSpace"),
+            Ok(lopdf::Object::Name(n)) if n.as_slice() == b"DeviceGray"
+        );
+        if is_gray {
+            continue;
+        }
+        found_image = true;
+        assert!(
+            matches!(dict.get(b"SMask"), Ok(lopdf::Object::Reference(_))),
+            "watermark image must carry an SMask alpha channel"
+        );
+        let smask_ref = dict.get(b"SMask").unwrap().as_reference().unwrap();
+        let smask = doc.get_object(smask_ref).unwrap().as_stream().unwrap();
+        let coverage = smask.decompressed_content().expect("smask flate decodes");
+        glyph_coverage += coverage.iter().map(|&b| (b > 32) as u64).sum::<u64>();
+    }
+    assert!(found_image, "output must embed a watermark image");
     assert!(
-        body.contains("Page 0"),
-        "extracted text must contain the fixture page text"
+        glyph_coverage > 1000,
+        "SMask must contain real glyph shapes, got {glyph_coverage} covered pixels"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ---------------------------------------------------------------- logging
 
 #[test]
 fn log_lines_are_appended_to_the_log_file() {
@@ -281,7 +321,7 @@ fn log_lines_are_appended_to_the_log_file() {
 #[test]
 fn tool_ids_are_unique_and_complete() {
     let all = ToolId::ALL;
-    assert_eq!(all.len(), 13, "registry fixes exactly 13 tools");
+    assert_eq!(all.len(), 12, "registry fixes exactly 12 tools");
     for i in 0..all.len() {
         for j in (i + 1)..all.len() {
             assert_ne!(all[i], all[j]);

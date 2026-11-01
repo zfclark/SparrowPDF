@@ -7,7 +7,6 @@
 pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
-pub mod extract_text;
 pub mod folder_to_pdf;
 pub mod image_embed;
 pub mod image_to_pdf;
@@ -108,7 +107,6 @@ pub enum ToolOptions {
         dpi: u32,
         format: ImageFormat,
     },
-    ExtractText,
 }
 
 impl ToolOptions {
@@ -165,10 +163,9 @@ impl ToolOptions {
                 allow_modify: true,
             },
             ToolId::PdfToImage => ToolOptions::PdfToImage {
-                dpi: 150,
+                dpi: 300,
                 format: ImageFormat::Png,
             },
-            ToolId::ExtractText => ToolOptions::ExtractText,
         }
     }
 }
@@ -271,7 +268,6 @@ pub fn tool_for(id: ToolId) -> Box<dyn Tool> {
         ToolId::ImageWatermark => Box::new(image_watermark::ImageWatermark),
         ToolId::Encrypt => Box::new(encrypt::Encrypt),
         ToolId::PdfToImage => Box::new(pdf_to_image::PdfToImage),
-        ToolId::ExtractText => Box::new(extract_text::ExtractText),
     }
 }
 

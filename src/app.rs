@@ -10,12 +10,11 @@ use crate::tools::ToolRequest;
 use crate::ui::panels::{FormState, PanelAction, ReorderState, panel_view};
 use crate::ui::{panels, sidebar, status, theme};
 
-/// App icon, embedded at compile time from `assets/icon.png`.
+/// App icon, embedded at compile time from the shipped launcher icon.
 ///
-/// The image crate is already a dependency (image tool decoding), so decoding
-/// the icon adds no new dependency. The same bytes serve the window icon and
-/// the sidebar texture, so the icon costs nothing extra in the binary.
-pub(crate) const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+/// `assets/icon.png` is the design reference and must stay untouched; the
+/// runtime icon uses the generated launcher asset instead.
+pub(crate) const ICON_PNG: &[u8] = include_bytes!("../assets/ic_launcher_512.png");
 
 pub struct SparrowApp {
     current: ToolId,
@@ -363,10 +362,7 @@ impl SparrowApp {
             _ => "_out",
         };
 
-        let ext = match tool_id {
-            ToolId::ExtractText => "txt",
-            _ => "pdf",
-        };
+        let ext = "pdf";
         parent.join(format!("{}{suffix}.{ext}", file_stem(&source)))
     }
 
@@ -465,16 +461,15 @@ impl SparrowApp {
             ToolId::ImageToPdf => panels::image_to_pdf::show(ui, form, preview),
             ToolId::FolderToPdf => panels::folder_to_pdf::show(ui, form, preview),
             ToolId::Merge => panels::merge::show(ui, form),
-            ToolId::Split => panels::split::show(ui, form),
-            ToolId::Rotate => panels::rotate::show(ui, form),
-            ToolId::DeletePages => panels::delete_pages::show(ui, form),
+            ToolId::Split => panels::split::show(ui, form, preview),
+            ToolId::Rotate => panels::rotate::show(ui, form, preview),
+            ToolId::DeletePages => panels::delete_pages::show(ui, form, preview),
             ToolId::Reorder => panels::reorder::show(ui, form, &mut self.reorder),
-            ToolId::Extract => panels::extract::show(ui, form),
+            ToolId::Extract => panels::extract::show(ui, form, preview),
             ToolId::TextWatermark => panels::text_watermark::show(ui, form),
             ToolId::ImageWatermark => panels::image_watermark::show(ui, form),
             ToolId::Encrypt => panels::encrypt::show(ui, form),
             ToolId::PdfToImage => panels::pdf_to_image::show(ui, form),
-            ToolId::ExtractText => panels::extract_text::show(ui, form),
         }
     }
 }

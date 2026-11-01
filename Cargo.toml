@@ -1,6 +1,6 @@
 [package]
 name = "sparrowpdf"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
@@ -26,6 +26,10 @@ kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
+
+[build-dependencies]
+# Embeds assets/app.ico into the Windows executable (taskbar / Explorer icon).
+winresource = "0.1"
 
 [profile.release]
 # Unwinding is required so the worker thread can catch tool panics and turn

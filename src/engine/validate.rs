@@ -148,6 +148,10 @@ pub fn assert_jpeg_soi_bytes(path: &Path, min_count: usize) -> Result<(), ToolEr
 }
 
 /// Assert a produced text file is non-empty (ignoring whitespace).
+///
+/// Only used by the (removed) text-extraction tool today; kept for the
+/// fixed validation-helper shape in case text output returns.
+#[allow(dead_code)]
 pub fn assert_non_empty_text(path: &Path) -> Result<(), ToolError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ToolError::ReadFailed {

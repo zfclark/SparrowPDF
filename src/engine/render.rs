@@ -42,17 +42,19 @@ impl FontSet {
             let Ok(bytes) = std::fs::read(path) else {
                 continue;
             };
-            // `.ttc` collections wrap the real font; try the first face.
-            let candidates: Vec<Vec<u8>> = if bytes.starts_with(b"ttcf") {
+            // `.ttc` collections keep absolute table offsets — parse each
+            // face from the full file via `parse_at` (slicing a face out
+            // would misalign every table).
+            let candidates: Vec<(usize, Vec<u8>)> = if bytes.starts_with(b"ttcf") {
                 ttc_offsets(&bytes)
                     .into_iter()
-                    .filter_map(|off| bytes.get(off..).map(|s| s.to_vec()))
+                    .map(|off| (off, bytes.clone()))
                     .collect()
             } else {
-                vec![bytes]
+                vec![(0, bytes)]
             };
-            for bytes in candidates {
-                if let Some(font) = TrueTypeFont::parse(bytes) {
+            for (base, data) in candidates {
+                if let Some(font) = TrueTypeFont::parse_at(data, base) {
                     fonts.push(((*path).to_string(), font));
                     break;
                 }
@@ -87,6 +89,34 @@ fn ttc_offsets(bytes: &[u8]) -> Vec<usize> {
         out.push(u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize);
     }
     out
+}
+
+/// Render the listed 1-based pages of `path` as small thumbnails.
+///
+/// Opens the document once and scales each page to roughly `height_px`
+/// device pixels (handy for preview strips). Returns `(page, pixmap)` pairs
+/// in the same order as `pages`.
+pub fn render_page_thumbnails(
+    path: &std::path::Path,
+    password: Option<&str>,
+    pages: &[u32],
+    height_px: f32,
+    fonts: &FontSet,
+) -> Result<Vec<(u32, Pixmap)>, String> {
+    let doc = crate::engine::pdf_io::open_document(path, password).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(pages.len());
+    for &page in pages {
+        let page_id = doc
+            .get_pages()
+            .get(&page)
+            .copied()
+            .ok_or_else(|| format!("页码 {page} 不存在"))?;
+        let (_x0, _y0, _x1, y1) = media_box(&doc, page_id);
+        let dpi = ((height_px / y1.abs().max(1.0)) * 72.0).round().clamp(2.0, 72.0) as u32;
+        let pixmap = render_page(&doc, page_id, dpi, fonts)?;
+        out.push((page, pixmap));
+    }
+    Ok(out)
 }
 
 /// Render one page to an RGBA pixmap at `dpi`.

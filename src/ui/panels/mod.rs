@@ -11,7 +11,6 @@
 pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
-pub mod extract_text;
 pub mod folder_to_pdf;
 pub mod image_to_pdf;
 pub mod image_watermark;

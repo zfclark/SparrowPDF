@@ -171,6 +171,7 @@ jobs:
           APP="SparrowPDF.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp universal/SparrowPDF "$APP/Contents/MacOS/SparrowPDF"
+          cp assets/app.icns "$APP/Contents/Resources/app.icns"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -179,6 +180,7 @@ jobs:
             <key>CFBundleName</key><string>轻雀 PDF</string>
             <key>CFBundleDisplayName</key><string>轻雀 PDF</string>
             <key>CFBundleExecutable</key><string>SparrowPDF</string>
+            <key>CFBundleIconFile</key><string>app</string>
             <key>CFBundleIdentifier</key><string>com.sparrowpdf.app</string>
             <key>CFBundleVersion</key><string>$V</string>
             <key>CFBundleShortVersionString</key><string>$V</string>

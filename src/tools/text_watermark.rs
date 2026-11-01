@@ -1,40 +1,26 @@
 //! Tool 8: text watermark.
 //!
-//! The watermark font is resolved from the operating system (a CJK-capable
-//! family when available, otherwise a PDF built-in font). No font is embedded in
-//! the binary — that is what keeps the executable under the size budget.
+//! CJK-safe by construction: the watermark text is rasterized into a
+//! transparent bitmap with the system TrueType font (via `engine::ttf` +
+//! `engine::raster`) and stamped onto every page as an image. PDF text
+//! drawing is deliberately avoided — simple PDF fonts are WinAnsi-encoded
+//! and turn every CJK character into `?` (a limitation of the embedded
+//! `medpdf` text API), while composite Type0/CID embedding is out of scope
+//! for the dependency. A bitmap watermark renders identically in every
+//! viewer and keeps the chosen color, size, rotation and opacity.
 
-use std::path::Path;
+use medpdf_image::{DrawImageParams, ImageData, add_image};
 
-use medpdf::{
-    AddTextParams, EmbeddedFontCache, FontCache, FontData, HAlign, PdfColor, VAlign,
-    add_text_params, find_font, set_page_rotation,
-};
-
-use crate::engine::{pdf_io, validate};
+use crate::engine::{pdf_io, render, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome, WatermarkPlacement};
 use crate::tools::{
     CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
     split::{ensure_pdf, single_input},
 };
 
-/// Family names tried in order; the first one the OS resolves wins.
-const FONT_CANDIDATES: &[&str] = &[
-    "Microsoft YaHei",
-    "Microsoft YaHei UI",
-    "DengXian",
-    "SimHei",
-    "SimSun",
-    "PingFang SC",
-    "Heiti SC",
-    "Songti SC",
-    "Noto Sans CJK SC",
-    "Source Han Sans SC",
-    "DejaVu Sans",
-];
-
-/// Last resort: a PDF built-in font (ASCII only, no embedding required).
-const BUILTIN_FALLBACK: &str = "@Helvetica";
+/// Pixels rendered per PDF point (4x supersampling keeps text crisp at
+/// print resolutions without blowing up memory).
+const SS: f32 = 4.0;
 
 pub struct TextWatermark;
 
@@ -86,19 +72,12 @@ impl Tool for TextWatermark {
             }
         };
 
-        let (font_data, font_name) = resolve_font(&text)?;
+        progress.report(0.05, "渲染水印文字".to_string());
+        let (image, wm_w, wm_h) = render_text_bitmap(&text, font_size, color)?;
 
         let mut doc = pdf_io::open_for_edit(path, req.password.as_deref())?;
         let pages: Vec<(u32, lopdf::ObjectId)> = doc.get_pages().into_iter().collect();
         let total = pages.len();
-
-        let mut font_cache = EmbeddedFontCache::new();
-        let tint = PdfColor::rgba(
-            color[0] as f32 / 255.0,
-            color[1] as f32 / 255.0,
-            color[2] as f32 / 255.0,
-            opacity.clamp(0.0, 1.0),
-        );
 
         for (index, (page_num, page_id)) in pages.iter().enumerate() {
             check_cancel(cancel)?;
@@ -118,40 +97,25 @@ impl Tool for TextWatermark {
                 (page_w, page_h)
             };
 
-            let placements: Vec<(f32, f32)> = match placement {
-                WatermarkPlacement::Center => vec![(vis_w / 2.0, vis_h / 2.0)],
-                WatermarkPlacement::Tiled => tiled_positions(vis_w, vis_h, font_size, &text),
+            let positions: Vec<(f32, f32)> = match placement {
+                WatermarkPlacement::Center => vec![(
+                    media[0] + (vis_w - wm_w) / 2.0,
+                    media[1] + (vis_h - wm_h) / 2.0,
+                )],
+                WatermarkPlacement::Tiled => {
+                    tiled_positions(vis_w, vis_h, wm_w, wm_h, media[0], media[1])
+                }
             };
 
-            for (cx, cy) in placements {
-                let mut params = AddTextParams::new(
-                    text.clone(),
-                    font_data.clone(),
-                    font_name.clone(),
-                )
-                .font_size(font_size)
-                .color(tint)
-                .rotation(rotation)
-                .h_align(HAlign::Center)
-                .v_align(VAlign::Center)
-                .layer_over(true);
-                // `page_media_box` origin may be non-zero; shift into media space.
-                params.x = cx + media[0];
-                params.y = cy + media[1];
-
-                add_text_params(&mut doc, *page_id, &params, &mut font_cache).map_err(|e| {
-                    ToolError::Internal {
-                        detail: format!("第 {page_num} 页添加水印失败：{e}"),
-                    }
+            for (x, y) in positions {
+                let params = DrawImageParams::new(image.clone(), x, y, wm_w, wm_h)
+                    .rotation(rotation)
+                    .alpha(opacity.clamp(0.0, 1.0))
+                    .layer_over(true);
+                add_image(&mut doc, *page_id, params).map_err(|e| ToolError::Internal {
+                    detail: format!("第 {page_num} 页添加水印失败：{e}"),
                 })?;
             }
-
-            // `set_page_rotation` is a no-op here; it exists so the invariant is
-            // explicit: watermarking must not change page rotation.
-            let keep = pdf_io::page_rotation(&doc, *page_id);
-            set_page_rotation(&mut doc, *page_id, keep).map_err(|e| ToolError::Internal {
-                detail: format!("保持第 {page_num} 页旋转失败：{e}"),
-            })?;
         }
 
         progress.report(0.9, "写入 PDF".to_string());
@@ -168,69 +132,158 @@ impl Tool for TextWatermark {
     }
 }
 
-/// Positions for the tiled mode: a grid spaced by text extents.
-fn tiled_positions(width: f32, height: f32, font_size: f32, text: &str) -> Vec<(f32, f32)> {
-    let approx_width = (text.chars().count() as f32 * font_size * 0.7).max(font_size * 2.0);
-    let step_x = approx_width.max(60.0);
-    let step_y = (font_size * 3.0).max(60.0);
-
+/// Grid positions for tiled mode, spacing by the bitmap's point size.
+fn tiled_positions(
+    width: f32,
+    height: f32,
+    wm_w: f32,
+    wm_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+) -> Vec<(f32, f32)> {
+    let step_x = (wm_w * 1.5).max(60.0);
+    let step_y = (wm_h * 2.0).max(60.0);
     let cols = (width / step_x).ceil().max(1.0) as usize;
     let rows = (height / step_y).ceil().max(1.0) as usize;
-
     let mut out = Vec::with_capacity(cols * rows);
     for row in 0..rows {
         for col in 0..cols {
-            out.push((
-                (col as f32 + 0.5) * step_x,
-                (row as f32 + 0.5) * step_y,
-            ));
+            out.push((origin_x + col as f32 * step_x, origin_y + row as f32 * step_y));
         }
     }
     out
 }
 
-/// Resolve a usable font: an OS CJK family when present, else a built-in.
-fn resolve_font(text: &str) -> Result<(FontData, String), ToolError> {
-    let mut cache = FontCache::new();
+/// Rasterize `text` into a transparent RGBA watermark bitmap.
+///
+/// Returns the image plus its size in PDF points (pixels / [`SS`]).
+/// Anti-aliasing comes from the scanline rasterizer: glyph coverage is
+/// blended over black and re-used as the alpha channel, so edges fade out
+/// exactly like the filled glyphs would.
+fn render_text_bitmap(
+    text: &str,
+    font_size: f32,
+    color: [u8; 3],
+) -> Result<(ImageData, f32, f32), ToolError> {
+    let font_set = render::FontSet::system();
+    let font = font_set
+        .primary()
+        .ok_or_else(|| ToolError::UnsupportedFormat {
+            path: None,
+            detail: "未找到可用的系统 TrueType 字体（C:\\Windows\\Fonts），无法渲染水印文字".to_string(),
+        })?;
 
-    if needs_cjk(text) {
-        for family in FONT_CANDIDATES {
-            let Ok(resolved) = find_font(Path::new(family)) else {
-                continue;
-            };
-            // `find_font` also succeeds for `FontPath::Hack`/`BuiltIn`; only a
-            // real file/memory font can carry CJK glyphs.
-            match &resolved {
-                medpdf::FontPath::Path(_) | medpdf::FontPath::Memory(_, _) => {}
-                _ => continue,
-            }
-            let name = resolved.get_name();
-            if let Ok(data) = cache.get_data(&resolved) {
-                return Ok((data, name));
-            }
+    let upem = font.units_per_em();
+    let scale = font_size / upem;
+
+    // Lay out the glyphs in point space (baseline at y = 0, y up).
+    struct PlacedGlyph {
+        contours: Vec<Vec<(f32, f32)>>,
+    }
+    let mut placed: Vec<PlacedGlyph> = Vec::new();
+    let mut pen_x = 0.0f32;
+    for ch in text.chars() {
+        let advance_pt = font.advance(font.glyph_for_char(ch)) * scale;
+        if ch != ' ' {
+            let gid = font.glyph_for_char(ch);
+            let raw = font.outline(gid);
+            let contours = raw
+                .into_iter()
+                .map(|contour| {
+                    contour
+                        .into_iter()
+                        .map(|(x, y)| (pen_x + x * scale, y * scale))
+                        .collect()
+                })
+                .collect();
+            placed.push(PlacedGlyph { contours });
         }
+        pen_x += advance_pt;
+    }
+    if placed.is_empty() {
         return Err(ToolError::UnsupportedFormat {
             path: None,
-            detail: "系统中未找到可嵌入的中文字体，请安装微软雅黑、思源黑体或 Noto Sans CJK 后重试"
-                .to_string(),
+            detail: "水印文字没有可渲染的字符".to_string(),
         });
     }
 
-    // ASCII-only watermark can use a built-in font, with no embedding at all.
-    if let Ok(resolved) = find_font(Path::new(BUILTIN_FALLBACK)) {
-        let name = resolved.get_name();
-        if let Ok(data) = cache.get_data(&resolved) {
-            return Ok((data, name));
+    // Bounding box in point space.
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for glyph in &placed {
+        for contour in &glyph.contours {
+            for &(x, y) in contour {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
         }
     }
+    if min_x >= max_x || min_y >= max_y {
+        return Err(ToolError::UnsupportedFormat {
+            path: None,
+            detail: "水印文字没有可渲染的轮廓".to_string(),
+        });
+    }
 
-    Ok((
-        FontData::BuiltIn("Helvetica".to_string()),
-        "Helvetica".to_string(),
-    ))
-}
+    let w_px = ((max_x - min_x) * SS).ceil() as u32 + 2;
+    let h_px = ((max_y - min_y) * SS).ceil() as u32 + 2;
 
-/// True when the text contains characters outside Latin-1.
-fn needs_cjk(text: &str) -> bool {
-    text.chars().any(|c| !c.is_ascii() && c as u32 > 0xFF)
+    // Fill on a black background; the rendered color channel then doubles as
+    // the anti-aliased coverage, which becomes the bitmap's alpha channel.
+    let mut pixmap = crate::engine::raster::Pixmap::new(w_px, h_px, [0, 0, 0]);
+    for glyph in &placed {
+        let mut path = crate::engine::raster::Path::new();
+        for contour in &glyph.contours {
+            let mut first = true;
+            for &(x, y) in contour {
+                // Point space -> pixel space (flip y so text reads upright).
+                let px = (x - min_x) * SS + 1.0;
+                let py = h_px as f32 - ((y - min_y) * SS + 1.0);
+                if first {
+                    path.move_to(px, py);
+                    first = false;
+                } else {
+                    path.line_to(px, py);
+                }
+            }
+            path.close();
+        }
+        crate::engine::raster::fill(
+            &mut pixmap,
+            &path,
+            [
+                color[0] as f32 / 255.0,
+                color[1] as f32 / 255.0,
+                color[2] as f32 / 255.0,
+                1.0,
+            ],
+        );
+    }
+
+    // Split the rendered raster into a solid tint + coverage alpha.
+    // `Pixmap::data` is RGBA; filled over black, the RGB channels carry the
+    // anti-aliased coverage of the single tint color.
+    let data = pixmap.data;
+    let mut pixels = Vec::with_capacity((w_px * h_px * 3) as usize);
+    let mut alpha = Vec::with_capacity((w_px * h_px) as usize);
+    for px in data.chunks_exact(4) {
+        let coverage = px[0].max(px[1]).max(px[2]);
+        pixels.push(color[0]);
+        pixels.push(color[1]);
+        pixels.push(color[2]);
+        alpha.push(coverage);
+    }
+
+    let image = ImageData::Decoded {
+        pixels,
+        alpha_channel: Some(alpha),
+        pixel_width: w_px,
+        pixel_height: h_px,
+        components: 3,
+    };
+    Ok((image, w_px as f32 / SS, h_px as f32 / SS))
 }

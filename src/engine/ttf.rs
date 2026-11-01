@@ -27,14 +27,28 @@ pub struct TrueTypeFont {
 impl TrueTypeFont {
     /// Parse a TrueType/OpenType font. Returns `None` for CFF-flavoured fonts
     /// (`OTTO` with no `glyf` table), which this reader cannot outline.
+    ///
+    /// The app only parses collection faces via [`Self::parse_at`]; kept for
+    /// completeness and tests.
+    #[allow(dead_code)]
     pub fn parse(data: Vec<u8>) -> Option<Self> {
-        if data.len() < 12 {
+        Self::parse_at(data, 0)
+    }
+
+    /// Parse one face of a TrueType Collection (`ttcf`).
+    ///
+    /// `dir_base` is the offset of the face's table directory within `data`.
+    /// In a collection the table offsets are absolute within the whole file
+    /// (they are not relative to the face directory), so `data` must be the
+    /// complete file — slicing a face out breaks every table lookup.
+    pub fn parse_at(data: Vec<u8>, dir_base: usize) -> Option<Self> {
+        if data.len() < dir_base + 12 {
             return None;
         }
-        let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+        let num_tables = u16::from_be_bytes([data[dir_base + 4], data[dir_base + 5]]) as usize;
         let mut tables: BTreeMap<[u8; 4], (usize, usize)> = BTreeMap::new();
         for i in 0..num_tables {
-            let base = 12 + i * 16;
+            let base = dir_base + 12 + i * 16;
             if base + 16 > data.len() {
                 return None;
             }
@@ -51,7 +65,7 @@ impl TrueTypeFont {
                 data[base + 14],
                 data[base + 15],
             ]) as usize;
-            if offset <= data.len() {
+            if offset + length <= data.len() {
                 tables.insert(tag, (offset, length));
             }
         }
