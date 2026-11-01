@@ -68,6 +68,40 @@ pub fn open_for_edit(path: &Path, password: Option<&str>) -> Result<Document, To
     open_document(path, password)
 }
 
+/// Human-facing detail for a write error.
+///
+/// Permission problems are the common "cannot save the output" case when the
+/// app runs without administrator rights (protected folders such as
+/// `C:\Program Files`, another user's profile, or a file currently locked by
+/// a PDF viewer), so call both out explicitly instead of surfacing a raw
+/// OS message.
+pub(crate) fn write_error_detail(err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            "没有写入权限：目录可能受系统保护（如 Program Files），或文件正被其他程序（如 PDF 阅读器）占用。请关闭占用该文件的程序；若目录受保护，请在「输出」中点击「选择输出文件…」改存到「文档」或桌面。".to_string()
+        }
+        _ => err.to_string(),
+    }
+}
+
+/// Probe whether `dir` accepts file creation, so the UI can fall back to a
+/// writable folder instead of failing at save time. The probe file is removed
+/// immediately; a `false` answer means the process could not write there.
+pub fn dir_is_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(".sparrow_write_probe");
+    match fs::File::create(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Save `doc` to `path` through a sibling temp file, so a failed write never
 /// leaves a half-written artifact behind.
 pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
@@ -75,7 +109,7 @@ pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
                 path: parent.to_path_buf(),
-                detail: e.to_string(),
+                detail: write_error_detail(&e),
             })?;
         }
     }
@@ -85,7 +119,7 @@ pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
         let _ = fs::remove_file(&tmp);
         ToolError::WriteFailed {
             path: path.to_path_buf(),
-            detail: e.to_string(),
+            detail: write_error_detail(&e),
         }
     })?;
 
@@ -99,7 +133,7 @@ pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
         let _ = fs::remove_file(&tmp);
         ToolError::WriteFailed {
             path: path.to_path_buf(),
-            detail: e.to_string(),
+            detail: write_error_detail(&e),
         }
     })?;
 
@@ -135,13 +169,13 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
                 path: parent.to_path_buf(),
-                detail: e.to_string(),
+                detail: write_error_detail(&e),
             })?;
         }
     }
     fs::write(path, bytes).map_err(|e| ToolError::WriteFailed {
         path: path.to_path_buf(),
-        detail: e.to_string(),
+        detail: write_error_detail(&e),
     })
 }
 

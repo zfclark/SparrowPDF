@@ -14,8 +14,15 @@ use sparrowpdf::tools::{tool_for, CancelFlag, Progress, ToolOptions, ToolRequest
 // ---------------------------------------------------------------- fixtures
 
 /// A scratch directory unique per test.
+///
+/// Prefers cargo's `target/tmp` (CARGO_TARGET_TMPDIR): it sits inside the
+/// workspace, which keeps the suite working under restricted environments
+/// where the system temp directory is not writable.
 fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let base = std::env::var("CARGO_TARGET_TMPDIR").unwrap_or_else(|_| {
+        std::env::temp_dir().display().to_string()
+    });
+    let dir = PathBuf::from(base).join(format!(
         "sparrowpdf-test-{}-{}",
         tag,
         std::process::id()
@@ -247,7 +254,7 @@ fn extract_text_writes_page_text() {
 #[test]
 fn tool_ids_are_unique_and_complete() {
     let all = ToolId::ALL;
-    assert_eq!(all.len(), 12, "spec fixes exactly 12 tools");
+    assert_eq!(all.len(), 13, "registry fixes exactly 13 tools");
     for i in 0..all.len() {
         for j in (i + 1)..all.len() {
             assert_ne!(all[i], all[j]);
@@ -256,4 +263,259 @@ fn tool_ids_are_unique_and_complete() {
     for id in all {
         assert!(!id.label().is_empty());
     }
+}
+
+// ---------------------------------------------------------------- image->pdf
+
+/// A landscape JPEG fixture (2:1), written with the `image` crate.
+fn make_landscape_jpeg(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let img = image::RgbImage::from_fn(800, 400, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+    });
+    img.save_with_format(&path, image::ImageFormat::Jpeg)
+        .expect("write jpeg fixture");
+    path
+}
+
+/// First page's MediaBox as [x0, y0, x1, y1] and content stream text.
+fn first_page_geometry(path: &Path) -> ([f64; 4], String) {
+    fn obj_f64(o: &lopdf::Object) -> f64 {
+        match o {
+            lopdf::Object::Real(v) => *v as f64,
+            lopdf::Object::Integer(v) => *v as f64,
+            other => panic!("not a number: {other:?}"),
+        }
+    }
+
+    let doc = lopdf::Document::load(path).expect("load output pdf");
+    let pages = doc.get_pages();
+    assert_eq!(pages.len(), 1, "one image -> one page");
+    let page_id = *pages.values().next().unwrap();
+    let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    let media_box: Vec<f64> = page
+        .get(b"MediaBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(obj_f64)
+        .collect();
+    let content_ref = page.get(b"Contents").unwrap().as_reference().unwrap();
+    let content = doc
+        .get_object(content_ref)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .content
+        .clone();
+    let text = String::from_utf8(content).expect("content stream is ascii");
+    let mut box4 = [0.0; 4];
+    box4.copy_from_slice(&media_box);
+    (box4, text)
+}
+
+#[test]
+fn image_to_pdf_auto_rotates_landscape_image_into_portrait_page() {
+    let dir = scratch("img-rot");
+    let img = make_landscape_jpeg(&dir, "wide.jpg");
+    let out = dir.join("merged.pdf");
+
+    let mut req = request(ToolId::ImageToPdf, vec![img], out.clone());
+    if let ToolOptions::ImageToPdf {
+        force_orientation,
+        auto_rotate,
+    } = &mut req.options
+    {
+        *force_orientation = Some(sparrowpdf::tools::Orientation::Portrait);
+        *auto_rotate = true;
+    }
+    run(ToolId::ImageToPdf, &req).expect("image to pdf succeeds");
+
+    let (media_box, content) = first_page_geometry(&out);
+    // A4 portrait page (595.28 x 841.89).
+    assert!((media_box[2] - 595.28).abs() < 0.5, "portrait width, got {media_box:?}");
+    assert!((media_box[3] - 841.89).abs() < 0.5, "portrait height, got {media_box:?}");
+    // Rotation matrix: a≈0, b<0, c>0, d≈0 (90° turn), filling the page height.
+    let nums: Vec<f64> = content
+        .split_whitespace()
+        .filter_map(|t| t.parse::<f64>().ok())
+        .collect();
+    assert!(nums.len() >= 6, "content stream must start with a cm matrix");
+    let [a, b, c, d, _e, _f] = nums[..6] else {
+        panic!("matrix parse");
+    };
+    assert!(a.abs() < 0.01 && d.abs() < 0.01, "rotated: {nums:?}");
+    assert!(b < -100.0 && c > 100.0, "rotated: {nums:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn image_to_pdf_without_auto_rotate_keeps_image_upright() {
+    let dir = scratch("img-norot");
+    let img = make_landscape_jpeg(&dir, "wide.jpg");
+    let out = dir.join("merged.pdf");
+
+    let mut req = request(ToolId::ImageToPdf, vec![img], out.clone());
+    if let ToolOptions::ImageToPdf {
+        force_orientation,
+        auto_rotate,
+    } = &mut req.options
+    {
+        *force_orientation = Some(sparrowpdf::tools::Orientation::Portrait);
+        *auto_rotate = false;
+    }
+    run(ToolId::ImageToPdf, &req).expect("image to pdf succeeds");
+
+    let (_media_box, content) = first_page_geometry(&out);
+    // Identity orientation: a>0, d>0, b≈0, c≈0.
+    let nums: Vec<f64> = content
+        .split_whitespace()
+        .filter_map(|t| t.parse::<f64>().ok())
+        .collect();
+    assert!(nums.len() >= 6, "content stream must start with a cm matrix");
+    let [a, b, c, d, _e, _f] = nums[..6] else {
+        panic!("matrix parse");
+    };
+    assert!(a > 100.0 && d > 100.0, "upright: {nums:?}");
+    assert!(b.abs() < 0.01 && c.abs() < 0.01, "upright: {nums:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ folder batch
+
+/// A small JPEG fixture with the given size, written as `dir/name`.
+fn make_image(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
+    let path = dir.join(name);
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+    });
+    img.save_with_format(&path, image::ImageFormat::Jpeg)
+        .expect("write jpeg fixture");
+    path
+}
+
+#[test]
+fn folder_batch_collects_images_in_numeric_order() {
+    let dir = scratch("folder-sort");
+    for name in ["10.png", "2.png", "1.png"] {
+        make_image(&dir, name, 40, 20);
+    }
+    std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
+
+    let images = sparrowpdf::tools::folder_to_pdf::collect_images(&dir);
+    let names: Vec<String> = images
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["1.png", "2.png", "10.png"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_writes_one_pdf_per_folder_into_itself() {
+    let dir = scratch("folder-batch");
+    let album1 = dir.join("album1");
+    std::fs::create_dir_all(&album1).unwrap();
+    for name in ["1.jpg", "2.jpg", "3.jpg"] {
+        make_image(&album1, name, 60, 40);
+    }
+    let album2 = dir.join("album2");
+    std::fs::create_dir_all(&album2).unwrap();
+    make_image(&album2, "a.png", 60, 40);
+    make_image(&album2, "b.png", 60, 40);
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    // Empty output path = default: each PDF lands inside its own folder.
+    let req = request(
+        ToolId::FolderToPdf,
+        vec![album1.clone(), album2.clone(), empty.clone()],
+        PathBuf::new(),
+    );
+    match run(ToolId::FolderToPdf, &req) {
+        Err(ToolError::PartialSuccess {
+            succeeded, failed, ..
+        }) => {
+            assert_eq!(succeeded, 2, "two folders have images");
+            assert_eq!(failed, 1, "the empty folder is skipped");
+        }
+        other => panic!("expected PartialSuccess, got {:?}", other.is_ok()),
+    }
+
+    let pdf1 = album1.join("album1.pdf");
+    let pdf2 = album2.join("album2.pdf");
+    assert!(pdf1.is_file() && pdf2.is_file(), "PDFs named after folders");
+    assert_eq!(pdf_io::page_count_of(&pdf1, None).unwrap(), 3);
+    assert_eq!(pdf_io::page_count_of(&pdf2, None).unwrap(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_two_per_page_merges_specified_pairs() {
+    let dir = scratch("folder-pair");
+    let album = dir.join("pair");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg"] {
+        make_image(&album, name, 80, 40);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir.clone());
+    if let ToolOptions::FolderToPdf {
+        mode, merge_spec, ..
+    } = &mut req.options
+    {
+        *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+        // Images 2+3 share page 1; 1, 4, 5 stay single -> 4 pages.
+        *merge_spec = "2-3".to_string();
+    }
+    let outcome = run(ToolId::FolderToPdf, &req).expect("batch with spec succeeds");
+    assert_eq!(outcome.outputs.len(), 1);
+    let pdf = &outcome.outputs[0];
+    assert_eq!(pdf_io::page_count_of(pdf, None).unwrap(), 4);
+
+    // Two-per-page pages are landscape A4.
+    let doc = lopdf::Document::load(pdf).unwrap();
+    let page_id = *doc.get_pages().values().next().unwrap();
+    let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    let media_box: Vec<f64> = page
+        .get(b"MediaBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| match o {
+            lopdf::Object::Real(v) => *v as f64,
+            lopdf::Object::Integer(v) => *v as f64,
+            other => panic!("not a number: {other:?}"),
+        })
+        .collect();
+    assert!((media_box[2] - 841.89).abs() < 0.5, "landscape width");
+    assert!((media_box[3] - 595.28).abs() < 0.5, "landscape height");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_rejects_bad_merge_specs() {
+    let dir = scratch("folder-spec");
+    let album = dir.join("spec");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["1.jpg", "2.jpg", "3.jpg"] {
+        make_image(&album, name, 40, 20);
+    }
+
+    for bad_spec in ["9", "1-3", "0"] {
+        let mut req = request(ToolId::FolderToPdf, vec![album.clone()], dir.join("o.pdf"));
+        if let ToolOptions::FolderToPdf { mode, merge_spec, .. } = &mut req.options {
+            *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+            *merge_spec = bad_spec.to_string();
+        }
+        match run(ToolId::FolderToPdf, &req) {
+            Err(ToolError::InvalidPageRange { .. }) => {}
+            other => panic!("spec {bad_spec:?}: expected InvalidPageRange, got {:?}", other.is_ok()),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

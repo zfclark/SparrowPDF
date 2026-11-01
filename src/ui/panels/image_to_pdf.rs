@@ -2,44 +2,52 @@
 
 use egui::Ui;
 
-use crate::model::{TaskState, ToolId};
-use crate::tools::ToolOptions;
-use crate::tools::Orientation;
-use crate::ui::panels::{
-    FormState, PanelAction, action_row, add_files_button, input_list, output_selector, section,
-    status_area,
-};
+use crate::model::ToolId;
+use crate::tools::{Orientation, ToolOptions};
+use crate::ui::panels::{FormState, add_files_button, input_list, output_selector};
+use crate::ui::preview;
+use crate::ui::theme;
 
-pub fn show(ui: &mut Ui, form: &mut FormState, state: &TaskState) -> PanelAction {
+pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::PreviewState) {
     let tool = ToolId::ImageToPdf;
 
-    section(ui, "输入图片");
-    add_files_button(ui, tool, form);
-    input_list(ui, tool, &mut form.inputs, true);
-    ui.label(
-        egui::RichText::new("支持 JPEG / PNG，可拖放排序；重复图片会自动去重。")
-            .small()
-            .weak(),
-    );
+    theme::card(ui, "输入图片", |ui| {
+        add_files_button(ui, tool, form);
+        input_list(ui, tool, &mut form.inputs, true);
+    });
 
-    section(ui, "选项");
-    let mut force = None;
-    if let ToolOptions::ImageToPdf { force_orientation } = form.options_mut(tool) {
-        ui.horizontal(|ui| {
-            ui.label("页面方向");
-            ui.radio_value(&mut force, None, "按图片");
-            ui.radio_value(&mut force, Some(Orientation::Portrait), "A4 竖版");
-            ui.radio_value(&mut force, Some(Orientation::Landscape), "A4 横版");
-        });
-        *force_orientation = force;
-    }
+    let files: Vec<std::path::PathBuf> = form.inputs.iter().map(|f| f.path.clone()).collect();
+    preview::show_files(ui, &files, preview_state);
 
-    section(ui, "输出");
-    output_selector(ui, form, "merged.pdf", &["pdf"], false);
+    theme::card(ui, "选项", |ui| {
+        if let ToolOptions::ImageToPdf {
+            force_orientation,
+            auto_rotate,
+        } = form.options_mut(tool)
+        {
+            theme::field_row_hover(
+                ui,
+                "页面方向",
+                "按图片：每张图片各自决定页面方向；A4 竖版 / A4 横版：统一页面方向",
+                |ui| {
+                    ui.radio_value(force_orientation, None, "按图片");
+                    ui.radio_value(force_orientation, Some(Orientation::Portrait), "A4 竖版");
+                    ui.radio_value(force_orientation, Some(Orientation::Landscape), "A4 横版");
+                },
+            );
+            theme::field_row_hover(
+                ui,
+                "自动旋转",
+                "勾选后，横向图片放入竖版页面（或纵向图片放入横版页面）时自动旋转 90° 铺满页面，不再缩小居中",
+                |ui| {
+                    ui.checkbox(auto_rotate, "方向不匹配时旋转 90°");
+                },
+            );
+            theme::hint(ui, "例：横向图片 + A4 竖版 + 自动旋转 = 图片竖向铺满整页");
+        }
+    });
 
-    section(ui, "状态");
-    status_area(ui, state);
-
-    let can_run = !form.inputs.is_empty();
-    action_row(ui, state, can_run, "请先添加至少一张图片。")
+    theme::card(ui, "输出", |ui| {
+        output_selector(ui, form, "merged.pdf", &["pdf"], false);
+    });
 }

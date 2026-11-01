@@ -2,64 +2,61 @@
 
 use egui::Ui;
 
-use crate::model::{PageRangeMode, TaskState, ToolId};
+use crate::model::{PageRangeMode, ToolId};
 use crate::tools::ToolOptions;
 use crate::ui::panels::{
-    FormState, PanelAction, action_row, add_files_button, input_list, multi_output_note,
-    output_selector, password_field, section, status_area,
+    FormState, add_files_button, input_list, multi_output_note, output_selector,
+    password_field,
 };
+use crate::ui::theme;
 
-pub fn show(ui: &mut Ui, form: &mut FormState, state: &TaskState) -> PanelAction {
+pub fn show(ui: &mut Ui, form: &mut FormState) {
     let tool = ToolId::Split;
 
-    section(ui, "输入 PDF");
-    add_files_button(ui, tool, form);
-    input_list(ui, tool, &mut form.inputs, false);
+    theme::card(ui, "输入 PDF", |ui| {
+        add_files_button(ui, tool, form);
+        input_list(ui, tool, &mut form.inputs, false);
+    });
 
-    section(ui, "选项");
-    if let ToolOptions::Split {
-        mode,
-        spec,
-        every_n,
-    } = form.options_mut(tool)
-    {
-        ui.horizontal(|ui| {
-            ui.radio_value(mode, PageRangeMode::Explicit, "按页码范围");
-            ui.radio_value(mode, PageRangeMode::EveryN, "按每 N 页");
-            ui.radio_value(mode, PageRangeMode::SinglePages, "按单页");
-        });
-        match mode {
-            PageRangeMode::Explicit => {
-                ui.horizontal(|ui| {
-                    ui.label("页码范围");
-                    ui.add(
-                        egui::TextEdit::singleline(spec)
-                            .desired_width(160.0)
-                            .hint_text("如 1-3,7"),
+    theme::card(ui, "选项", |ui| {
+        if let ToolOptions::Split {
+            mode,
+            spec,
+            every_n,
+        } = form.options_mut(tool)
+        {
+            theme::field_row(ui, "拆分方式", |ui| {
+                ui.radio_value(mode, PageRangeMode::Explicit, "按页码范围");
+                ui.radio_value(mode, PageRangeMode::EveryN, "按每 N 页");
+                ui.radio_value(mode, PageRangeMode::SinglePages, "按单页");
+            });
+            match mode {
+                PageRangeMode::Explicit => {
+                    theme::field_row_hover(
+                        ui,
+                        "页码范围",
+                        "如 1-3,7；分段输出为一个文件",
+                        |ui| {
+                            theme::text_input(ui, spec, "例如：1-3,7 或 5");
+                        },
                     );
-                });
-            }
-            PageRangeMode::EveryN => {
-                ui.horizontal(|ui| {
-                    ui.label("每");
-                    ui.add(egui::DragValue::new(every_n).range(1..=9999));
-                    ui.label("页一个文件");
-                });
-            }
-            PageRangeMode::SinglePages => {
-                ui.label(egui::RichText::new("每一页输出一个 PDF 文件").weak());
+                }
+                PageRangeMode::EveryN => {
+                    theme::field_row(ui, "每 N 页", |ui| {
+                        theme::number_input(ui, every_n, 1..=9999, |d| d.speed(1.0));
+                        ui.label("页为一个文件");
+                    });
+                }
+                PageRangeMode::SinglePages => {
+                    theme::hint(ui, "每一页输出一个 PDF 文件");
+                }
             }
         }
-    }
-    password_field(ui, form);
+        password_field(ui, form);
+    });
 
-    section(ui, "输出");
-    multi_output_note(ui);
-    output_selector(ui, form, "", &[], true);
-
-    section(ui, "状态");
-    status_area(ui, state);
-
-    let can_run = !form.inputs.is_empty();
-    action_row(ui, state, can_run, "请先选择一个 PDF 文件。")
+    theme::card(ui, "输出", |ui| {
+        multi_output_note(ui);
+        output_selector(ui, form, "", &[], true);
+    });
 }

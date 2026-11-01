@@ -16,13 +16,24 @@ use eframe::egui;
 const WINDOW_TITLE: &str = "轻雀 PDF";
 const INITIAL_SIZE: [f32; 2] = [900.0, 650.0];
 
+fn window_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(app::ICON_PNG).ok()?;
+    let rgba = img.to_rgba8();
+    Some(egui::IconData {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    })
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
             .with_inner_size(INITIAL_SIZE)
             .with_min_inner_size([760.0, 520.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(window_icon().expect("embedded icon.png must decode")),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

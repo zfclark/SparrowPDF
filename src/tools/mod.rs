@@ -8,6 +8,8 @@ pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
 pub mod extract_text;
+pub mod folder_to_pdf;
+pub mod image_embed;
 pub mod image_to_pdf;
 pub mod image_watermark;
 pub mod merge;
@@ -34,6 +36,22 @@ pub enum ToolOptions {
     ImageToPdf {
         /// Force a page orientation instead of deriving it per image.
         force_orientation: Option<Orientation>,
+        /// Rotate an image 90° when its orientation conflicts with the forced
+        /// page orientation (landscape image on a portrait page and vice
+        /// versa), so it fills the page instead of shrinking to a strip.
+        auto_rotate: bool,
+    },
+    /// Batch conversion: one PDF per input folder.
+    FolderToPdf {
+        /// How images are laid out on pages.
+        mode: BatchPageMode,
+        /// Page orientation for one-image-per-page mode.
+        force_orientation: Option<Orientation>,
+        /// Two-per-page merge spec, e.g. `1-2,5-6` (1-based image numbers).
+        /// Empty means sequential pairs; images outside the spec stay alone.
+        merge_spec: String,
+        /// Rotate an image 90° when its orientation conflicts with its slot.
+        auto_rotate: bool,
     },
     Merge,
     Split {
@@ -91,6 +109,13 @@ impl ToolOptions {
         match id {
             ToolId::ImageToPdf => ToolOptions::ImageToPdf {
                 force_orientation: None,
+                auto_rotate: true,
+            },
+            ToolId::FolderToPdf => ToolOptions::FolderToPdf {
+                mode: BatchPageMode::Single,
+                force_orientation: None,
+                merge_spec: String::new(),
+                auto_rotate: true,
             },
             ToolId::Merge => ToolOptions::Merge,
             ToolId::Split => ToolOptions::Split {
@@ -143,6 +168,15 @@ impl ToolOptions {
 pub enum Orientation {
     Portrait,
     Landscape,
+}
+
+/// Page layout for the folder batch tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPageMode {
+    /// Each image becomes its own page.
+    Single,
+    /// Two images share one landscape page.
+    TwoPerPage,
 }
 
 /// Everything one execution needs. `output` is a file for single-output tools
@@ -217,6 +251,7 @@ pub trait Tool: Send + Sync {
 pub fn tool_for(id: ToolId) -> Box<dyn Tool> {
     match id {
         ToolId::ImageToPdf => Box::new(image_to_pdf::ImageToPdf),
+        ToolId::FolderToPdf => Box::new(folder_to_pdf::FolderToPdf),
         ToolId::Merge => Box::new(merge::Merge),
         ToolId::Split => Box::new(split::Split),
         ToolId::Rotate => Box::new(rotate::Rotate),
@@ -239,6 +274,6 @@ pub fn tool_for(id: ToolId) -> Box<dyn Tool> {
 pub fn ensure_dir(dir: &std::path::Path) -> Result<(), ToolError> {
     std::fs::create_dir_all(dir).map_err(|e| ToolError::WriteFailed {
         path: dir.to_path_buf(),
-        detail: e.to_string(),
+        detail: crate::engine::pdf_io::write_error_detail(&e),
     })
 }

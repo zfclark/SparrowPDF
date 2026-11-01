@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ToolId {
     ImageToPdf,
+    FolderToPdf,
     Merge,
     Split,
     Rotate,
@@ -25,8 +26,9 @@ pub enum ToolId {
 
 impl ToolId {
     /// Registry order, grouped the same way the sidebar renders them.
-    pub const ALL: [ToolId; 12] = [
+    pub const ALL: [ToolId; 13] = [
         ToolId::ImageToPdf,
+        ToolId::FolderToPdf,
         ToolId::Merge,
         ToolId::Split,
         ToolId::Rotate,
@@ -42,7 +44,7 @@ impl ToolId {
 
     pub fn group(self) -> ToolGroup {
         match self {
-            ToolId::ImageToPdf => ToolGroup::Generate,
+            ToolId::ImageToPdf | ToolId::FolderToPdf => ToolGroup::Generate,
             ToolId::Merge
             | ToolId::Split
             | ToolId::Rotate
@@ -58,6 +60,7 @@ impl ToolId {
     pub fn label(self) -> &'static str {
         match self {
             ToolId::ImageToPdf => "图片合并为 PDF",
+            ToolId::FolderToPdf => "批量转换",
             ToolId::Merge => "PDF 合并",
             ToolId::Split => "PDF 拆分",
             ToolId::Rotate => "页面旋转",
@@ -72,10 +75,29 @@ impl ToolId {
         }
     }
 
+    /// One-line summary shown under the panel heading.
+    pub fn description(self) -> &'static str {
+        match self {
+            ToolId::ImageToPdf => "把 JPEG / PNG 合并为一份 PDF，自动纠正 EXIF 方向",
+            ToolId::FolderToPdf => "选择文件夹，图片按文件名数字排序合成 PDF，支持两图一页",
+            ToolId::Merge => "多个 PDF 按列表顺序合并为一个文件",
+            ToolId::Split => "按页码范围、每 N 页或逐页拆分",
+            ToolId::Rotate => "以 90° 增量旋转指定页面",
+            ToolId::DeletePages => "按页码范围删除页面",
+            ToolId::Reorder => "拖动调整页面顺序后重组",
+            ToolId::Extract => "把选中的页面抽取为新文件",
+            ToolId::TextWatermark => "添加文本水印，支持平铺、透明度与旋转",
+            ToolId::ImageWatermark => "把图片作为水印叠加到每一页",
+            ToolId::Encrypt => "AES-256 加密，或移除现有密码",
+            ToolId::PdfToImage => "渲染为 PNG / JPEG，36-600 DPI",
+            ToolId::ExtractText => "提取文本层为 UTF-8 纯文本",
+        }
+    }
+
     /// File extensions the tool accepts from the drag-and-drop surface.
     pub fn accepted_extensions(self) -> &'static [&'static str] {
         match self {
-            ToolId::ImageToPdf => &["jpg", "jpeg", "png"],
+            ToolId::ImageToPdf | ToolId::FolderToPdf => &["jpg", "jpeg", "png"],
             ToolId::ImageWatermark => &["pdf", "jpg", "jpeg", "png"],
             ToolId::PdfToImage => &["pdf"],
             _ => &["pdf"],
@@ -85,7 +107,7 @@ impl ToolId {
     /// How many file slots the tool takes. `None` means unbounded.
     pub fn max_inputs(self) -> Option<usize> {
         match self {
-            ToolId::Merge | ToolId::ImageToPdf => None,
+            ToolId::Merge | ToolId::ImageToPdf | ToolId::FolderToPdf => None,
             ToolId::ImageWatermark => Some(2),
             _ => Some(1),
         }
@@ -95,7 +117,7 @@ impl ToolId {
     pub fn is_multi_output(self) -> bool {
         matches!(
             self,
-            ToolId::Split | ToolId::PdfToImage
+            ToolId::Split | ToolId::PdfToImage | ToolId::FolderToPdf
         )
     }
 }
@@ -165,28 +187,6 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    pub fn label(&self) -> String {
-        match self {
-            TaskState::Idle => "空闲".to_string(),
-            TaskState::Validating => "校验中".to_string(),
-            TaskState::Ready => "就绪".to_string(),
-            TaskState::Running { progress, .. } => {
-                format!("处理中 {}%", (progress * 100.0).round() as i32)
-            }
-            TaskState::Done { .. } => "完成".to_string(),
-            TaskState::Failed { .. } => "失败".to_string(),
-            TaskState::Cancelled => "已取消".to_string(),
-        }
-    }
-
-    pub fn progress(&self) -> Option<f32> {
-        match self {
-            TaskState::Running { progress, .. } => Some(*progress),
-            TaskState::Done { .. } => Some(1.0),
-            _ => None,
-        }
-    }
-
     /// True while the tool must reject a second execute click.
     pub fn is_busy(&self) -> bool {
         matches!(self, TaskState::Validating | TaskState::Running { .. })

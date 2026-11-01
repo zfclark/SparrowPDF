@@ -1,9 +1,9 @@
 [package]
 name = "sparrowpdf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.95"
-description = "轻雀 PDF —— 纯 Rust 本地 PDF 工具箱"
+description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
 publish = false
 
 [lib]
@@ -25,9 +25,6 @@ medpdf-image = { version = "0.2.2", default-features = false }
 kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-# medpdf 在自己的清单里以 default features 引 allsorts，Cargo 特一化后
-# allsorts/default（flate2_zlib → libz-sys 静态 C zlib）会被拉回。
-# 此处显式声明 flate2_rust 仅表达意图；见 README「依赖说明」。
 allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
 
 [profile.release]
