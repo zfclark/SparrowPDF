@@ -1,6 +1,6 @@
 [package]
 name = "sparrowpdf"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
