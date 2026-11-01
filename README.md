@@ -31,6 +31,25 @@ cargo build --release
 - 最低 Rust 版本：1.95（edition 2021）。
 - 无需任何系统级 C/C++ 依赖（见下方「依赖说明」）。
 
+### Windows：提权与免提权变体
+
+默认构建的 exe 内嵌清单 `requestedExecutionLevel = requireAdministrator`，
+启动时会请求管理员权限——这样输出可以直接写入受保护目录（如
+`C:\Program Files`、其他用户的目录）。代价：每次启动弹一次 UAC，
+且系统禁止把文件从资源管理器拖入提权进程（拖放会失效）。
+
+需要「普通权限启动、拖放正常」的变体（适合按用户安装、输出到文档/桌面）：
+
+```bash
+SPARROW_AS_INVOKER=1 cargo build --release
+```
+
+该变体写受保护目录时仍会失败，但程序会把输出自动改存到
+`文档\SparrowPDF` 并在结果卡片提示（也可对目标目录做一次性授权：
+`icacls "目标目录" /grant "%USERNAME%":(OI)(CI)M`，之后普通权限可直接写入）。
+
+macOS 无此机制：权限由 POSIX/ACL 与 TCC 决定，`.app` 正常以当前用户身份运行。
+
 ## UI 语言与中文字体
 
 界面为简体中文。为遵守体积红线，程序**不内嵌 CJK 字体**：启动时会按顺序探测系统字体（微软雅黑 / 等线 / 黑体 / 宋体 / PingFang / Noto Sans CJK / DejaVu Sans 等），命中后以运行时回退字体注入 egui。

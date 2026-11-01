@@ -175,6 +175,9 @@ pub enum TaskState {
     Done {
         summary: String,
         outputs: Vec<PathBuf>,
+        /// Extra note shown under the summary (e.g. the output had to be
+        /// redirected to a writable directory).
+        note: Option<String>,
     },
     Failed {
         error: ToolError,

@@ -92,6 +92,9 @@ pub enum PanelAction {
     None,
     Run,
     Cancel,
+    /// The result card offered to save into Documents instead of a
+    /// protected location.
+    RetryInDocuments,
 }
 
 /// What a panel tells the shell about its action bar.

@@ -17,7 +17,8 @@ target
 rustc-ice-*.txt
 
 # Ignore editor and OS noise.
-.dsh/
+.dsh
+.workbuddy
 .vscode/
 .idea/
 *.swp
@@ -31,6 +32,3 @@ dist/
 
 # Local debug / verification artifacts (screenshots, fixtures, scratch PDFs).
 .probe/
-
-# WorkBuddy local workspace data.
-.workbuddy/

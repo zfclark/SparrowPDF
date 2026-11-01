@@ -14,7 +14,9 @@ pub fn show(ui: &mut Ui, state: &TaskState, view: &PanelView) -> PanelAction {
     let mut action = PanelAction::None;
 
     egui::Panel::bottom("sparrow_bottom").show(ui, |ui| {
-        theme::result_area(ui, state);
+        if theme::result_area(ui, state) == theme::ResultAction::RetryInDocuments {
+            action = PanelAction::RetryInDocuments;
+        }
 
         // Hairline between the content above and the action row.
         let rect = ui.available_rect_before_wrap();

@@ -6,7 +6,7 @@
 
 use egui::{Color32, CornerRadius, FontId, FontFamily, Margin, Pos2, RichText, Stroke, TextStyle, Ui, vec2};
 
-use crate::model::TaskState;
+use crate::model::{TaskState, ToolError};
 
 // ------------------------------------------------------------------ palette
 
@@ -449,16 +449,38 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
         .circle_filled(rect.center() + vec2(0.0, 0.5), 4.0, color);
 }
 
+/// What the result card asks the shell to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResultAction {
+    #[default]
+    None,
+    /// The chosen output location was not writable: retry into Documents.
+    RetryInDocuments,
+}
+
 /// Result area, shown once a task finished, failed or was cancelled.
 ///
 /// Renders nothing while the tool is idle, so it costs no space until there
 /// is something to report.
-pub fn result_area(ui: &mut Ui, state: &TaskState) {
+pub fn result_area(ui: &mut Ui, state: &TaskState) -> ResultAction {
+    let mut action = ResultAction::None;
     match state {
-        TaskState::Done { summary, outputs } => {
+        TaskState::Done {
+            summary,
+            outputs,
+            note,
+        } => {
             tinted_card(ui, success(ui), |ui| {
                 ui.label(RichText::new("已完成").strong().color(success(ui)));
                 ui.label(summary);
+                if let Some(note) = note {
+                    // No emoji here: the bundled CJK font has no ⚠ glyph.
+                    ui.label(
+                        RichText::new(format!("注意：{note}"))
+                            .small()
+                            .color(warning(ui)),
+                    );
+                }
                 for output in outputs.iter().take(6) {
                     let link = ui
                         .link(RichText::new(output.display().to_string()).small())
@@ -470,12 +492,24 @@ pub fn result_area(ui: &mut Ui, state: &TaskState) {
                 if outputs.len() > 6 {
                     hint(ui, &format!("……另有 {} 个文件已输出", outputs.len() - 6));
                 }
+                if let Some(dir) = outputs.first().and_then(|p| p.parent()) {
+                    if small_button(ui, "打开所在文件夹").clicked() {
+                        let _ = open_path(dir);
+                    }
+                }
             });
         }
         TaskState::Failed { error } => {
             tinted_card(ui, danger(ui), |ui| {
                 ui.label(RichText::new("处理失败").strong().color(danger(ui)));
                 ui.label(RichText::new(error.to_string()).small());
+                // Permission failures get a one-click escape hatch: save into
+                // the user's writable Documents folder instead.
+                if matches!(error, ToolError::WriteFailed { .. }) {
+                    if small_button(ui, "改存到「文档」并重试").clicked() {
+                        action = ResultAction::RetryInDocuments;
+                    }
+                }
             });
         }
         TaskState::Cancelled => {
@@ -485,6 +519,7 @@ pub fn result_area(ui: &mut Ui, state: &TaskState) {
         }
         TaskState::Idle | TaskState::Validating | TaskState::Ready | TaskState::Running { .. } => {}
     }
+    action
 }
 
 fn tinted_card(ui: &mut Ui, tint: Color32, add_contents: impl FnOnce(&mut Ui)) {

@@ -34,6 +34,8 @@ pub struct SparrowApp {
     /// Chosen fallback directory per unwritable source directory, so the
     /// decision (and its log line) happens exactly once.
     fallback_cache: std::collections::BTreeMap<PathBuf, PathBuf>,
+    /// Note to attach to the next finished task (e.g. "output was redirected").
+    task_note: Option<String>,
     /// Thumbnail preview state shared by the image→PDF panels.
     preview: crate::ui::preview::PreviewState,
 }
@@ -116,6 +118,7 @@ impl SparrowApp {
                         PathBuf::from("E:\\output\\merged.pdf"),
                         PathBuf::from("E:\\output\\merged-2.pdf"),
                     ],
+                    note: Some("源文件夹不可写，输出已改存到「文档\\SparrowPDF」".to_string()),
                 },
             );
         }
@@ -141,6 +144,7 @@ impl SparrowApp {
             probe,
             writable_cache: std::collections::BTreeMap::new(),
             fallback_cache: std::collections::BTreeMap::new(),
+            task_note: None,
             preview: crate::ui::preview::PreviewState::new(),
         }
     }
@@ -183,6 +187,7 @@ impl SparrowApp {
                     TaskState::Done {
                         summary: outcome.summary,
                         outputs: outcome.outputs,
+                        note: self.task_note.take(),
                     },
                 );
                 self.worker = None;
@@ -251,6 +256,10 @@ impl SparrowApp {
             ),
         );
 
+        // Remember whether the default output had to be redirected, so the
+        // result card can tell the user where the file actually went.
+        self.task_note = self.redirect_note(tool_id, &request);
+
         self.states.insert(tool_id, TaskState::Ready);
         self.states.insert(
             tool_id,
@@ -260,6 +269,62 @@ impl SparrowApp {
             },
         );
         self.worker = Some((tool_id, spawn(tool_id, request)));
+    }
+
+    /// Build the "output was redirected" note for the result card.
+    ///
+    /// Only applies to automatically resolved destinations: an explicitly
+    /// chosen path is never silently moved.
+    fn redirect_note(
+        &self,
+        tool_id: ToolId,
+        request: &crate::tools::ToolRequest,
+    ) -> Option<String> {
+        if self.form.output.is_some() || tool_id.is_multi_output() {
+            return None;
+        }
+        if request.output.as_os_str().is_empty() {
+            return None;
+        }
+        let source_parent = self
+            .form
+            .inputs
+            .first()
+            .and_then(|f| f.path.parent())
+            .map(|p| p.to_path_buf());
+        let out_parent = request.output.parent().map(|p| p.to_path_buf());
+        if source_parent.is_some() && source_parent != out_parent {
+            out_parent.map(|dir| format!("源文件夹不可写，输出已改存到「{}」", dir.display()))
+        } else {
+            None
+        }
+    }
+
+    /// Retry the current task with its output redirected into the writable
+    /// fallback folder (offered by the failure card).
+    fn retry_in_documents(&mut self) {
+        let Some(dir) = fallback_output_dir() else {
+            crate::engine::logging::log("ERROR", "没有找到可写的回退目录");
+            return;
+        };
+        let tool = self.current;
+        let target = if tool.is_multi_output() {
+            dir.clone()
+        } else {
+            let source = self
+                .form
+                .inputs
+                .first()
+                .map(|f| f.path.clone())
+                .unwrap_or_else(|| PathBuf::from("output.pdf"));
+            dir.join(format!("{}{}.pdf", file_stem(&source), output_suffix(tool)))
+        };
+        crate::engine::logging::log(
+            "INFO",
+            &format!("按用户选择改存到：{}", target.display()),
+        );
+        self.form.output = Some(target);
+        self.start();
     }
 
     /// Re-evaluate readiness for the active tool after the form changed.
@@ -351,17 +416,7 @@ impl SparrowApp {
             return parent;
         }
 
-        let suffix = match tool_id {
-            ToolId::ImageToPdf | ToolId::Merge => "_merged",
-            ToolId::Rotate => "_rotated",
-            ToolId::DeletePages => "_deleted",
-            ToolId::Reorder => "_reordered",
-            ToolId::Extract => "_extracted",
-            ToolId::TextWatermark | ToolId::ImageWatermark => "_watermarked",
-            ToolId::Encrypt => "_secured",
-            _ => "_out",
-        };
-
+        let suffix = output_suffix(tool_id);
         let ext = "pdf";
         parent.join(format!("{}{suffix}.{ext}", file_stem(&source)))
     }
@@ -520,6 +575,7 @@ impl eframe::App for SparrowApp {
         match action {
             PanelAction::Run => self.start(),
             PanelAction::Cancel => self.cancel(),
+            PanelAction::RetryInDocuments => self.retry_in_documents(),
             PanelAction::None => {}
         }
 
@@ -559,20 +615,48 @@ fn file_stem(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "output".to_string())
 }
 
+/// Default file-name suffix per tool (single-output tools).
+fn output_suffix(tool_id: ToolId) -> &'static str {
+    match tool_id {
+        ToolId::ImageToPdf | ToolId::Merge => "_merged",
+        ToolId::Rotate => "_rotated",
+        ToolId::DeletePages => "_deleted",
+        ToolId::Reorder => "_reordered",
+        ToolId::Extract => "_extracted",
+        ToolId::TextWatermark | ToolId::ImageWatermark => "_watermarked",
+        ToolId::Encrypt => "_secured",
+        _ => "_out",
+    }
+}
+
 /// First writable directory among common user folders, used when the source's
 /// own folder is protected and the process lacks administrator rights.
+///
+/// Preferred target is a dedicated `Documents/SparrowPDF` folder: it is
+/// always writable for the current user, predictable, and keeps redirected
+/// outputs out of the user's normal document list.
 fn fallback_output_dir() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home_dir() {
+        candidates.push(home.join("Documents").join("SparrowPDF"));
         candidates.push(home.join("Documents"));
+        // Documents may be redirected into OneDrive (`%OneDrive%\Documents`).
+        if let Some(onedrive) = std::env::var_os("OneDrive") {
+            let base = PathBuf::from(onedrive).join("Documents");
+            candidates.push(base.join("SparrowPDF"));
+            candidates.push(base);
+        }
         candidates.push(home.join("Desktop"));
         candidates.push(home.join("Downloads"));
         candidates.push(home);
     }
     candidates.push(std::env::temp_dir());
-    candidates
-        .into_iter()
-        .find(|dir| crate::engine::pdf_io::dir_is_writable(dir))
+    candidates.into_iter().find(|dir| {
+        // The preferred folder may not exist yet; creating it here means the
+        // probe (and the later save) agree on the same location.
+        let _ = std::fs::create_dir_all(dir);
+        crate::engine::pdf_io::dir_is_writable(dir)
+    })
 }
 
 fn home_dir() -> Option<PathBuf> {
