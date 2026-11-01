@@ -38,6 +38,8 @@ pub struct SparrowApp {
     task_note: Option<String>,
     /// Thumbnail preview state shared by the image→PDF panels.
     preview: crate::ui::preview::PreviewState,
+    /// Saved appearance choice; `None` follows the operating-system theme.
+    theme_pref: Option<crate::ui::prefs::ThemePref>,
 }
 
 /// TEMP: environment-driven screenshot probe for visual verification.
@@ -67,8 +69,20 @@ impl SparrowApp {
             failed: std::env::var("SPARROW_SHOT_FAIL").is_ok(),
             frames: 0,
         };
-        if probe.dark {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+        // Appearance: the screenshot probe wins, then the saved user choice.
+        // With neither, leave egui alone so the app keeps following the
+        // operating-system theme (pinning a guess here would freeze the first
+        // frame into the wrong mode).
+        let theme_pref = probe
+            .dark
+            .then_some(crate::ui::prefs::ThemePref::Dark)
+            .or_else(crate::ui::prefs::load);
+        if let Some(pref) = theme_pref {
+            cc.egui_ctx.set_theme(if pref.is_dark() {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
         }
         let mut current = ToolId::ImageToPdf;
         if let Ok(label) = std::env::var("SPARROW_SHOT_TOOL") {
@@ -146,7 +160,30 @@ impl SparrowApp {
             fallback_cache: std::collections::BTreeMap::new(),
             task_note: None,
             preview: crate::ui::preview::PreviewState::new(),
+            theme_pref,
         }
+    }
+
+    /// Apply the appearance choice, remember it, and log the switch.
+    fn set_theme_pref(&mut self, ctx: &egui::Context, pref: crate::ui::prefs::ThemePref) {
+        if self.theme_pref == Some(pref) {
+            return;
+        }
+        self.theme_pref = Some(pref);
+        ctx.set_theme(if pref.is_dark() {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
+        crate::ui::prefs::save(pref);
+        crate::engine::logging::log(
+            "INFO",
+            if pref.is_dark() {
+                "界面外观切换为深色"
+            } else {
+                "界面外观切换为浅色"
+            },
+        );
     }
 
     fn state(&self) -> &TaskState {
@@ -546,7 +583,12 @@ impl eframe::App for SparrowApp {
         let view = panel_view(self.current, &self.form, &self.reorder);
         let action = status::show(ui, self.state(), &view);
 
-        if let Some(tool) = sidebar::show(ui, self.current, self.icon.as_ref()) {
+        let dark = matches!(ctx.theme(), egui::Theme::Dark);
+        let side = sidebar::show(ui, self.current, self.icon.as_ref(), dark);
+        if let Some(dark) = side.theme {
+            self.set_theme_pref(&ctx, crate::ui::prefs::ThemePref::from_dark(dark));
+        }
+        if let Some(tool) = side.selected {
             if tool != self.current {
                 self.current = tool;
                 self.form.reset_inputs();

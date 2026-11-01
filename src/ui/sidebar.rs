@@ -11,14 +11,35 @@ use crate::ui::theme::{self, SIDEBAR_ROW_H, accent, hover_fill, lerp_color, pain
 /// Sidebar width in logical points; sized so 900x650 never scrolls.
 const WIDTH: f32 = 204.0;
 
-/// Draw the sidebar and return the tool the user selected this frame, if any.
-pub fn show(ui: &mut Ui, current: ToolId, icon: Option<&egui::TextureHandle>) -> Option<ToolId> {
-    let mut selected = None;
+/// What the sidebar produced this frame.
+#[derive(Debug, Default)]
+pub struct SidebarOutput {
+    /// Tool the user selected, if any.
+    pub selected: Option<ToolId>,
+    /// Appearance the user asked for, when the footer switch was used.
+    pub theme: Option<bool>,
+}
+
+/// Draw the sidebar and report the tool / appearance the user picked.
+pub fn show(
+    ui: &mut Ui,
+    current: ToolId,
+    icon: Option<&egui::TextureHandle>,
+    dark: bool,
+) -> SidebarOutput {
+    let mut output = SidebarOutput::default();
 
     egui::Panel::left("sparrow_sidebar")
         .resizable(false)
         .exact_size(WIDTH)
         .show(ui, |ui| {
+            // The footer is declared first, as a bottom panel: it reserves its
+            // own space so the tool list (which fills the rest) can never push
+            // it out of view.
+            egui::Panel::bottom("sparrow_sidebar_footer").show(ui, |ui| {
+                footer(ui, dark, &mut output);
+            });
+
             app_header(ui, icon);
             ui.add_space(theme::GAP_S);
 
@@ -29,24 +50,35 @@ pub fn show(ui: &mut Ui, current: ToolId, icon: Option<&egui::TextureHandle>) ->
                         group_header(ui, group);
                         for tool in group.tools() {
                             if tool_row(ui, tool, tool == current) {
-                                selected = Some(tool);
+                                output.selected = Some(tool);
                             }
                         }
                         ui.add_space(theme::GAP_XS);
                     }
                 });
-
-            ui.add_space(theme::GAP_S);
-            ui.painter().hline(
-                ui.available_rect_before_wrap().x_range(),
-                ui.available_rect_before_wrap().top(),
-                theme::hairline(ui),
-            );
-            ui.add_space(theme::GAP_S);
-            ui.label(egui::RichText::new("无上传 · 无遥测 · 本地处理").small().weak());
         });
 
-    selected
+    output
+}
+
+/// Sidebar footer: appearance switch plus the privacy note.
+fn footer(ui: &mut Ui, dark: bool, output: &mut SidebarOutput) {
+    ui.add_space(theme::GAP_S);
+    ui.painter().hline(
+        ui.available_rect_before_wrap().x_range(),
+        ui.available_rect_before_wrap().top(),
+        theme::hairline(ui),
+    );
+    ui.add_space(theme::GAP_S);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("外观").small().weak());
+        if let Some(dark) = theme::theme_switch(ui, dark) {
+            output.theme = Some(dark);
+        }
+    });
+    ui.add_space(theme::GAP_XS);
+    ui.label(egui::RichText::new("无上传 · 无遥测 · 本地处理").small().weak());
+    ui.add_space(theme::GAP_XS);
 }
 
 fn app_header(ui: &mut Ui, icon: Option<&egui::TextureHandle>) {

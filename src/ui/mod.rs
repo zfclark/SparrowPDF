@@ -6,6 +6,7 @@
 //! under `ui/`.
 
 pub mod panels;
+pub mod prefs;
 pub mod preview;
 pub mod sidebar;
 pub mod status;

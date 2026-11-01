@@ -188,6 +188,32 @@ pub fn small_button(ui: &mut Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(text).small().corner_radius(CornerRadius::same(RADIUS_CTRL - 1)))
 }
 
+/// Appearance switch (`浅色 / 深色`), used in the sidebar footer.
+///
+/// The active side uses egui's selection visuals, which already resolve against
+/// the current theme, so the control reads correctly in both modes. Returns the
+/// newly requested dark flag only when the user picks the inactive side.
+pub fn theme_switch(ui: &mut Ui, dark: bool) -> Option<bool> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        for (label, wants_dark) in [("浅色", false), ("深色", true)] {
+            let selected = dark == wants_dark;
+            let hover = if selected {
+                "当前外观"
+            } else {
+                "切换到此外观（会记住，下次启动沿用）"
+            };
+            let response = ui
+                .selectable_label(selected, RichText::new(label).small())
+                .on_hover_text(hover);
+            if response.clicked() && !selected {
+                picked = Some(wants_dark);
+            }
+        }
+    });
+    picked
+}
+
 /// Label + control on one line; labels share a fixed column so forms align.
 pub fn field_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
     field_row_hover(ui, label, "", add_contents);
