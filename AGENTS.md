@@ -1,0 +1,640 @@
+# 轻雀 PDF（SparrowPDF）协作与交付规范
+
+> 本文件是仓库内**唯一**的工程协作契约，面向人类开发者与 AI 编码代理（Claude Code、Codex、Cursor、Copilot Workspace 等）。
+> 与 `README.md` 冲突时，以本文件为准；与代码现状冲突时，先修文档或代码，不允许两套标准并行。
+> 维护责任：发布负责人。每次流程变更必须同步修改本文件，并随代码一起提交。
+
+---
+
+## 0. 使用方式（AI 代理执行约定）
+
+开始任何任务前，按以下顺序建立上下文，完成后再动手：
+
+1. 读 `Cargo.toml`（版本号、依赖、release profile）
+2. 读 `src/model.rs`（`ToolId`、`ToolGroup`、`ToolError`、`TaskState`）
+3. 读 `src/tools/mod.rs`（`Tool` trait、`ToolOptions`、`Progress`、`CancelFlag`）
+4. 读将要修改的模块，以及 `src/ui/mod.rs` 顶部的分层约束注释
+5. 若涉及界面，再读 `src/ui/theme.rs`（设计令牌与组件）
+
+执行原则：
+
+- **先读后写**：不得在未读源码的情况下凭猜测改接口。
+- **最小改动**：一次任务只解决一个议题，不夹带格式重排、无关重命名。
+- **验证前置**：改完必须跑第 4.4 节的质量门，输出真实结果，不臆测「应该能过」。
+- **不做外部动作**：`git push`、`git tag` 推送、创建 Release、修改仓库设置等一律需人工明确授权。
+- **不确定就问**：涉及依赖增删、公开接口破坏、License 变更时停下确认。
+
+---
+
+## 1. 项目概览
+
+### 1.1 定位与硬性约束
+
+| 项目 | 说明 |
+| --- | --- |
+| 产品名 | 轻雀 PDF / SparrowPDF |
+| 形态 | 单机桌面应用（Windows / macOS），单文件可执行 |
+| 语言 | Rust，edition 2021，MSRV 1.95（CI 固定 1.97.1） |
+| 界面 | egui / eframe 0.37，Glow 后端，无 WebView |
+| 数据流 | **纯本地**：不联网、不上传、无遥测、无账号体系 |
+| 工具数 | 12 项，分组：生成 2 / 结构操作 6 / 页面编辑 2 / 安全 1 / 转换 1 |
+| 安装形态 | 绿色 exe（Windows）、`.app` 打包为 DMG（macOS） |
+
+破坏性约束（任何改动都不得违反）：
+
+1. 不引入网络请求、埋点、崩溃上报、自动更新检查。
+2. 不引入需要 C/C++ 系统库编译的新依赖（当前仅 `libz-sys` 通过 `cc` 编译，属既有例外）。
+3. 不改动 `LICENSE`（MIT，版权人 霖海）。
+4. 不提交二进制产物、构建缓存、本地调试素材。
+
+### 1.2 技术栈
+
+| 依赖 | 用途 |
+| --- | --- |
+| `eframe` / `egui` 0.37 | 窗口与 immediate-mode UI |
+| `egui_dnd` 0.18 | 页面/文件拖拽排序 |
+| `rfd` 0.17 | 系统文件/文件夹选择对话框 |
+| `lopdf` 0.39 | PDF 对象模型、读写、加密 |
+| `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入 |
+| `kamadak-exif` 0.6 | JPEG 的 EXIF 方向读取 |
+| `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
+| `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
+| `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |
+
+---
+
+## 2. 目录结构与职责
+
+### 2.1 顶层结构
+
+```
+SparrowPDF/
+├── Cargo.toml            # 包元数据、依赖、release profile（体积/性能开关）
+├── Cargo.lock            # 锁定依赖，发布构建使用 --locked
+├── build.rs              # Windows 资源：app.ico + 应用清单（提权/长路径/DPI）
+├── assets/               # 图标素材（icns / ico / png），不参与运行时解码逻辑
+├── src/                  # 全部 Rust 源码（见 2.2）
+├── tests/integration.rs  # 端到端集成测试（不启动 GUI，直接调 Tool）
+├── README.md             # 面向用户的功能与安装说明
+├── AGENTS.md             # 本文件：面向协作者的工程规范
+└── .github/workflows/    # 发布流水线（tag 触发，构建双平台并产出 Release）
+```
+
+本地开发期目录（**不入库**，已在 `.gitignore` 中）：`target/`、`.probe/`（截图与调试素材）、`.workbuddy/`（本机代理工作数据）。
+
+### 2.2 `src/` 分层与依赖方向
+
+```
+main.rs ── 启动窗口、内嵌图标、运行 eframe
+   │
+app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、worker 轮询、结果渲染
+   │
+   ├── ui/        纯表现层（不得出现 PDF / 图片库类型）
+   │    ├── theme.rs     设计令牌 + 组件（卡片、按钮、输入框、状态色、结果区）
+   │    ├── sidebar.rs   工具导航 + 外观切换
+   │    ├── status.rs    底部操作条（主按钮、进度、结果区）
+   │    ├── preview.rs   缩略图预览（图片与 PDF 页面，逐帧限流渲染）
+   │    ├── prefs.rs     外观偏好持久化（%LOCALAPPDATA%\sparrowpdf\ui.pref）
+   │    └── panels/      每个工具一个面板文件，与 tools/ 一一对应
+   │
+   ├── tools/     业务层：把一次请求变成产物
+   │    ├── mod.rs        Tool trait、ToolOptions、Progress、CancelFlag、tool_for
+   │    ├── image_embed.rs 图片页嵌入与排版（被图片类工具共享）
+   │    └── <tool>.rs     12 个工具实现（image_to_pdf、folder_to_pdf、merge、…）
+   │
+   ├── engine/    基础设施层：不含业务语义
+   │    ├── pdf_io.rs   打开/保存/原子写/可写性探测/错误文案
+   │    ├── worker.rs   后台线程 + catch_unwind + 取消
+   │    ├── validate.rs 产物断言（页数、非空文本等）
+   │    ├── render.rs   PDF 页面软件光栅化（缩略图与 PDF 转图片）
+   │    ├── raster.rs   像素缓冲与绘制原语
+   │    ├── ttf.rs      TrueType/OpenType 解析（支持 .ttc 集合）
+   │    └── logging.rs  追加式文件日志（%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log）
+   │
+   └── model.rs   领域模型（无 IO、无第三方 PDF 类型）：ToolId / ToolGroup / ToolError / TaskState
+```
+
+**依赖方向（硬约束）**
+
+- `ui/` → `model`、`tools`（仅选项类型与 trait 签名）、`engine::logging`
+- `tools/` → `engine`、`model`、`lopdf` / `medpdf` / `image`
+- `engine/` → `model`（错误类型）与各自领域库
+- `model.rs` → 仅标准库
+- `ui/` 中**禁止**出现 `lopdf`、`medpdf`、`medpdf_image`、`image`、`kamadak_exif` 的类型（`src/ui/mod.rs` 顶部有明文约束）
+
+### 2.3 关键文件职责
+
+| 文件 | 职责 | 修改风险 |
+| --- | --- | --- |
+| `src/model.rs` | 工具注册表与错误模型；新增工具必须在此登记 | 高：影响全部面板与测试 |
+| `src/tools/mod.rs` | `Tool` 契约、选项枚举、进度/取消通道、工厂函数 | 高 |
+| `src/engine/pdf_io.rs` | 唯一的落盘入口（原子写）、密码打开、可写性探测 | 高：写坏即数据丢失 |
+| `src/engine/worker.rs` | 线程生命周期、panic 捕获、取消传播 | 中 |
+| `src/app.rs` | 输出路径解析与回退、任务编排、结果状态机 | 中高 |
+| `src/ui/theme.rs` | 全部视觉令牌与通用控件 | 中：改动影响所有面板 |
+| `build.rs` | Windows 清单与图标；提权策略 | 中：可令程序无法启动 |
+
+---
+
+## 3. 核心功能与实现逻辑
+
+### 3.1 工具清单
+
+| 分组 | 工具 | 输入 | 产物 |
+| --- | --- | --- | --- |
+| 生成 | 图片合并为 PDF | 多张 JPG/PNG | 单个 PDF |
+| 生成 | 批量转换 | 多个文件夹 | 每个文件夹一个 PDF |
+| 结构操作 | PDF 合并 | ≥2 个 PDF | 单个 PDF |
+| 结构操作 | PDF 拆分 | 1 个 PDF | 按页码范围 / 每 N 页 / 逐页输出 |
+| 结构操作 | 页面旋转 | 1 个 PDF | 旋转后的 PDF |
+| 结构操作 | 删除页面 | 1 个 PDF | 删页后的 PDF |
+| 结构操作 | 页面重排 | 1 个 PDF | 重排后的 PDF |
+| 结构操作 | 提取页面 | 1 个 PDF | 抽取页组成的新 PDF |
+| 页面编辑 | 文本水印 | 1 个 PDF | 叠加文字水印的 PDF |
+| 页面编辑 | 图片水印 | 1 个 PDF + 1 图 | 叠加图片水印的 PDF |
+| 安全 | 加密 / 解密 | 1 个 PDF | AES-256 加密或移除密码 |
+| 转换 | PDF 转图片 | 1 个 PDF | 每页 PNG/JPEG |
+
+### 3.2 统一契约
+
+所有工具实现 `Tool`（`src/tools/mod.rs`）：
+
+```rust
+pub trait Tool: Send + Sync {
+    fn id(&self) -> ToolId;
+    fn validate(&self, req: &ToolRequest) -> Result<(), ToolError>;   // 只读预检
+    fn execute(&self, req: &ToolRequest, progress: &Progress,
+               cancel: &CancelFlag) -> Result<ToolOutcome, ToolError>;
+}
+```
+
+- `ToolRequest`：`inputs: Vec<InputFile>`、`output: PathBuf`、`options: ToolOptions`、`password: Option<String>`。
+- `ToolOptions`：每工具一个变体，保证 `execute` 签名统一且类型安全。
+- `Progress::report(fraction, msg)`：把进度送回 UI（内部限幅 0~1）。
+- `CancelFlag = Arc<AtomicBool>`：**循环体内**必须调用 `check_cancel(cancel)?`。
+- 成功返回 `ToolOutcome { summary, outputs }`；部分失败返回 `ToolError::PartialSuccess`。
+
+### 3.3 落盘与自校验流水线（所有工具必须遵守）
+
+1. 解析参数 → 尽早失败（`validate`）。
+2. 逐项处理，每步 `check_cancel` + `progress.report`。
+3. **统一经 `pdf_io::save_document`（或 `write_file`）落盘**：先写同目录临时文件，再 `rename` 覆盖，避免半成品；权限错误由 `write_error_detail` 映射为中文提示。
+4. 落盘后**重新打开产物断言**（`validate::assert_page_count` 等）；断言失败要删除产物并返回 `ValidationFailed`。
+5. 不得在工具内部直接 `fs::write` 或 `File::create` 绕过第 3 步。
+
+### 3.4 图片 → PDF（`tools/image_embed.rs`）
+
+- **JPEG 直通**：以 `DCTDecode` 原样嵌入，不二次编码，画质与体积最优。
+- **PNG 内嵌**：解码后以 `FlateDecode` + `SMask` 写入。
+- **EXIF 方向**：`read_exif_orientation` 读到 5~8 时交换宽高，并通过 `rotate_cw_code` 合成旋转矩阵（与自动旋转复合，不叠加错误）。
+- **页面排版**：A4 尺寸 + 统一页边距，等比缩放居中。
+- **自动旋转**：图片方向与目标页面方向冲突时旋转 90° 铺满页面（替代缩小成条）。
+- **两图一页**：一个页面上开两个槽位，按 `A4 横版`（左右并排）或 `A4 竖版`（上下并排）计算槽位与缩放；每张图独立做方向判定。
+
+### 3.5 批量转换（`tools/folder_to_pdf.rs`）
+
+- **数字感知排序**：文件名中的数字按数值比较（`1, 2, 10` 而非 `1, 10, 2`）；无法提取数字的按系统列举顺序稳定排在后面。
+- **输出命名**：`<文件夹名>.pdf` 写回文件夹自身；指定输出目录时重名加 `-2`、`-3` 后缀。
+- **两图一页**：默认按顺序两两配对；勾选「指定合并序号」后仅在给定序号对之间合并（如 `1-2,5-6`），其余单独成页。
+- **页码语义**：合并页以**输出 PDF 的实际页序**连续编号（预览标签即最终页码），图片编号另行在悬停中提示。
+- **容错**：单个文件夹失败不中断整批，最终以 `PartialSuccess` 汇报；空文件夹跳过；非图片文件忽略。
+
+### 3.6 中文水印（`tools/text_watermark.rs`）
+
+根因：PDF 简单字体是单字节（WinAnsi）编码，中文会被写成 `?`。实现方案：
+
+1. 用系统 TrueType 字体（`engine::ttf`，支持 `.ttc` 集合）取字形轮廓。
+2. 以 4× 超采样光栅化为灰度覆盖图，合成「纯色 tint + SMask 透明度」位图。
+3. 通过图片 XObject 叠加到页面，保留字号、颜色、透明度、旋转角与平铺/居中策略。
+4. 找不到可用中文字体时给出明确错误，不得静默输出空白水印。
+
+### 3.7 加密 / 解密
+
+基于 `lopdf` 的 AES-256：用户密码（打开）与所有者密码（权限）分离，权限位（打印/复制/修改）可组合；解密时用用户密码重写为无加密文档。
+
+### 3.8 PDF → 图片 与 页面预览（`engine/render.rs`）
+
+- 纯 Rust 软件光栅器，按 DPI 缩放（默认 300，范围 36–600，附耗时提示）。
+- `render_page_thumbnails` 按页批量渲染缩略图；UI 侧每帧限量渲染，避免大文档卡顿。
+- 内置光栅器只绘制嵌入字体、矢量图与图片：未嵌入的标准 14 字体文本可能不显示。此限制仅影响应用内预览，真实阅读器打开正常。
+
+### 3.9 应用壳（`src/app.rs`）
+
+- **状态机**：`Idle → Ready → Running{fraction,message} → Done{summary,outputs,note} | Failed | Cancelled`，按工具独立保存。
+- **输出路径解析**：用户指定优先；否则与源文件同目录；目录不可写时按
+  `Documents\SparrowPDF → Documents → OneDrive\Documents\SparrowPDF → OneDrive\Documents → Desktop → Downloads → 用户目录 → TEMP`
+  回退，并在结果区标注「已改存到…」；决策结果缓存，避免每帧探测。
+- **执行前预检**：`preflight_output` 向上寻找最近已存在祖先判断可写性，权限不足立即给出中文提示。
+- **拖放**：按当前工具接受的文件类型过滤。
+
+### 3.10 平台集成
+
+- **日志**：`engine::logging::log("INFO"|"WARN"|"ERROR", msg)`，追加写入 `%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log`；`SPARROW_LOG_DIR` 可覆盖（测试与便携使用）。
+- **Windows 清单**（`build.rs`）：`requireAdministrator` + `longPathAware` + `dpiAware`；仅注入主程序（`winresource::compile_for("sparrowpdf")`），否则测试可执行文件也会被要求提权。
+- **免提权变体**：`SPARROW_AS_INVOKER=1 cargo build --release`，适合按用户安装、需要拖放正常的场景。
+- **macOS**：`app.icns` + `CFBundleIconFile`；ad-hoc 签名，分发需 Developer ID 与公证。
+
+---
+
+## 4. 构建与验证
+
+### 4.1 常用命令
+
+```bash
+cargo check --release --all-targets      # 快速类型检查（含测试）
+cargo build --release --locked           # 发布构建（CI 同款）
+cargo test --release --lib --test integration
+```
+
+### 4.2 Windows 构建环境要点
+
+- 需要 MSVC 与 Windows SDK；若 `cl.exe` 报 `C1083 无法打开 stddef.h`，说明当前 shell 缺 `INCLUDE`/`LIB`，改用 VS 开发者命令提示符。
+- debug 构建可能触发 `libz-sys` 的 `D8050`（与 `-Z7` 相关）——验证功能优先用 `--release`。
+- `panic = "unwind"` 是**功能依赖**：worker 依赖 `catch_unwind` 把 panic 转成可见错误，不得改回 `abort`。
+- `strip = true` + `lto = true` + `opt-level = "z"` 共同压体积；CI 有 20 MB（UPX 前）硬门禁与 12 MB 软目标。
+
+### 4.3 测试策略
+
+| 层级 | 位置 | 覆盖内容 |
+| --- | --- | --- |
+| 集成测试 | `tests/integration.rs`（19 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号 |
+| 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
+
+规则：
+
+- 新增或修改工具行为 → **必须**补一条集成测试，断言产物结构（页数、MediaBox、矩阵、XObject 等），不只断言「执行成功」。
+- 测试的临时目录走 `CARGO_TARGET_TMPDIR`（工作区内），不写系统 temp，避免受限环境失败。
+- 测试夹具由测试自行生成（`make_pdf` / `make_image`），不依赖仓库内二进制。
+
+### 4.4 提交前质量门（必须全绿）
+
+1. `cargo check --release --all-targets` 无警告（`warning: unused` 视为失败）。
+2. `cargo test --release --lib --test integration` 全通过。
+3. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
+4. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
+5. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
+
+---
+
+## 5. 编码约定
+
+1. **错误处理**：对外只用 `ToolError` 变体；禁止 `unwrap()` / `expect()` 处理用户输入、路径与 IO。
+2. **日志**：用 `engine::logging::log`，不要 `println!`（Windows 发布版无控制台）。
+3. **UI 复用**：输入框用 `theme::text_input` / `password_input` / `number_input`；颜色用 `theme::accent/success/warning/danger/card_fill` 等语义函数（自动适配明暗）。
+4. **文案**：中文界面文案不使用 emoji 与生僻符号（系统 CJK 字体缺字形会显示为方框），警示用「注意：」前缀。
+5. **注释**：解释「为什么」，不解释「是什么」；模块顶部写职责与不变量。
+6. **命名**：类型 `UpperCamelCase`，函数/变量 `snake_case`，常量 `SCREAMING_SNAKE_CASE`；缩写按词处理（`PdfToImage`、`pdf_io`）。
+7. **性能**：大文档路径必须可取消、可报告进度；UI 线程内不做解码/光栅化（走 worker 或逐帧预算）。
+8. **依赖**：新增 crate 需论证（体积、许可证、是否纯 Rust），并同步更新本文件 1.2 节。
+
+---
+
+## 6. Git 提交规范
+
+采用 **Conventional Commits 1.0.0**，与 SemVer 联动；**标题与正文统一使用中文**（`type`、`scope` 保留英文关键字）。
+
+### 6.1 类型划分
+
+| type | 含义 | 触发版本变化 |
+| --- | --- | --- |
+| `feat` | 新增用户可见能力 | minor（0.x 阶段同样升 minor） |
+| `fix` | 修复缺陷 | patch |
+| `perf` | 性能优化，行为不变 | patch |
+| `refactor` | 重构，不改外部行为 | 无 |
+| `docs` | 文档、注释、README | 无 |
+| `test` | 测试用例与测试夹具 | 无 |
+| `build` | 构建脚本、依赖、Cargo 配置、图标资源 | 视情况 patch |
+| `ci` | 流水线与自动化配置 | 无 |
+| `chore` | 杂务（版本号、忽略规则、依赖锁） | patch（版本号时） |
+| `style` | 纯格式调整（不含逻辑） | 无 |
+| `revert` | 回滚既有提交 | 视被回滚内容 |
+
+### 6.2 scope 取值（可省略，但同一模块应保持一致）
+
+`batch`、`image`、`merge`、`split`、`rotate`、`pages`、`watermark`、`encrypt`、`pdf2img`、`preview`、`ui`、`save`、`engine`、`worker`、`icon`、`build`、`ci`、`release`、`deps`。
+
+### 6.3 格式
+
+```
+<type>(<scope>): <中文摘要>
+
+<中文正文：为什么改、改了什么、影响面>
+
+<脚注>
+```
+
+硬规则：
+
+- 摘要 ≤ 50 个汉字，动词开头，不加句号，不使用「更新代码」「优化一下」这类空话。
+- 摘要行不写版本号；版本信息由 tag 与 CHANGELOG 承载。
+- 正文每行 ≤ 72 字符，用 `-` 分条；说明**动机、取舍与影响面**，不复述 diff。
+- 破坏性变更：type 后加 `!`，并在脚注写 `BREAKING CHANGE: <影响与迁移方式>`。
+
+### 6.4 示例
+
+```
+feat(batch): 新增批量转换，支持多文件夹与两图一页
+
+- 文件名数字感知排序（1、2、10 而非 1、10、2），无数字的按系统顺序尾部排列
+- 每个文件夹合成一个同名 PDF，默认写回文件夹自身，可选统一输出目录
+- 两图一页支持 A4 横/竖两种槽位，合并序号改为可勾选
+
+Closes #12
+```
+
+```
+fix(save): 非管理员运行时输出丢失
+
+根因：默认输出落在源文件同目录，受保护目录（如 Program Files）对中等完整性
+进程不可写，写入失败但仅记录到 stderr。
+
+- 新增可写性探测与回退链（文档\SparrowPDF 优先），结果缓存避免每帧探测
+- 权限类错误映射为中文提示，并在结果区标注实际保存位置
+```
+
+```
+refactor(engine)!: 统一落盘入口
+
+BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_document；
+自定义工具实现需同步迁移。
+```
+
+### 6.5 原子性与禁区
+
+- 一个提交只做一件事；重构与功能分开提交，便于回滚。
+- 提交前 `git status` 必须干净可解释，禁止把 `target/`、`.probe/`、编辑器配置混入。
+- 不提交大二进制（>2 MB）与密钥、令牌、个人路径。
+- 不使用 `--no-verify` 跳过钩子；钩子失败先修问题。
+- 已推送的提交不 `--amend`、不 `rebase` 重写；需要修正时用新的 `fix` 提交。
+- 提交信息不写「WIP」「临时」「先这样」。
+
+### 6.6 分支管理策略
+
+采用 **主干开发 + 短生命周期分支**：
+
+| 分支 | 命名 | 来源 | 合并去向 | 存活期 |
+| --- | --- | --- | --- | --- |
+| 主干 | `main` | — | — | 常驻，始终可发布 |
+| 功能 | `feat/<scope>-<简述>` | `main` | `main`（squash） | ≤ 3 天 |
+| 缺陷 | `fix/<scope>-<简述>` | `main` | `main`（squash） | ≤ 1 天 |
+| 维护 | `ci/<简述>`、`docs/<简述>`、`build/<简述>` | `main` | `main`（squash） | ≤ 1 天 |
+| 发布 | `release/<x.y.z>` | `main` | `main` + `vX.Y.Z` tag | 发布窗口内 |
+| 紧急修复 | `hotfix/<x.y.z>` | 线上 tag | `main` + 新 tag | ≤ 1 天 |
+
+规则：
+
+1. `main` 受保护：禁止直接推送，必须经评审合并；历史保持线性（squash 或 rebase-and-merge，不产生无意义 merge commit）。
+2. 分支名全小写、用连字符分隔，不含中文与空格。
+3. 发布以 **tag 为准**：`vX.Y.Z` 打在 `main` 上，tag 一旦推送不得移动或复用。
+4. 禁止对 `main` 强制推送；`hotfix` 必须同时回合 `main`，避免双线分叉。
+5. 远程同步用 `git pull --rebase`，本地分支可随意整理，已共享的分支不改写。
+
+---
+
+## 7. 标准开发流程
+
+### 7.1 阶段总览
+
+| 阶段 | 准入条件 | 负责人 | 准出交付物 |
+| --- | --- | --- | --- |
+| 1 需求 | 问题可复现或价值明确 | 需求提出方 | 需求卡（含验收标准） |
+| 2 开发 | 需求卡已确认 | 开发者 / AI 代理 | 分支上的实现与规范提交 |
+| 3 测试 | 代码可编译 | 开发者自测 + 评审人复测 | 测试结果与已知限制说明 |
+| 4 评审 | 质量门全绿 | 评审人（非作者） | 评审结论与批准记录 |
+| 5 发布 | 评审通过 | 发布负责人 | tag + Release + CHANGELOG |
+
+### 7.2 各阶段职责与交付物
+
+**1）需求**
+
+- 输入：用户反馈、缺陷复现步骤、功能设想。
+- 动作：写清「谁在什么场景遇到什么问题」「验收标准是什么」「不做什么」；技术预研只在必要时进行。
+- 交付物：需求卡，须包含：背景 / 目标 / 验收标准 / 影响范围 / 优先级。
+- 准出：验收标准可被测试用例直接翻译；范围外内容显式列出。
+
+**2) 开发**
+
+- 输入：需求卡。
+- 动作：建分支 → 读上下文（第 0 节）→ 实现 → 自测 → 按第 6 节提交。
+- 交付物：可编译分支、原子提交序列、变更说明（改了什么、为什么、影响哪些模块）。
+- 准出：`cargo check --release --all-targets` 无警告；本地可运行。
+
+**3）测试**
+
+- 输入：开发分支。
+- 动作：补/改集成测试；覆盖边界（空输入、越界页码、损坏文件、加密文件、权限受限目录、超长路径）；手工冒烟关键路径。
+- 交付物：测试结论（通过/失败项）、已知限制、复现步骤（失败时）。
+- 准出：`cargo test --release --lib --test integration` 全绿；新增行为有对应断言。
+
+**4）评审**
+
+- 输入：待合并分支 + 测试结论。
+- 动作：检查分层约束、错误处理、落盘路径、取消与进度、UI 一致性与明暗适配、测试有效性、提交信息规范。
+- 交付物：评审意见（阻塞项 / 建议项分类）与最终结论。
+- 准出：阻塞项清零；作者非评审人；合并方式符合 6.6。
+
+**5）发布**
+
+- 输入：`main` 上通过评审的提交。
+- 动作：确认版本号（`Cargo.toml` + `Cargo.lock`）→ 更新 `CHANGELOG.md` → 打 annotated tag `vX.Y.Z` → 推送分支与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、版本号正确、图标正确）。
+- 交付物：tag、Release 页面（含变更摘要与产物校验信息）、更新后的 CHANGELOG。
+- 准出：双平台产物可下载且可运行；`guard` 校验（tag 格式、版本一致、打包资源齐全）通过。
+- 回滚预案：产物异常时删除 Release 并标记 tag 作废，修复后升 patch 版本重新发布；不得移动既有 tag。
+
+### 7.3 AI 代理执行清单
+
+| 阶段 | 代理必须做 | 代理不得做 |
+| --- | --- | --- |
+| 需求 | 复述验收标准，列出不确定点 | 自行扩大范围、臆造验收条件 |
+| 开发 | 读上下文、最小改动、分类型提交 | 顺手重构无关模块、改依赖、改 License |
+| 测试 | 运行质量门并粘贴真实输出 | 声称「应该通过」而无执行记录 |
+| 评审 | 逐项对照 5 节与 4.4 节自检 | 自行批准自己的改动 |
+| 发布 | 校验版本号一致性、给出推送命令 | 执行 `git push` / 创建 Release / 移动 tag |
+
+---
+
+## 8. CHANGELOG 规范
+
+### 8.1 文件与来源
+
+- 位置：仓库根目录 `CHANGELOG.md`，格式遵循 **Keep a Changelog 1.1.0**。
+- 版本号遵循 **Semantic Versioning 2.0.0**。
+- 唯一事实来源是**已合并到 `main` 的提交与 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
+- 顺序：新版本在上；未发布内容置于 `[Unreleased]`。
+
+### 8.2 变更分类（固定六类，顺序不变）
+
+| 分类 | 收录内容 |
+| --- | --- |
+| `Added` 新增 | 新工具、新选项、新平台能力 |
+| `Changed` 变更 | 行为调整、默认值变化、交互改动 |
+| `Deprecated` 弃用 | 仍可用但计划移除的能力 |
+| `Removed` 移除 | 已删除的工具/选项/文件格式支持 |
+| `Fixed` 修复 | 缺陷修复、崩溃、错误提示改善 |
+| `Security` 安全 | 加密、权限、路径处理相关的加固 |
+
+仅保留有内容的分类，空分类不写标题。
+
+### 8.3 版本号规则
+
+| 变更性质 | 当前 0.x 阶段 | 1.0.0 之后 |
+| --- | --- | --- |
+| 破坏性变更（`type!` 或 `BREAKING CHANGE`） | minor +1（`0.4.2 → 0.5.0`） | major +1 |
+| 新增功能（`feat`） | minor +1 | minor +1 |
+| 修复/性能/杂务（`fix`/`perf`/`chore`） | patch +1 | patch +1 |
+| 纯文档、测试、CI | 不发版 | 不发版 |
+
+补充规则：
+
+- 版本号必须三处一致：`Cargo.toml`、`Cargo.lock`、git tag。
+- 0.x 阶段视为「对外接口未稳定」，破坏性变更允许在 minor 中发生，但必须在该版本条目首行用「**不兼容**：」标明。
+- 一次发布只对应一个 tag；tag 使用 annotated tag，内容为该版本 CHANGELOG 摘要。
+
+### 8.4 条目格式
+
+```
+## [x.y.z] - YYYY-MM-DD
+
+### 分类
+
+- **模块**：一句话说明改动（`scope`，可选 `#PR`）
+```
+
+硬规则：
+
+1. 每条一行，动宾结构，中文，结尾不加句号。
+2. 以「模块」加粗开头，模块名与代码 `scope` 一致（如 `批量转换`、`保存`、`文本水印`）。
+3. 面向使用者描述**结果**，不写实现细节（实现细节放提交正文）。
+4. 引用关联项：`(#12)` 表示 Issue/PR 编号；作者贡献可写 `@name`。
+5. 破坏性变更在分类条目下另起一行缩进 2 空格，以「不兼容：」开头说明迁移方式。
+
+### 8.5 示例
+
+```markdown
+# 更新日志
+
+本文件记录轻雀 PDF 的所有重要变更，格式遵循 Keep a Changelog，
+版本号遵循语义化版本。
+
+## [Unreleased]
+
+### Added
+- **批量转换**：支持指定合并序号（如 `1-2,5-6`），未列出的图片单独成页
+
+## [0.4.2] - 2026-11-02
+
+### Added
+- **外观**：侧边栏新增「浅色 / 深色」切换，选择持久化并在下次启动沿用
+
+### Fixed
+- **界面**：侧边栏底部的隐私说明与外观入口不再被滚动区挤出可视范围
+
+## [0.4.1] - 2026-11-01
+
+### Changed
+- **保存**：源目录不可写时自动改存「文档\SparrowPDF」，结果区标注实际位置并提供「打开所在文件夹」
+- **Windows**：可执行文件声明管理员权限，写受保护目录不再失败；另提供免提权构建变体
+
+### Fixed
+- **输出**：写入失败不再静默，错误提示与日志均有明确记录
+
+## [0.4.0] - 2026-11-01
+
+### Added
+- **页面预览**：旋转、删除、提取、拆分面板支持缩略图预览，可收起展开
+- **应用图标**：Windows 嵌入可执行文件资源，macOS 打包 icns，窗口与侧边栏同步更新
+- **颜色快捷项**：文本水印提供常用色一键选择，减少取色操作
+
+### Changed
+- **PDF 转图片**：默认 DPI 由 150 提升至 300，并提示可用范围
+
+### Removed
+- **文本提取**：移除该工具，工具总数调整为 12
+
+### Fixed
+- **文本水印**：中文不再输出问号，改用系统 TrueType 字形渲染为透明位图叠加
+- **字体解析**：修复 `.ttc` 集合字体表偏移错误导致字形全部丢失
+
+[Unreleased]: https://github.com/zfclark/SparrowPDF/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/zfclark/SparrowPDF/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/zfclark/SparrowPDF/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/zfclark/SparrowPDF/compare/v0.3.0...v0.4.0
+```
+
+### 8.6 维护流程
+
+1. 开发阶段：如有必要，先在 `[Unreleased]` 下累积条目（可选，避免冲突）。
+2. 发布前：发布负责人从合并记录中提炼条目，归类并核对措辞，确认无内部术语泄漏。
+3. 发版时：把 `[Unreleased]` 内容归档为 `## [x.y.z] - 日期`，替换比较链接，提交信息用 `chore(release): 版本号 A -> B`。
+4. tag 消息取该版本条目作为摘要，使 `git show vX.Y.Z` 与 CHANGELOG 一致。
+5. 已发布条目**只增不改**；如需更正，追加新版本条目说明。
+
+---
+
+## 9. 附录
+
+### A. 常用命令速查
+
+```bash
+# 质量门
+cargo check --release --all-targets
+cargo test --release --lib --test integration
+
+# 发布构建（CI 同款）
+cargo build --release --locked
+SPARROW_AS_INVOKER=1 cargo build --release      # Windows 免提权变体
+
+# 版本与标签
+cargo check --release                            # 同步 Cargo.lock 中的版本号
+git tag -a vX.Y.Z -m "<该版本变更摘要>"
+git push origin main
+git push origin vX.Y.Z
+
+# 日志与偏好定位（排查用）
+%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log
+%LOCALAPPDATA%\sparrowpdf\ui.pref
+```
+
+### B. 新增/修改工具的改动清单
+
+1. `src/model.rs`：`ToolId` 变体、`ToolId::ALL`、`group()`、`label()`、`description()`、`accepted_extensions()`、`max_inputs()`、`is_multi_output()`
+2. `src/tools/mod.rs`：`ToolOptions` 变体、默认选项、`tool_for()`、`pub mod` 声明
+3. `src/tools/<tool>.rs`：实现 `Tool`，遵守 3.3 的落盘与自校验
+4. `src/ui/panels/<tool>.rs` + `panels/mod.rs` 注册
+5. `src/app.rs`：`show_panel()` 分支；若需特殊输出规则，补 `resolve_output()` 与 `output_suffix()`
+6. `tests/integration.rs`：新增用例；更新工具总数断言（`tool_ids_are_unique_and_complete`）
+7. `README.md` 功能表、`CHANGELOG.md`、必要时本文件第 3 节
+
+### C. 禁止事项（硬性）
+
+1. 引入网络调用、遥测、自动更新。
+2. 绕过 `pdf_io` 直接落盘，或吞掉写入错误。
+3. 在 `ui/` 层引用 PDF/图片库类型。
+4. 提交 `target/`、`.probe/`、`.workbuddy/`、密钥与个人绝对路径。
+5. 对 `main` 强制推送、移动已发布 tag、改写已共享历史。
+6. 未经授权执行 `git push`、创建 Release、修改仓库设置。
+7. 用 emoji 充当状态图标（字体缺字形会显示为方框）。
+
+### D. 合并请求（PR）模板
+
+```markdown
+## 变更内容
+<!-- 一句话说明这个 PR 解决什么问题 -->
+
+## 关联需求
+Closes #<编号>
+
+## 影响面
+- 涉及模块：
+- 用户可见变化：
+- 兼容性：无 / 有（说明）
+
+## 验证方式
+- [ ] `cargo check --release --all-targets` 无警告
+- [ ] `cargo test --release --lib --test integration` 全通过
+- [ ] 手动冒烟：（步骤）
+- [ ] 涉及 UI 时附截图
+
+## 回滚方案
+<!-- 撤销方式：回滚提交 / 关闭开关 / 恢复默认值 -->
+```
