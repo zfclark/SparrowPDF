@@ -23,26 +23,52 @@ pub(crate) const A4_HEIGHT: f32 = 841.89;
 /// Margin around each image, in points.
 pub(crate) const PAGE_MARGIN: f32 = 0.0;
 
+/// Layout of one image page.
+///
+/// One value per output document, built once by the caller before the first
+/// page is written. Grouping the knobs here is what keeps a multi-page
+/// document from mixing layouts: the caller cannot forget to forward one of
+/// them to a page type (that was exactly how the two-per-page A4 orientation
+/// used to apply to merged pages only).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImagePageLayout {
+    /// Forced page orientation; `None` derives it from each image.
+    pub orientation: Option<Orientation>,
+    /// Rotate an image 90° when it conflicts with `orientation`.
+    pub auto_rotate: bool,
+    /// Uniform margin around the image box, in points.
+    pub margin: f32,
+}
+
 /// Add one A4 page holding `path`, returning whether the source was a JPEG.
 ///
-/// `force` fixes the page orientation; with `auto_rotate`, an image whose own
-/// orientation conflicts with the forced page orientation is turned 90° so it
-/// fills the page instead of appearing as a small centred strip.
+/// With `layout.orientation` set, the page takes that orientation; with
+/// `layout.auto_rotate`, an image whose own orientation conflicts with it is
+/// turned 90° so it fills the page instead of appearing as a small centred
+/// strip.
 pub(crate) fn add_image_page(
     doc: &mut Document,
     pages_id: ObjectId,
     path: &Path,
-    force: Option<Orientation>,
-    auto_rotate: bool,
+    layout: ImagePageLayout,
     index: usize,
 ) -> Result<bool, ToolError> {
+    let ImagePageLayout {
+        orientation: force,
+        auto_rotate,
+        margin,
+    } = layout;
     let image = load_image(path).map_err(|e| ToolError::UnsupportedFormat {
         path: Some(path.to_path_buf()),
         detail: e.to_string(),
     })?;
 
     let is_jpeg = matches!(image, ImageData::Jpeg { .. });
-    let orientation = if is_jpeg { read_exif_orientation(path) } else { 1 };
+    let orientation = if is_jpeg {
+        read_exif_orientation(path)
+    } else {
+        1
+    };
 
     let (px_w, px_h) = (image.pixel_width() as f32, image.pixel_height() as f32);
     if px_w <= 0.0 || px_h <= 0.0 {
@@ -54,7 +80,7 @@ pub(crate) fn add_image_page(
 
     // Orientations 5..=8 display the image rotated by 90 degrees, so the
     // effective width/height are swapped.
-    let (eff_w, eff_h) = if matches!(orientation, 5 | 6 | 7 | 8) {
+    let (eff_w, eff_h) = if matches!(orientation, 5..=8) {
         (px_h, px_w)
     } else {
         (px_w, px_h)
@@ -84,8 +110,8 @@ pub(crate) fn add_image_page(
     };
 
     // Fit the image into the page box, preserving aspect ratio.
-    let box_w = page_w - PAGE_MARGIN * 2.0;
-    let box_h = page_h - PAGE_MARGIN * 2.0;
+    let box_w = page_w - margin * 2.0;
+    let box_h = page_h - margin * 2.0;
     let scale = (box_w / fit_w).min(box_h / fit_h);
     let draw_w = fit_w * scale;
     let draw_h = fit_h * scale;
@@ -111,11 +137,7 @@ pub(crate) fn add_image_page(
         orientation
     };
     let matrix = placement_matrix(code, x0, y0, draw_w, draw_h);
-    write_content_stream(
-        doc,
-        page_id,
-        &[(name, matrix)],
-    )?;
+    write_content_stream(doc, page_id, &[(name, matrix)])?;
 
     Ok(is_jpeg)
 }
@@ -207,7 +229,11 @@ pub(crate) fn add_image_xobject(
                 None => None,
             };
 
-            let color_space = if components == 1 { "DeviceGray" } else { "DeviceRGB" };
+            let color_space = if components == 1 {
+                "DeviceGray"
+            } else {
+                "DeviceRGB"
+            };
             let mut dict = dictionary! {
                 "Type" => "XObject",
                 "Subtype" => "Image",
@@ -312,7 +338,9 @@ pub(crate) fn read_exif_orientation(path: &Path) -> u8 {
     };
     match exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
         Some(field) => match field.value {
-            exif::Value::Short(ref values) => values.first().copied().unwrap_or(1).clamp(1, 8) as u8,
+            exif::Value::Short(ref values) => {
+                values.first().copied().unwrap_or(1).clamp(1, 8) as u8
+            }
             _ => 1,
         },
         None => 1,

@@ -3,8 +3,9 @@
 use crate::engine::{pdf_io, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
-    split::{ensure_pdf, single_input},
+    check_cancel,
+    split::{ensure_not_empty, ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct DeletePages;
@@ -42,8 +43,11 @@ impl Tool for DeletePages {
             }
         };
 
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+
         let mut doc = pdf_io::open_for_edit(path, req.password.as_deref())?;
         let total = pdf_io::page_count(&doc);
+        ensure_not_empty(total, path)?;
         let targets = pdf_io::parse_pages(&spec, total)?;
 
         if targets.len() >= total as usize {
@@ -70,15 +74,15 @@ impl Tool for DeletePages {
 
         progress.report(0.9, "写入 PDF".to_string());
         check_cancel(cancel)?;
-        pdf_io::save_document(&mut doc, &req.output)?;
+        pdf_io::save_document(&mut doc, &out, req.conflict)?;
 
         let expected = total - targets.len() as u32;
-        validate::assert_page_count(&req.output, expected, None)?;
+        validate::assert_page_count(&out, expected, None)?;
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
             format!("已删除 {} 页，剩余 {expected} 页", targets.len()),
-            vec![req.output.clone()],
+            vec![out],
         ))
     }
 }

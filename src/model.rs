@@ -220,18 +220,56 @@ impl ToolOutcome {
 #[derive(Debug, Clone)]
 pub enum ToolError {
     /// Wrong extension or a file the tool cannot decode.
-    UnsupportedFormat { path: Option<PathBuf>, detail: String },
-    ReadFailed { path: PathBuf, detail: String },
-    WriteFailed { path: PathBuf, detail: String },
-    InvalidPageRange { detail: String },
-    PasswordRequired { path: PathBuf },
-    WrongPassword { path: PathBuf },
+    UnsupportedFormat {
+        path: Option<PathBuf>,
+        detail: String,
+    },
+    ReadFailed {
+        path: PathBuf,
+        detail: String,
+    },
+    WriteFailed {
+        path: PathBuf,
+        detail: String,
+    },
+    InvalidPageRange {
+        detail: String,
+    },
+    PasswordRequired {
+        path: PathBuf,
+    },
+    WrongPassword {
+        path: PathBuf,
+    },
     /// Output verification failed; the produced file has already been deleted.
-    ValidationFailed { detail: String },
+    ValidationFailed {
+        detail: String,
+    },
+    /// The planned output already exists and the request asked to be told
+    /// instead of overwriting. Nothing has been written when this is returned.
+    OutputExists {
+        paths: Vec<PathBuf>,
+    },
+    /// `ConflictPolicy::Unique` ran out of serial numbers (`-2` … `-9999`).
+    /// Nothing has been written when this is returned.
+    OutputNameExhausted {
+        path: PathBuf,
+    },
     Cancelled,
     /// Some inputs succeeded, some did not.
-    PartialSuccess { succeeded: usize, failed: usize, detail: String },
-    Internal { detail: String },
+    ///
+    /// `outputs` carries the artifacts that *were* produced: a partial run must
+    /// stay openable from the result card instead of looking like a total
+    /// failure.
+    PartialSuccess {
+        succeeded: usize,
+        failed: usize,
+        detail: String,
+        outputs: Vec<PathBuf>,
+    },
+    Internal {
+        detail: String,
+    },
 }
 
 impl fmt::Display for ToolError {
@@ -255,12 +293,28 @@ impl fmt::Display for ToolError {
                 write!(f, "密码错误：{}", path.display())
             }
             ToolError::ValidationFailed { detail } => write!(f, "产物校验失败：{detail}"),
+            ToolError::OutputExists { paths } => {
+                let first = paths
+                    .first()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                write!(f, "目标文件已存在：{first}（共 {} 个）", paths.len())
+            }
+            ToolError::OutputNameExhausted { path } => write!(
+                f,
+                "同名文件太多，无法自动编号：{}（请手动改名或另选目录）",
+                path.display()
+            ),
             ToolError::Cancelled => f.write_str("已取消"),
             ToolError::PartialSuccess {
                 succeeded,
                 failed,
                 detail,
-            } => write!(f, "部分成功：成功 {succeeded} 个，失败 {failed} 个（{detail}）"),
+                ..
+            } => write!(
+                f,
+                "部分成功：成功 {succeeded} 个，失败 {failed} 个（{detail}）"
+            ),
             ToolError::Internal { detail } => write!(f, "内部错误：{detail}"),
         }
     }
@@ -320,6 +374,23 @@ impl ImageFormat {
 pub enum WatermarkPlacement {
     Center,
     Tiled,
+}
+
+/// What to do when a planned output path is already taken.
+///
+/// The default is [`ConflictPolicy::Report`]: a tool computes every path it
+/// intends to write, reports the clash, and only writes once the user picked a
+/// policy. Overwriting therefore never happens silently, and `Unique` keeps the
+/// previous result instead of destroying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    /// Return [`ToolError::OutputExists`] carrying every clashing path.
+    #[default]
+    Report,
+    /// Replace the existing file(s).
+    Overwrite,
+    /// Keep the existing file(s) and suffix the new names with `-2`, `-3`, …
+    Unique,
 }
 
 /// A single file the user has staged for the active tool.

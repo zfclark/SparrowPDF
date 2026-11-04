@@ -95,6 +95,8 @@ pub enum PanelAction {
     /// The result card offered to save into Documents instead of a
     /// protected location.
     RetryInDocuments,
+    /// The bar showed the remembered "same name" answer and the user cleared it.
+    ClearConflictPolicy,
 }
 
 /// What a panel tells the shell about its action bar.
@@ -181,6 +183,18 @@ pub fn append_inputs(tool: ToolId, form: &mut FormState, paths: Vec<PathBuf>) {
             form.inputs.push(file);
         }
     }
+    if tool == ToolId::ImageWatermark {
+        // Slot 1 is the PDF, slot 2 the watermark image. Picking them the
+        // other way round is a natural mistake and used to surface as a
+        // confusing "需要 PDF 文件" error instead of just working.
+        form.inputs.sort_by_key(|f| !is_pdf(&f.path));
+    }
+}
+
+fn is_pdf(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
 }
 
 /// File dialog filtered to the tool's accepted extensions.
@@ -193,12 +207,11 @@ fn pick_files(tool: ToolId) -> Option<Vec<PathBuf>> {
     };
 
     let dialog = rfd::FileDialog::new().add_filter(filter_name, extensions);
-    let picked = if tool.max_inputs().map(|m| m > 1).unwrap_or(true) {
+    if tool.max_inputs().map(|m| m > 1).unwrap_or(true) {
         dialog.pick_files()
     } else {
         dialog.pick_file().map(|p| vec![p])
-    };
-    picked
+    }
 }
 
 /// Save-target picker; returns the chosen path.
@@ -240,7 +253,9 @@ pub fn output_selector_hinted(
     is_dir_tool: bool,
     empty_hint: &str,
 ) {
-    ui.horizontal(|ui| {
+    // Wrapped: the "not chosen yet" hint is a full sentence and used to be cut
+    // off at the card edge on a narrow window.
+    ui.horizontal_wrapped(|ui| {
         let label = if is_dir_tool {
             "选择输出目录…"
         } else {
@@ -274,14 +289,25 @@ pub fn output_selector_hinted(
 
 /// Password field for tools that can open encrypted inputs.
 pub fn password_field(ui: &mut Ui, form: &mut FormState) {
-    theme::field_row_hover(ui, "打开密码", "文件已加密时填写；未加密可留空", |ui| {
-        theme::password_input(ui, &mut form.password, "文件已加密时必填，否则留空");
-    });
+    theme::field_row_hover(
+        ui,
+        "打开密码",
+        "文件已加密时填写；未加密可留空",
+        |ui| {
+            theme::password_input(ui, &mut form.password, "文件已加密时必填，否则留空");
+        },
+    );
 }
 
 /// File list with per-row remove buttons and optional drag reordering.
 pub fn input_list(ui: &mut Ui, tool: ToolId, inputs: &mut Vec<InputFile>, reorderable: bool) {
-    input_list_hinted(ui, tool, inputs, reorderable, "拖放文件到此处，或点击「添加文件…」");
+    input_list_hinted(
+        ui,
+        tool,
+        inputs,
+        reorderable,
+        "拖放文件到此处，或点击「添加文件…」",
+    );
 }
 
 /// [`input_list`] with a custom empty-state hint (e.g. for folders).
@@ -309,10 +335,10 @@ fn input_list_filled(ui: &mut Ui, tool: ToolId, inputs: &mut Vec<InputFile>, reo
             inputs,
             |ui, item, handle, _state| {
                 ui.horizontal(|ui| {
+                    ui.set_min_height(ROW_H);
                     handle.ui(ui, drag_handle);
-                    let name = ui.add(
-                        egui::Label::new(RichText::new(item.display_name())).truncate(),
-                    );
+                    let name =
+                        ui.add(egui::Label::new(RichText::new(item.display_name())).truncate());
                     name.on_hover_text(item.path.display().to_string());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if remove_button(ui).clicked() {
@@ -324,7 +350,10 @@ fn input_list_filled(ui: &mut Ui, tool: ToolId, inputs: &mut Vec<InputFile>, reo
         );
     } else {
         for (index, file) in inputs.iter().enumerate() {
+            // Fixed row height so a long name cannot make one row taller than
+            // its neighbours.
             ui.horizontal(|ui| {
+                ui.set_min_height(ROW_H);
                 ui.add_sized(
                     egui::vec2(18.0, ROW_H),
                     egui::Label::new(RichText::new(format!("{}.", index + 1)).weak()),
@@ -346,7 +375,7 @@ fn input_list_filled(ui: &mut Ui, tool: ToolId, inputs: &mut Vec<InputFile>, reo
 }
 
 fn remove_button(ui: &mut Ui) -> egui::Response {
-    theme::small_button(ui, "×").on_hover_text("移除")
+    theme::icon_button(ui, "×", "移除")
 }
 
 /// Drag handle drawn with the painter instead of a text glyph.

@@ -3,9 +3,11 @@
 //! * Images inside each folder are ordered by the number in their file name
 //!   (`1.png`, `2.png`, …, `10.png` sorts numerically); names without any
 //!   number keep the system listing order after the numbered ones.
-//! * Page layout: one image per page, or two images sharing one landscape A4
-//!   page (`BatchPageMode::TwoPerPage`), optionally with an explicit merge
-//!   spec such as `1-2,5-6`.
+//! * Page layout: one image per page, or two images sharing one A4 page
+//!   (`BatchPageMode::TwoPerPage`, landscape = side by side, portrait =
+//!   stacked), optionally with an explicit merge spec such as `1-2,5-6`.
+//!   The chosen layout applies to *every* page of a document, including the
+//!   pages that end up with a single image.
 //! * Each folder becomes `<folder name>.pdf`, written into the folder itself
 //!   by default or into the user-chosen output directory.
 
@@ -14,11 +16,12 @@ use std::path::{Path, PathBuf};
 
 use lopdf::{dictionary, Document, Object};
 
-use crate::engine::pdf_io;
+use crate::engine::{pdf_io, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::image_embed::{
     self, add_image_xobject, attach_page, placement_matrix, read_exif_orientation,
-    register_xobject, rotate_cw_code, write_content_stream, A4_HEIGHT, A4_WIDTH,
+    register_xobject, rotate_cw_code, write_content_stream, ImagePageLayout, A4_HEIGHT, A4_WIDTH,
+    PAGE_MARGIN,
 };
 use crate::tools::{
     check_cancel, ensure_dir, BatchPageMode, CancelFlag, Orientation, Progress, Tool, ToolOptions,
@@ -29,6 +32,63 @@ use crate::tools::{
 const SLOT_MARGIN: f32 = 18.0;
 /// Gap between the two image slots of a two-per-page layout, in points.
 const SLOT_GAP: f32 = 18.0;
+
+/// Page layout of one output document, decided once per folder.
+///
+/// Every page — single-image or two-image — is written from this one value.
+/// The mode, not the page, owns the orientation: in two-per-page mode a page
+/// that ends up with a single image (a trailing odd image, or an image the
+/// merge spec leaves alone) still uses the chosen A4 orientation and the same
+/// outer margin, so one PDF never mixes page sizes.
+#[derive(Debug, Clone, Copy)]
+struct PagePolicy {
+    /// Orientation of pages holding one image; `None` follows each image.
+    single_orientation: Option<Orientation>,
+    /// Orientation of pages holding two images.
+    pair_orientation: Orientation,
+    /// Margin of a single-image page, in points.
+    single_margin: f32,
+    auto_rotate: bool,
+}
+
+impl PagePolicy {
+    fn new(
+        mode: BatchPageMode,
+        force: Option<Orientation>,
+        pair_orientation: Orientation,
+        auto_rotate: bool,
+    ) -> Self {
+        match mode {
+            BatchPageMode::Single => Self {
+                single_orientation: force,
+                pair_orientation,
+                single_margin: PAGE_MARGIN,
+                auto_rotate,
+            },
+            // Two-per-page owns the page geometry for the whole document.
+            BatchPageMode::TwoPerPage => Self {
+                single_orientation: Some(pair_orientation),
+                pair_orientation,
+                single_margin: SLOT_MARGIN,
+                auto_rotate,
+            },
+        }
+    }
+
+    /// The orientation every page must share, when the layout fixes one.
+    fn uniform_orientation(&self) -> Option<Orientation> {
+        self.single_orientation
+    }
+
+    /// Layout for a page holding a single image.
+    fn single_layout(&self) -> ImagePageLayout {
+        ImagePageLayout {
+            orientation: self.single_orientation,
+            auto_rotate: self.auto_rotate,
+            margin: self.single_margin,
+        }
+    }
+}
 
 pub struct FolderToPdf;
 
@@ -61,7 +121,8 @@ impl Tool for FolderToPdf {
         progress: &Progress,
         cancel: &CancelFlag,
     ) -> Result<ToolOutcome, ToolError> {
-        let (mode, force, pair_orientation, use_merge_spec, spec, auto_rotate) = match &req.options {
+        let (mode, force, pair_orientation, use_merge_spec, spec, auto_rotate) = match &req.options
+        {
             ToolOptions::FolderToPdf {
                 mode,
                 force_orientation,
@@ -77,14 +138,14 @@ impl Tool for FolderToPdf {
                 merge_spec.clone(),
                 *auto_rotate,
             ),
-            _ => (
-                BatchPageMode::Single,
-                None,
-                Orientation::Landscape,
-                false,
-                String::new(),
-                true,
-            ),
+            // Every other tool reports a mismatched option set instead of
+            // falling back to defaults: a silent fallback is precisely how a
+            // layout setting ends up applied to only part of a document.
+            _ => {
+                return Err(ToolError::Internal {
+                    detail: "选项类型不匹配".to_string(),
+                })
+            }
         };
 
         // Empty output path = default: each PDF lands inside its own folder.
@@ -101,13 +162,17 @@ impl Tool for FolderToPdf {
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut total_images = 0usize;
 
-        for (index, folder) in req.inputs.iter().enumerate() {
-            check_cancel(cancel)?;
-            progress.report(
-                index as f32 / total as f32,
-                format!("处理文件夹 {}/{}：{}", index + 1, total, folder.display_name()),
-            );
-
+        // Phase 1 — plan. Every output name is known before a single page is
+        // rendered, so the caller can be asked about existing files up front
+        // instead of after minutes of conversion.
+        struct PlannedFolder<'a> {
+            folder: &'a crate::model::InputFile,
+            images: Vec<PathBuf>,
+            plans: Vec<PagePlan>,
+            out_path: PathBuf,
+        }
+        let mut planned: Vec<PlannedFolder<'_>> = Vec::new();
+        for folder in &req.inputs {
             let images = collect_images(&folder.path);
             if images.is_empty() {
                 skipped.push((
@@ -136,43 +201,65 @@ impl Tool for FolderToPdf {
                 }
             };
 
+            let out_path = output_path(folder, out_root.as_deref(), &mut used_names);
+            planned.push(PlannedFolder {
+                folder,
+                images,
+                plans,
+                out_path,
+            });
+        }
+
+        let names: Vec<PathBuf> = planned.iter().map(|p| p.out_path.clone()).collect();
+        let targets = pdf_io::resolve_outputs(&names, req.conflict)?;
+
+        // Phase 2 — render and write.
+        for (index, (job, out_path)) in planned.into_iter().zip(targets).enumerate() {
+            check_cancel(cancel)?;
+            progress.report(
+                index as f32 / total as f32,
+                format!(
+                    "处理文件夹 {}/{}：{}",
+                    index + 1,
+                    total,
+                    job.folder.display_name()
+                ),
+            );
+
             let mut doc = Document::with_version("1.7");
             let pages_id = build_document_skeleton(&mut doc);
-            for (page_index, plan) in plans.iter().enumerate() {
+            // Built once per folder, then reused by every page.
+            let policy = PagePolicy::new(mode, force, pair_orientation, auto_rotate);
+            for (page_index, plan) in job.plans.iter().enumerate() {
                 check_cancel(cancel)?;
-                render_page(
-                    &mut doc,
-                    pages_id,
-                    page_index,
-                    plan,
-                    &images,
-                    force,
-                    pair_orientation,
-                    auto_rotate,
-                )?;
+                render_page(&mut doc, pages_id, page_index, plan, &job.images, policy)?;
             }
 
-            let out_path = output_path(folder, out_root.as_deref(), &mut used_names);
             // One unwritable / locked output must not discard the folders
             // that do succeed: record, log, continue — surfaced as
             // PartialSuccess at the end.
-            let saved = pdf_io::save_document(&mut doc, &out_path).and_then(|_| {
-                crate::engine::validate::assert_page_count(&out_path, plans.len() as u32, None)
-            });
+            let saved = pdf_io::save_document(&mut doc, &out_path, req.conflict)
+                .and_then(|_| validate::assert_page_count(&out_path, job.plans.len() as u32, None))
+                // A fixed-orientation layout must hold for *every* page; a
+                // mixed document means a page type lost the policy again.
+                .and_then(|_| match policy.uniform_orientation() {
+                    Some(orientation) => validate::assert_page_orientation(
+                        &out_path,
+                        orientation == Orientation::Landscape,
+                    ),
+                    None => Ok(()),
+                });
             if let Err(err) = saved {
                 crate::engine::logging::log(
                     "ERROR",
                     &format!("写入输出失败：{}（{err}）", out_path.display()),
                 );
-                skipped.push((
-                    folder.display_name(),
-                    format!("写入失败：{err}"),
-                ));
+                skipped.push((job.folder.display_name(), format!("写入失败：{err}")));
                 continue;
             }
 
             outputs.push(out_path);
-            total_images += images.len();
+            total_images += job.images.len();
         }
 
         if outputs.is_empty() {
@@ -207,6 +294,7 @@ impl Tool for FolderToPdf {
                 succeeded: outputs.len(),
                 failed: skipped.len(),
                 detail: format!("{summary}；跳过：{detail}"),
+                outputs,
             });
         }
 
@@ -454,9 +542,7 @@ fn render_page(
     page_index: usize,
     plan: &PagePlan,
     images: &[PathBuf],
-    force: Option<Orientation>,
-    pair_orientation: Orientation,
-    auto_rotate: bool,
+    policy: PagePolicy,
 ) -> Result<(), ToolError> {
     match plan {
         PagePlan::One(idx) => {
@@ -464,8 +550,7 @@ fn render_page(
                 doc,
                 pages_id,
                 &images[*idx],
-                force,
-                auto_rotate,
+                policy.single_layout(),
                 page_index,
             )?;
         }
@@ -475,8 +560,8 @@ fn render_page(
                 pages_id,
                 page_index,
                 (&images[*left], &images[*right]),
-                pair_orientation,
-                auto_rotate,
+                policy.pair_orientation,
+                policy.auto_rotate,
             )?;
         }
     }
@@ -526,7 +611,11 @@ fn add_two_image_page(
             detail: e.to_string(),
         })?;
         let is_jpeg = matches!(image, medpdf_image::ImageData::Jpeg { .. });
-        let orientation = if is_jpeg { read_exif_orientation(path) } else { 1 };
+        let orientation = if is_jpeg {
+            read_exif_orientation(path)
+        } else {
+            1
+        };
 
         let (px_w, px_h) = (image.pixel_width() as f32, image.pixel_height() as f32);
         if px_w <= 0.0 || px_h <= 0.0 {
@@ -535,7 +624,7 @@ fn add_two_image_page(
                 detail: "图片尺寸为 0".to_string(),
             });
         }
-        let (eff_w, eff_h) = if matches!(orientation, 5 | 6 | 7 | 8) {
+        let (eff_w, eff_h) = if matches!(orientation, 5..=8) {
             (px_h, px_w)
         } else {
             (px_w, px_h)
@@ -554,14 +643,10 @@ fn add_two_image_page(
         let draw_h = fit_h * scale;
 
         let (slot_x, slot_y) = match pair_orientation {
-            Orientation::Landscape => (
-                SLOT_MARGIN + slot as f32 * (slot_w + SLOT_GAP),
-                SLOT_MARGIN,
-            ),
-            Orientation::Portrait => (
-                SLOT_MARGIN,
-                SLOT_MARGIN + slot as f32 * (slot_h + SLOT_GAP),
-            ),
+            Orientation::Landscape => {
+                (SLOT_MARGIN + slot as f32 * (slot_w + SLOT_GAP), SLOT_MARGIN)
+            }
+            Orientation::Portrait => (SLOT_MARGIN, SLOT_MARGIN + slot as f32 * (slot_h + SLOT_GAP)),
         };
         let x0 = slot_x + (slot_w - draw_w) / 2.0;
         let y0 = slot_y + (slot_h - draw_h) / 2.0;

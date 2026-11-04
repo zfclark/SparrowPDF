@@ -1,13 +1,14 @@
 //! Tool 10: AES-256 encryption and decryption.
 
-use medpdf::{EncryptionAlgorithm, EncryptionParams, encrypt_document};
 use lopdf::Permissions;
+use medpdf::{encrypt_document, EncryptionAlgorithm, EncryptionParams};
 
 use crate::engine::{pdf_io, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
+    check_cancel,
     split::{ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct Encrypt;
@@ -20,31 +21,24 @@ impl Tool for Encrypt {
     fn validate(&self, req: &ToolRequest) -> Result<(), ToolError> {
         let path = single_input(req)?;
         ensure_pdf(path)?;
+        // An empty owner password is not an error: the panel says it may be
+        // left blank, and `execute` then reuses the user password. Requiring it
+        // here made the panel promise something the tool refused.
         if let ToolOptions::Encrypt {
             encrypt,
             user_password,
-            owner_password,
             ..
         } = &req.options
         {
-            if *encrypt {
-                if user_password.is_empty() {
-                    return Err(ToolError::UnsupportedFormat {
-                        path: None,
-                        detail: "加密需要设置用户密码".to_string(),
-                    });
-                }
-                if owner_password.is_empty() {
-                    return Err(ToolError::UnsupportedFormat {
-                        path: None,
-                        detail: "加密需要设置所有者密码".to_string(),
-                    });
-                }
-            } else if req.password.as_deref().unwrap_or("").is_empty() {
-                return Err(ToolError::PasswordRequired {
-                    path: path.to_path_buf(),
+            if *encrypt && user_password.is_empty() {
+                return Err(ToolError::UnsupportedFormat {
+                    path: None,
+                    detail: "加密需要设置用户密码".to_string(),
                 });
             }
+            // Decryption is validated in `execute`, after the file has been
+            // checked for encryption: asking for a password up front made an
+            // unencrypted file impossible to process at all.
         }
         Ok(())
     }
@@ -83,9 +77,18 @@ impl Tool for Encrypt {
         progress.report(0.2, "读取 PDF".to_string());
         check_cancel(cancel)?;
 
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+
         if !encrypt {
-            return decrypt(req, path, progress, cancel);
+            return decrypt(req, path, &out, progress, cancel);
         }
+
+        // Leaving the owner password blank means "same as the user password".
+        let owner_password = if owner_password.is_empty() {
+            user_password.clone()
+        } else {
+            owner_password
+        };
 
         let mut doc = pdf_io::open_for_edit(path, req.password.as_deref())?;
         let total = pdf_io::page_count(&doc);
@@ -120,18 +123,18 @@ impl Tool for Encrypt {
         })?;
 
         progress.report(0.9, "写入 PDF".to_string());
-        pdf_io::save_document(&mut doc, &req.output)?;
+        pdf_io::save_document(&mut doc, &out, req.conflict)?;
 
         // Invariants: artifact is encrypted, page count preserved, and it can be
         // reopened with the user password but not without one.
-        validate::assert_encrypted(&req.output)?;
-        validate::assert_page_count(&req.output, total, Some(&user_password))?;
-        verify_password_paths(&req.output, &user_password)?;
+        validate::assert_encrypted(&out)?;
+        validate::assert_page_count(&out, total, Some(&user_password))?;
+        verify_password_paths(&out, &user_password)?;
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
             format!("已使用 AES-256 加密 {total} 页"),
-            vec![req.output.clone()],
+            vec![out],
         ))
     }
 }
@@ -139,12 +142,24 @@ impl Tool for Encrypt {
 fn decrypt(
     req: &ToolRequest,
     path: &std::path::Path,
+    out: &std::path::Path,
     progress: &Progress,
     cancel: &CancelFlag,
 ) -> Result<ToolOutcome, ToolError> {
-    let password = req.password.clone().ok_or_else(|| ToolError::PasswordRequired {
-        path: path.to_path_buf(),
-    })?;
+    // Saying "not encrypted" is the honest answer for a plain file; the old
+    // flow demanded a password it could not use.
+    if !pdf_io::is_encrypted(path)? {
+        return Err(ToolError::UnsupportedFormat {
+            path: Some(path.to_path_buf()),
+            detail: "文件未加密，无需解密".to_string(),
+        });
+    }
+    let password = req
+        .password
+        .clone()
+        .ok_or_else(|| ToolError::PasswordRequired {
+            path: path.to_path_buf(),
+        })?;
 
     progress.report(0.3, "读取加密 PDF".to_string());
     check_cancel(cancel)?;
@@ -155,15 +170,15 @@ fn decrypt(
 
     progress.report(0.8, "写入未加密 PDF".to_string());
     check_cancel(cancel)?;
-    pdf_io::save_document(&mut doc, &req.output)?;
+    pdf_io::save_document(&mut doc, out, req.conflict)?;
 
-    validate::assert_decrypted(&req.output)?;
-    validate::assert_page_count(&req.output, total, None)?;
+    validate::assert_decrypted(out)?;
+    validate::assert_page_count(out, total, None)?;
 
     progress.report(1.0, "完成".to_string());
     Ok(ToolOutcome::success(
         format!("已移除加密，共 {total} 页"),
-        vec![req.output.clone()],
+        vec![out.to_path_buf()],
     ))
 }
 

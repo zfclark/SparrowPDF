@@ -4,7 +4,9 @@
 //! visual language. Colors resolve against the active egui theme, so the app
 //! looks right in both light and dark mode without a second code path.
 
-use egui::{Color32, CornerRadius, FontId, FontFamily, Margin, Pos2, RichText, Stroke, TextStyle, Ui, vec2};
+use egui::{
+    vec2, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, RichText, Stroke, TextStyle, Ui,
+};
 
 use crate::model::{TaskState, ToolError};
 
@@ -86,11 +88,7 @@ pub fn hairline(ui: &Ui) -> Stroke {
 pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(
-        mix(a.r(), b.r()),
-        mix(a.g(), b.g()),
-        mix(a.b(), b.b()),
-    )
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 // ------------------------------------------------------------------ metrics
@@ -133,6 +131,10 @@ fn input_width(ui: &Ui) -> f32 {
 // ---------------------------------------------------------------- components
 
 /// Grouped section: rounded card with a quiet title.
+///
+/// Every card is stretched to the width of the content column: sizing them to
+/// their contents produced a ragged stack (a 300 pt preview card next to a 680 pt
+/// input card) that read as a layout bug rather than as hierarchy.
 pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(card_fill(ui))
@@ -141,6 +143,7 @@ pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
         .inner_margin(Margin::symmetric(CARD_PAD as i8, 10))
         .outer_margin(Margin::symmetric(0, 5))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(RichText::new(title).small().weak());
             ui.add_space(GAP_XS);
             add_contents(ui);
@@ -164,7 +167,10 @@ pub fn primary_button(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
     let (fill, fg) = if active {
         (accent(ui), Color32::WHITE)
     } else {
-        (muted_fill(ui), ui.visuals().widgets.inactive.fg_stroke.color)
+        (
+            muted_fill(ui),
+            ui.visuals().widgets.inactive.fg_stroke.color,
+        )
     };
     ui.add_sized(
         vec2(96.0, PRIMARY_H),
@@ -185,7 +191,29 @@ pub fn button(ui: &mut Ui, text: &str) -> egui::Response {
 
 /// Small button for dense rows (e.g. list actions).
 pub fn small_button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(text).small().corner_radius(CornerRadius::same(RADIUS_CTRL - 1)))
+    ui.add(
+        egui::Button::new(text)
+            .small()
+            .corner_radius(CornerRadius::same(RADIUS_CTRL - 1)),
+    )
+}
+
+/// Frameless button for row-level actions (remove a file, close a preview).
+///
+/// A framed button on every list row competed with the file name for
+/// attention; the row action should be quiet until hovered.
+pub fn icon_button(ui: &mut Ui, glyph: &str, hover: &str) -> egui::Response {
+    let color = ui.visuals().weak_text_color();
+    let response = ui.add(
+        egui::Button::new(RichText::new(glyph).color(color))
+            .frame(false)
+            .min_size(vec2(22.0, 22.0)),
+    );
+    if hover.is_empty() {
+        response
+    } else {
+        response.on_hover_text(hover)
+    }
 }
 
 /// Appearance switch (`浅色 / 深色`), used in the sidebar footer.
@@ -193,24 +221,26 @@ pub fn small_button(ui: &mut Ui, text: &str) -> egui::Response {
 /// The active side uses egui's selection visuals, which already resolve against
 /// the current theme, so the control reads correctly in both modes. Returns the
 /// newly requested dark flag only when the user picks the inactive side.
+///
+/// Adds its two entries directly to `ui` (no nested row): a nested horizontal
+/// region inside the footer row aligned the chips a few points below the
+/// "外观" label instead of on its baseline.
 pub fn theme_switch(ui: &mut Ui, dark: bool) -> Option<bool> {
     let mut picked = None;
-    ui.horizontal(|ui| {
-        for (label, wants_dark) in [("浅色", false), ("深色", true)] {
-            let selected = dark == wants_dark;
-            let hover = if selected {
-                "当前外观"
-            } else {
-                "切换到此外观（会记住，下次启动沿用）"
-            };
-            let response = ui
-                .selectable_label(selected, RichText::new(label).small())
-                .on_hover_text(hover);
-            if response.clicked() && !selected {
-                picked = Some(wants_dark);
-            }
+    for (label, wants_dark) in [("浅色", false), ("深色", true)] {
+        let selected = dark == wants_dark;
+        let hover = if selected {
+            "当前外观"
+        } else {
+            "切换到此外观（会记住，下次启动沿用）"
+        };
+        let response = ui
+            .selectable_label(selected, RichText::new(label).small())
+            .on_hover_text(hover);
+        if response.clicked() && !selected {
+            picked = Some(wants_dark);
         }
-    });
+    }
     picked
 }
 
@@ -237,12 +267,17 @@ pub fn field_row_hover(ui: &mut Ui, label: &str, hover: &str, add_contents: impl
 /// Quiet supporting text, kept at a contrast that stays readable at a glance
 /// (the default weak color is too faint to notice).
 pub fn hint(ui: &mut Ui, text: &str) {
-    let color = if ui.visuals().dark_mode {
+    let color = hint_color(ui);
+    ui.label(RichText::new(text).small().color(color));
+}
+
+/// Color of [`hint`] text, for hand-styled labels that must match it.
+pub fn hint_color(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
         Color32::from_gray(150)
     } else {
         Color32::from_rgb(0x6E, 0x6E, 0x78)
-    };
-    ui.label(RichText::new(text).small().color(color));
+    }
 }
 
 // -------------------------------------------------------------------- inputs
@@ -336,23 +371,19 @@ pub fn number_input<N: egui::emath::Numeric>(
 ) -> egui::Response {
     ui.scope(|ui| {
         style_input_scope(ui);
-        ui.add(
-            customize(
-                egui::DragValue::new(value)
-                    .range(range)
-                    .min_size(vec2(NUMBER_W, CONTROL_H)),
-            ),
-        )
+        ui.add(customize(
+            egui::DragValue::new(value)
+                .range(range)
+                .min_size(vec2(NUMBER_W, CONTROL_H)),
+        ))
     })
     .inner
 }
 
 /// Dashed target shown while the input list is empty.
 pub fn drop_zone(ui: &mut Ui, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(
-        vec2(ui.available_width(), DROP_H),
-        egui::Sense::hover(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), DROP_H), egui::Sense::hover());
     let painter = ui.painter();
     let color = ui.visuals().weak_text_color().gamma_multiply(0.7);
     dashed_rounded_rect(painter, rect, RADIUS_CARD as f32, color);
@@ -531,10 +562,10 @@ pub fn result_area(ui: &mut Ui, state: &TaskState) -> ResultAction {
                 ui.label(RichText::new(error.to_string()).small());
                 // Permission failures get a one-click escape hatch: save into
                 // the user's writable Documents folder instead.
-                if matches!(error, ToolError::WriteFailed { .. }) {
-                    if small_button(ui, "改存到「文档」并重试").clicked() {
-                        action = ResultAction::RetryInDocuments;
-                    }
+                if matches!(error, ToolError::WriteFailed { .. })
+                    && small_button(ui, "改存到「文档」并重试").clicked()
+                {
+                    action = ResultAction::RetryInDocuments;
                 }
             });
         }
@@ -555,7 +586,12 @@ fn tinted_card(ui: &mut Ui, tint: Color32, add_contents: impl FnOnce(&mut Ui)) {
         .corner_radius(CornerRadius::same(RADIUS_CARD))
         .inner_margin(Margin::symmetric(CARD_PAD as i8, 8))
         .outer_margin(Margin::symmetric(0, 5))
-        .show(ui, add_contents);
+        .show(ui, |ui| {
+            // Same width rule as `card`: the result banner spans the bar
+            // instead of floating as a small box in an empty strip.
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
 }
 
 /// Open a path with the platform default handler.
@@ -575,8 +611,46 @@ pub fn open_path(path: &std::path::Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Open an http(s) address in the user's default browser.
+///
+/// The address is handed to the operating system's own handler rather than to a
+/// guessed browser path, so the user's default browser and profile are used.
+/// Nothing is fetched by the app itself — the request only starts once the
+/// browser has been launched, and a failure is returned so the caller can offer
+/// the address another way.
+pub fn open_url(url: &str) -> Result<(), std::io::Error> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // `start` is shell built-in, so it must be reached through `cmd`; it
+        // resolves the URL via the registered protocol handler, which is the
+        // only dependency-free route to the *default* browser. Its first
+        // argument is the window title — passing an empty one keeps the URL
+        // itself from being swallowed as the title. CREATE_NO_WINDOW stops a
+        // console from flashing, since this process has no console of its own.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    Ok(())
+}
+
 /// Row height shared by sidebar entries and list rows.
-pub const SIDEBAR_ROW_H: f32 = 28.0;
+///
+/// 26 pt (not 28) is what lets all 12 tools plus the five group captions fit
+/// the 650 pt default window without scrolling.
+pub const SIDEBAR_ROW_H: f32 = 25.0;
 
 /// Font used for manually painted text.
 pub fn painted_font(ui: &Ui) -> FontId {

@@ -9,13 +9,14 @@
 //! for the dependency. A bitmap watermark renders identically in every
 //! viewer and keeps the chosen color, size, rotation and opacity.
 
-use medpdf_image::{DrawImageParams, ImageData, add_image};
+use medpdf_image::{add_image, DrawImageParams, ImageData};
 
 use crate::engine::{pdf_io, render, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome, WatermarkPlacement};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
+    check_cancel,
     split::{ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 /// Pixels rendered per PDF point (4x supersampling keeps text crisp at
@@ -72,6 +73,8 @@ impl Tool for TextWatermark {
             }
         };
 
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+
         progress.report(0.05, "渲染水印文字".to_string());
         let (image, wm_w, wm_h) = render_text_bitmap(&text, font_size, color)?;
 
@@ -120,14 +123,14 @@ impl Tool for TextWatermark {
 
         progress.report(0.9, "写入 PDF".to_string());
         check_cancel(cancel)?;
-        pdf_io::save_document(&mut doc, &req.output)?;
+        pdf_io::save_document(&mut doc, &out, req.conflict)?;
 
-        validate::assert_page_count(&req.output, total as u32, None)?;
+        validate::assert_page_count(&out, total as u32, None)?;
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
             format!("已在 {total} 页添加文字水印"),
-            vec![req.output.clone()],
+            vec![out],
         ))
     }
 }
@@ -148,7 +151,10 @@ fn tiled_positions(
     let mut out = Vec::with_capacity(cols * rows);
     for row in 0..rows {
         for col in 0..cols {
-            out.push((origin_x + col as f32 * step_x, origin_y + row as f32 * step_y));
+            out.push((
+                origin_x + col as f32 * step_x,
+                origin_y + row as f32 * step_y,
+            ));
         }
     }
     out
@@ -170,7 +176,8 @@ fn render_text_bitmap(
         .primary()
         .ok_or_else(|| ToolError::UnsupportedFormat {
             path: None,
-            detail: "未找到可用的系统 TrueType 字体（C:\\Windows\\Fonts），无法渲染水印文字".to_string(),
+            detail: "未找到可用的系统 TrueType 字体（C:\\Windows\\Fonts），无法渲染水印文字"
+                .to_string(),
         })?;
 
     let upem = font.units_per_em();

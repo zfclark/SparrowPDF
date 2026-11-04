@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use lopdf::{Document, ObjectId};
 use lopdf::dictionary;
+use lopdf::{Document, ObjectId};
 
 use crate::engine::{pdf_io, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome};
-use crate::tools::{CancelFlag, Progress, Tool, ToolRequest, check_cancel};
+use crate::tools::{check_cancel, CancelFlag, Progress, Tool, ToolRequest};
 
 pub struct Merge;
 
@@ -41,6 +41,10 @@ impl Tool for Merge {
         progress: &Progress,
         cancel: &CancelFlag,
     ) -> Result<ToolOutcome, ToolError> {
+        // Claim the output before doing the work: the user should not wait for
+        // a 200-page merge to be asked whether to overwrite a file.
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+
         let mut dest = Document::with_version("1.7");
         new_skeleton(&mut dest);
 
@@ -87,15 +91,16 @@ impl Tool for Merge {
                 succeeded: 0,
                 failed: skipped.len(),
                 detail: describe(&skipped),
+                outputs: Vec::new(),
             });
         }
 
         progress.report(0.95, "写入 PDF".to_string());
         check_cancel(cancel)?;
-        pdf_io::save_document(&mut dest, &req.output)?;
+        pdf_io::save_document(&mut dest, &out, req.conflict)?;
 
         let expected: u32 = succeeded.iter().sum();
-        validate::assert_merged_page_total(&req.output, &succeeded, None)?;
+        validate::assert_merged_page_total(&out, &succeeded, None)?;
 
         progress.report(1.0, "完成".to_string());
 
@@ -108,15 +113,13 @@ impl Tool for Merge {
                     skipped.len(),
                     describe(&skipped)
                 ),
+                outputs: vec![out.clone()],
             });
         }
 
         Ok(ToolOutcome::success(
-            format!(
-                "已合并 {} 个文件，共 {expected} 页",
-                succeeded.len()
-            ),
-            vec![req.output.clone()],
+            format!("已合并 {} 个文件，共 {expected} 页", succeeded.len()),
+            vec![out],
         ))
     }
 }

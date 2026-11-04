@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 
-use medpdf_image::{DrawImageParams, ImageFit, add_image, load_image};
+use medpdf_image::{add_image, load_image, DrawImageParams, ImageFit};
 
 use crate::engine::{pdf_io, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome, WatermarkPlacement};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
+    check_cancel,
     split::{ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct ImageWatermark;
@@ -68,7 +69,17 @@ impl Tool for ImageWatermark {
         cancel: &CancelFlag,
     ) -> Result<ToolOutcome, ToolError> {
         let pdf_path = single_input(req)?;
-        let watermark_path: &PathBuf = &req.inputs[1].path;
+        // `validate` guarantees the second slot, but `execute` must not panic if
+        // it is ever called without it (worker catches panics, yet an
+        // "内部错误" is a poor answer for a missing file).
+        let watermark_path: &PathBuf = &req
+            .inputs
+            .get(1)
+            .ok_or_else(|| ToolError::UnsupportedFormat {
+                path: None,
+                detail: "请选择一张作为水印的图片".to_string(),
+            })?
+            .path;
         let (scale, opacity, position) = match &req.options {
             ToolOptions::ImageWatermark {
                 scale,
@@ -81,6 +92,8 @@ impl Tool for ImageWatermark {
                 })
             }
         };
+
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
 
         let mut doc = pdf_io::open_for_edit(pdf_path, req.password.as_deref())?;
         let pages: Vec<(u32, lopdf::ObjectId)> = doc.get_pages().into_iter().collect();
@@ -149,14 +162,14 @@ impl Tool for ImageWatermark {
 
         progress.report(0.9, "写入 PDF".to_string());
         check_cancel(cancel)?;
-        pdf_io::save_document(&mut doc, &req.output)?;
+        pdf_io::save_document(&mut doc, &out, req.conflict)?;
 
-        validate::assert_page_count(&req.output, total as u32, None)?;
+        validate::assert_page_count(&out, total as u32, None)?;
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
             format!("已在 {total} 页添加图片水印"),
-            vec![req.output.clone()],
+            vec![out],
         ))
     }
 }

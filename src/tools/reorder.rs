@@ -7,11 +7,25 @@
 use crate::engine::{pdf_io, validate};
 use crate::model::{ToolError, ToolId, ToolOutcome};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
-    split::{ensure_pdf, single_input},
+    check_cancel,
+    split::{ensure_not_empty, ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct Reorder;
+
+/// Translate a 0-based source order into 1-based page numbers.
+///
+/// Shared by the tool and its live preview so the strip the user sees and the
+/// page sequence written to disk can never disagree. Out-of-range indices are
+/// dropped here; [`Reorder::execute`] rejects them with a message first.
+pub fn ordered_pages(order: &[usize], total: u32) -> Vec<u32> {
+    order
+        .iter()
+        .filter(|index| **index < total as usize)
+        .map(|index| *index as u32 + 1)
+        .collect()
+}
 
 impl Tool for Reorder {
     fn id(&self) -> ToolId {
@@ -46,13 +60,15 @@ impl Tool for Reorder {
             }
         };
 
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+
         let source = pdf_io::open_for_edit(path, req.password.as_deref())?;
         let total = pdf_io::page_count(&source);
+        ensure_not_empty(total, path)?;
 
         // 0-based source indices in, 1-based page numbers out; reject duplicates
         // and out-of-range indices so the output assertion stays meaningful.
         let mut seen = vec![false; total as usize];
-        let mut pages: Vec<u32> = Vec::with_capacity(order.len());
         for index in &order {
             if *index >= total as usize {
                 return Err(ToolError::InvalidPageRange {
@@ -65,8 +81,8 @@ impl Tool for Reorder {
                 });
             }
             seen[*index] = true;
-            pages.push(*index as u32 + 1);
         }
+        let pages = ordered_pages(&order, total);
 
         progress.report(0.2, "重建页面顺序".to_string());
         check_cancel(cancel)?;
@@ -75,13 +91,13 @@ impl Tool for Reorder {
         pdf_io::copy_pages(&mut dest, &source, &pages)?;
 
         progress.report(0.9, "写入 PDF".to_string());
-        pdf_io::save_document(&mut dest, &req.output)?;
-        validate::assert_page_count(&req.output, pages.len() as u32, None)?;
+        pdf_io::save_document(&mut dest, &out, req.conflict)?;
+        validate::assert_page_count(&out, pages.len() as u32, None)?;
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
             format!("已重排 {} 页", pages.len()),
-            vec![req.output.clone()],
+            vec![out],
         ))
     }
 }

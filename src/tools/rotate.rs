@@ -5,8 +5,9 @@
 use crate::engine::{pdf_io, validate};
 use crate::model::{RotationDegrees, ToolError, ToolId, ToolOutcome};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel,
-    split::{ensure_pdf, single_input},
+    check_cancel,
+    split::{ensure_not_empty, ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct Rotate;
@@ -44,8 +45,13 @@ impl Tool for Rotate {
             }
         };
 
+        let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+
         let mut doc = pdf_io::open_for_edit(path, req.password.as_deref())?;
         let total = pdf_io::page_count(&doc);
+        // `parse_pages("all", 0)` yields an empty list, so an empty document
+        // would otherwise "succeed" while rotating nothing.
+        ensure_not_empty(total, path)?;
         let targets = pdf_io::parse_pages(&spec, total)?;
         let page_map = doc.get_pages();
 
@@ -80,15 +86,15 @@ impl Tool for Rotate {
 
         progress.report(0.9, "写入 PDF".to_string());
         check_cancel(cancel)?;
-        pdf_io::save_document(&mut doc, &req.output)?;
+        pdf_io::save_document(&mut doc, &out, req.conflict)?;
 
-        validate::assert_page_count(&req.output, total, None)?;
-        validate::assert_rotations(&req.output, &expected)?;
+        validate::assert_page_count(&out, total, None)?;
+        validate::assert_rotations(&out, &expected)?;
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
             format!("已旋转 {} 页，每页 +{delta}°", expected.len()),
-            vec![req.output.clone()],
+            vec![out],
         ))
     }
 }

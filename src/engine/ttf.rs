@@ -75,8 +75,7 @@ impl TrueTypeFont {
         let glyf = *tables.get(b"glyf")?;
         let loca = *tables.get(b"loca")?;
 
-        let units_per_em =
-            u16::from_be_bytes([data[head.0 + 18], data[head.0 + 19]]) as f32;
+        let units_per_em = u16::from_be_bytes([data[head.0 + 18], data[head.0 + 19]]) as f32;
         let long_loca = i16::from_be_bytes([data[head.0 + 50], data[head.0 + 51]]) == 1;
         let num_glyphs = u16::from_be_bytes([data[maxp.0 + 4], data[maxp.0 + 5]]);
 
@@ -84,18 +83,16 @@ impl TrueTypeFont {
         // because text is positioned from the content stream, not the font.
         let mut num_h_metrics = 0usize;
         if let Some(hhea) = tables.get(b"hhea") {
-            num_h_metrics =
-                u16::from_be_bytes([data[hhea.0 + 34], data[hhea.0 + 35]]) as usize;
+            num_h_metrics = u16::from_be_bytes([data[hhea.0 + 34], data[hhea.0 + 35]]) as usize;
         }
 
         let mut advances = vec![0u16; num_glyphs as usize];
         if let Some(hmtx) = tables.get(b"hmtx") {
-            for gid in 0..num_glyphs as usize {
+            for (gid, advance) in advances.iter_mut().enumerate() {
                 let index = gid.min(num_h_metrics.saturating_sub(1));
                 let off = hmtx.0 + index * 4;
                 if off + 2 <= data.len() {
-                    advances[gid] =
-                        u16::from_be_bytes([data[off], data[off + 1]]);
+                    *advance = u16::from_be_bytes([data[off], data[off + 1]]);
                 }
             }
         }
@@ -124,7 +121,11 @@ impl TrueTypeFont {
 
         Some(Self {
             data,
-            units_per_em: if units_per_em > 0.0 { units_per_em } else { 1000.0 },
+            units_per_em: if units_per_em > 0.0 {
+                units_per_em
+            } else {
+                1000.0
+            },
             loca: loca_entries,
             glyf,
             cmap,
@@ -255,7 +256,11 @@ impl TrueTypeFont {
                 }
                 let v = d[p] as i32;
                 p += 1;
-                if flag & 0x10 != 0 { v } else { -v }
+                if flag & 0x10 != 0 {
+                    v
+                } else {
+                    -v
+                }
             } else if flag & 0x10 != 0 {
                 0
             } else {
@@ -279,7 +284,11 @@ impl TrueTypeFont {
                 }
                 let v = d[p] as i32;
                 p += 1;
-                if flag & 0x20 != 0 { v } else { -v }
+                if flag & 0x20 != 0 {
+                    v
+                } else {
+                    -v
+                }
             } else if flag & 0x20 != 0 {
                 0
             } else {
@@ -415,8 +424,10 @@ fn flatten_quadratic(points: &[(f32, f32, bool)]) -> Vec<(f32, f32)> {
         for point in points {
             out.push((point.0, point.1));
         }
-        out.push(((points[0].0 + points[1 % points.len()].0) / 2.0,
-                  (points[0].1 + points[1 % points.len()].1) / 2.0));
+        out.push((
+            (points[0].0 + points[1 % points.len()].0) / 2.0,
+            (points[0].1 + points[1 % points.len()].1) / 2.0,
+        ));
         return out;
     };
 
@@ -451,12 +462,7 @@ fn flatten_quadratic(points: &[(f32, f32, bool)]) -> Vec<(f32, f32)> {
 }
 
 /// Flatten one quadratic Bezier segment.
-fn push_quad(
-    out: &mut Vec<(f32, f32)>,
-    p0: (f32, f32),
-    control: (f32, f32),
-    p1: (f32, f32),
-) {
+fn push_quad(out: &mut Vec<(f32, f32)>, p0: (f32, f32), control: (f32, f32), p1: (f32, f32)) {
     const STEPS: usize = 6;
     for step in 1..=STEPS {
         let t = step as f32 / STEPS as f32;
@@ -482,12 +488,9 @@ fn parse_cmap(data: &[u8], cmap_offset: usize) -> BTreeMap<u32, u16> {
         }
         let platform = u16::from_be_bytes([data[rec], data[rec + 1]]);
         let encoding = u16::from_be_bytes([data[rec + 2], data[rec + 3]]);
-        let offset = u32::from_be_bytes([
-            data[rec + 4],
-            data[rec + 5],
-            data[rec + 6],
-            data[rec + 7],
-        ]) as usize;
+        let offset =
+            u32::from_be_bytes([data[rec + 4], data[rec + 5], data[rec + 6], data[rec + 7]])
+                as usize;
         let sub = cmap_offset + offset;
         if sub + 2 > data.len() {
             continue;
@@ -540,7 +543,8 @@ fn parse_cmap_format4(data: &[u8], sub: usize, map: &mut BTreeMap<u32, u16>) {
             let gid = if range_offset == 0 {
                 (code as i32 + delta as i32) as u16
             } else {
-                let addr = range_base + seg * 2 + range_offset as usize + (code - start) as usize * 2;
+                let addr =
+                    range_base + seg * 2 + range_offset as usize + (code - start) as usize * 2;
                 let g = read_u16(data, addr);
                 if g == 0 {
                     continue;
@@ -572,7 +576,8 @@ fn parse_cmap_format12(data: &[u8], sub: usize, map: &mut BTreeMap<u32, u16>) {
         if base + 12 > data.len() {
             break;
         }
-        let start = u32::from_be_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]]);
+        let start =
+            u32::from_be_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]]);
         let end = u32::from_be_bytes([
             data[base + 4],
             data[base + 5],

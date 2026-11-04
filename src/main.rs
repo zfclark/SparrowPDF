@@ -10,6 +10,7 @@ mod engine;
 mod model;
 mod tools;
 mod ui;
+mod version;
 
 use eframe::egui;
 

@@ -17,50 +17,102 @@ use lopdf::{Document, Object, ObjectId};
 use super::raster::{self, ImageRgba, Matrix, Path, Pixmap};
 use super::ttf::TrueTypeFont;
 
-/// Resolves fonts for text rendering.
-pub struct FontSet {
-    fonts: Vec<(String, TrueTypeFont)>,
+/// Rough flavour of a font, used to substitute the closest system face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Sans,
+    Serif,
+    Mono,
 }
 
+struct LoadedFont {
+    family: Family,
+    font: TrueTypeFont,
+}
+
+/// Resolves fonts for text rendering.
+///
+/// One face per family (sans / serif / mono) is loaded, not just the first
+/// match: a document set in Times or Courier kept being drawn with the CJK sans
+/// face, and any character that face lacked disappeared. Several faces also give
+/// [`Self::resolve`] somewhere to fall back to per glyph.
+pub struct FontSet {
+    fonts: Vec<LoadedFont>,
+}
+
+/// Upper bound on the font bytes kept in memory; a 40 MB CJK collection on
+/// macOS would otherwise be followed by two more faces nobody asked for.
+const MAX_FONT_BYTES: usize = 56 * 1024 * 1024;
+
 impl FontSet {
-    /// Locate the first usable system font from a candidate list.
     pub fn system() -> Self {
-        const CANDIDATES: &[&str] = &[
-            r"C:\Windows\Fonts\msyh.ttc",
-            r"C:\Windows\Fonts\msyh.ttf",
-            r"C:\Windows\Fonts\simsun.ttc",
-            r"C:\Windows\Fonts\simhei.ttf",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
+        const SANS: &[&str] = &[
+            r"C:/Windows/Fonts/msyh.ttc",
+            r"C:/Windows/Fonts/msyh.ttf",
             "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/Helvetica.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            r"C:/Windows/Fonts/segoeui.ttf",
+            r"C:/Windows/Fonts/arial.ttf",
         ];
-        let mut fonts = Vec::new();
-        for path in CANDIDATES {
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
-            // `.ttc` collections keep absolute table offsets — parse each
-            // face from the full file via `parse_at` (slicing a face out
-            // would misalign every table).
-            let candidates: Vec<(usize, Vec<u8>)> = if bytes.starts_with(b"ttcf") {
-                ttc_offsets(&bytes)
-                    .into_iter()
-                    .map(|off| (off, bytes.clone()))
-                    .collect()
-            } else {
-                vec![(0, bytes)]
-            };
-            for (base, data) in candidates {
-                if let Some(font) = TrueTypeFont::parse_at(data, base) {
-                    fonts.push(((*path).to_string(), font));
+        const SERIF: &[&str] = &[
+            r"C:/Windows/Fonts/simsun.ttc",
+            r"C:/Windows/Fonts/times.ttf",
+            "/System/Library/Fonts/Songti.ttc",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            r"C:/Windows/Fonts/georgia.ttf",
+        ];
+        const MONO: &[&str] = &[
+            r"C:/Windows/Fonts/consola.ttf",
+            r"C:/Windows/Fonts/cour.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ];
+
+        let mut fonts: Vec<LoadedFont> = Vec::new();
+        let mut loaded_paths: Vec<String> = Vec::new();
+        let mut total_bytes = 0usize;
+        for (family, candidates) in [
+            (Family::Sans, SANS),
+            (Family::Serif, SERIF),
+            (Family::Mono, MONO),
+        ] {
+            for path in candidates {
+                if loaded_paths.iter().any(|loaded| loaded == path) {
+                    continue;
+                }
+                if total_bytes >= MAX_FONT_BYTES {
                     break;
                 }
-            }
-            if !fonts.is_empty() {
-                break;
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                total_bytes += bytes.len();
+                // `.ttc` collections keep absolute table offsets — parse each
+                // face from the full file via `parse_at` (slicing a face out
+                // would misalign every table).
+                let faces: Vec<(usize, Vec<u8>)> = if bytes.starts_with(b"ttcf") {
+                    ttc_offsets(&bytes)
+                        .into_iter()
+                        .map(|off| (off, bytes.clone()))
+                        .collect()
+                } else {
+                    vec![(0, bytes)]
+                };
+                let mut parsed = None;
+                for (base, data) in faces {
+                    if let Some(font) = TrueTypeFont::parse_at(data, base) {
+                        parsed = Some(font);
+                        break;
+                    }
+                }
+                if let Some(font) = parsed {
+                    loaded_paths.push((*path).to_string());
+                    fonts.push(LoadedFont { family, font });
+                    break;
+                }
             }
         }
         Self { fonts }
@@ -71,7 +123,54 @@ impl FontSet {
     }
 
     pub fn primary(&self) -> Option<&TrueTypeFont> {
-        self.fonts.first().map(|(_, f)| f)
+        self.fonts.first().map(|loaded| &loaded.font)
+    }
+
+    /// Closest face for a PDF `/BaseFont` name.
+    ///
+    /// Name matching, not metrics: the point is to stop drawing a Times
+    /// document with a CJK gothic face, which changes every glyph's width.
+    pub fn pick(&self, base: &str) -> Option<&TrueTypeFont> {
+        let lower = base.to_ascii_lowercase();
+        let family = if ["times", "serif", "song", "宋", "ming", "georgia", "roman"]
+            .iter()
+            .any(|key| lower.contains(key))
+        {
+            Family::Serif
+        } else if ["courier", "mono", "consol", "menlo"]
+            .iter()
+            .any(|key| lower.contains(key))
+        {
+            Family::Mono
+        } else {
+            Family::Sans
+        };
+        self.fonts
+            .iter()
+            .find(|loaded| loaded.family == family)
+            .map(|loaded| &loaded.font)
+            .or_else(|| self.primary())
+    }
+
+    /// Glyph for `ch`: the preferred face first, then any loaded face.
+    ///
+    /// The fallback is what keeps a mixed-script run from losing characters —
+    /// the reason text used to vanish in the middle of a line.
+    pub fn resolve<'a>(
+        &'a self,
+        preferred: Option<&'a TrueTypeFont>,
+        ch: char,
+    ) -> Option<(&'a TrueTypeFont, u16)> {
+        if let Some(font) = preferred {
+            let gid = font.glyph_for_char(ch);
+            if gid != 0 {
+                return Some((font, gid));
+            }
+        }
+        self.fonts.iter().find_map(|loaded| {
+            let gid = loaded.font.glyph_for_char(ch);
+            (gid != 0).then_some((&loaded.font, gid))
+        })
     }
 }
 
@@ -86,7 +185,9 @@ fn ttc_offsets(bytes: &[u8]) -> Vec<usize> {
         if at + 4 > bytes.len() {
             break;
         }
-        out.push(u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize);
+        out.push(
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize,
+        );
     }
     out
 }
@@ -112,7 +213,9 @@ pub fn render_page_thumbnails(
             .copied()
             .ok_or_else(|| format!("页码 {page} 不存在"))?;
         let (_x0, _y0, _x1, y1) = media_box(&doc, page_id);
-        let dpi = ((height_px / y1.abs().max(1.0)) * 72.0).round().clamp(2.0, 72.0) as u32;
+        let dpi = ((height_px / y1.abs().max(1.0)) * 72.0)
+            .round()
+            .clamp(2.0, 72.0) as u32;
         let pixmap = render_page(&doc, page_id, dpi, fonts)?;
         out.push((page, pixmap));
     }
@@ -223,7 +326,9 @@ fn page_rotation(doc: &Document, page_id: ObjectId) -> u32 {
 }
 
 fn number(obj: &Object) -> Option<f32> {
-    obj.as_float().ok().or_else(|| obj.as_i64().ok().map(|v| v as f32))
+    obj.as_float()
+        .ok()
+        .or_else(|| obj.as_i64().ok().map(|v| v as f32))
 }
 
 /// Graphics state for the interpreter.
@@ -251,44 +356,431 @@ impl State {
 }
 
 /// Page-level resources, resolved once.
+#[derive(Default)]
 struct Resources {
     xobjects: BTreeMap<Vec<u8>, ObjectId>,
     extgstates: BTreeMap<Vec<u8>, ObjectId>,
+    /// Font resources, keyed by the name used in `Tf`.
+    fonts: BTreeMap<Vec<u8>, FontResource>,
+}
+
+/// Everything text drawing needs to know about one `/Font` resource.
+///
+/// The glyphs come from a system font (no font program is executed), but the
+/// *characters* must come from the document: a subset or CID font stores codes,
+/// not Latin-1 bytes. `/ToUnicode` is the authoritative mapping; without it a
+/// simple font falls back to WinAnsi and a composite font gives up.
+#[derive(Default)]
+struct FontResource {
+    /// `/BaseFont`, used to pick a substitute with the right flavour.
+    base: String,
+    /// Two-byte codes (Type0 / CID-keyed).
+    is_cid: bool,
+    /// code -> character, parsed from `/ToUnicode`.
+    to_unicode: BTreeMap<u32, char>,
+    /// Embedded TrueType program (`/FontFile2`), if the file carries one.
+    ///
+    /// Using it is what makes a subset font readable at all: its codes are
+    /// arbitrary indices, and a system font has no idea what they mean.
+    embedded: Option<Box<TrueTypeFont>>,
+    /// `/CIDToGIDMap`; `None` is `/Identity` (CID == glyph id).
+    cid_to_gid: Option<Vec<u16>>,
+    /// `/Encoding /Differences`: code -> glyph name.
+    differences: BTreeMap<u8, String>,
+}
+
+impl FontResource {
+    /// Character for one code unit (a CID, or a single byte).
+    fn char_for(&self, code: u32) -> Option<char> {
+        if let Some(ch) = self.to_unicode.get(&code) {
+            return Some(*ch);
+        }
+        let byte = u8::try_from(code).ok()?;
+        self.differences
+            .get(&byte)
+            .and_then(|name| glyph_name_char(name))
+            .or_else(|| win_ansi(byte))
+    }
+
+    /// Glyph id inside the embedded program, when the file ships one.
+    fn glyph(&self, code: u32, ch: Option<char>) -> Option<u16> {
+        let font = self.embedded.as_deref()?;
+        if self.is_cid {
+            let gid = match &self.cid_to_gid {
+                Some(map) => *map.get(code as usize)?,
+                None => u16::try_from(code).ok()?,
+            };
+            return (gid != 0).then_some(gid);
+        }
+        let gid = font.glyph_for_char(ch?);
+        (gid != 0).then_some(gid)
+    }
 }
 
 fn page_resources(doc: &Document, page_id: ObjectId) -> Resources {
+    doc.get_dictionary(page_id)
+        .ok()
+        .and_then(|d| d.get(b"Resources").ok())
+        .and_then(|o| deref_dict(doc, o))
+        .map(|res| resources_from(doc, res))
+        .unwrap_or_default()
+}
+
+/// Resolve one `/Resources` dictionary.
+///
+/// Also used for form XObjects: a form may carry its own dictionary, and its
+/// text must be decoded with *that* font table rather than the page's.
+fn resources_from(doc: &Document, res: &lopdf::Dictionary) -> Resources {
     let mut xobjects = BTreeMap::new();
     let mut extgstates = BTreeMap::new();
+    let mut fonts = BTreeMap::new();
 
-    let dict = doc.get_dictionary(page_id).ok();
-    let res = dict
-        .and_then(|d| d.get(b"Resources").ok())
-        .and_then(|o| deref_dict(doc, o));
-
-    if let Some(res) = res {
-        if let Some(xo) = res.get(b"XObject").ok().and_then(|o| deref_dict(doc, o)) {
-            for (name, value) in xo.iter() {
-                if let Ok(id) = value.as_reference() {
-                    xobjects.insert(name.clone(), id);
-                }
+    if let Some(xo) = res.get(b"XObject").ok().and_then(|o| deref_dict(doc, o)) {
+        for (name, value) in xo.iter() {
+            if let Ok(id) = value.as_reference() {
+                xobjects.insert(name.clone(), id);
             }
         }
-        if let Some(gs) = res
-            .get(b"ExtGState")
-            .ok()
-            .and_then(|o| deref_dict(doc, o))
-        {
-            for (name, value) in gs.iter() {
-                if let Ok(id) = value.as_reference() {
-                    extgstates.insert(name.clone(), id);
-                }
+    }
+    if let Some(gs) = res.get(b"ExtGState").ok().and_then(|o| deref_dict(doc, o)) {
+        for (name, value) in gs.iter() {
+            if let Ok(id) = value.as_reference() {
+                extgstates.insert(name.clone(), id);
+            }
+        }
+    }
+    if let Some(font_dict) = res.get(b"Font").ok().and_then(|o| deref_dict(doc, o)) {
+        for (name, value) in font_dict.iter() {
+            if let Ok(id) = value.as_reference() {
+                fonts.insert(name.clone(), parse_font(doc, id));
             }
         }
     }
     Resources {
         xobjects,
         extgstates,
+        fonts,
     }
+}
+
+/// Read the parts of a `/Font` dictionary that affect *which characters* the
+/// byte string stands for.
+fn parse_font(doc: &Document, id: ObjectId) -> FontResource {
+    /// A font program bigger than this is not a subset; keeping it would cost
+    /// more memory than substituting a system face.
+    const MAX_EMBEDDED_FONT: usize = 32 * 1024 * 1024;
+
+    let Ok(dict) = doc.get_dictionary(id) else {
+        return FontResource::default();
+    };
+    let name_of = |d: &lopdf::Dictionary, key: &[u8]| -> String {
+        d.get(key)
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .unwrap_or_default()
+    };
+    let is_cid = name_of(dict, b"Subtype") == "Type0";
+
+    // A composite font keeps its descriptor and CID map on the descendant.
+    let descendant = if is_cid {
+        dict.get(b"DescendantFonts")
+            .ok()
+            .and_then(|o| match o {
+                Object::Array(items) => items.first(),
+                other => Some(other),
+            })
+            .and_then(|o| deref_dict(doc, o))
+    } else {
+        Some(dict)
+    };
+
+    let base = {
+        let own = name_of(dict, b"BaseFont");
+        if own.is_empty() {
+            descendant
+                .map(|d| name_of(d, b"BaseFont"))
+                .unwrap_or_default()
+        } else {
+            own
+        }
+    };
+
+    let to_unicode = dict
+        .get(b"ToUnicode")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+        .and_then(|id| doc.get_object(id).ok())
+        .and_then(|o| o.as_stream().ok())
+        .and_then(decoded_stream_content)
+        .map(|cmap| parse_to_unicode(&cmap))
+        .unwrap_or_default();
+
+    let embedded = descendant
+        .and_then(|d| d.get(b"FontDescriptor").ok())
+        .and_then(|o| deref_dict(doc, o))
+        .and_then(|fd| fd.get(b"FontFile2").ok())
+        .and_then(|o| o.as_reference().ok())
+        .and_then(|id| doc.get_object(id).ok())
+        .and_then(|o| o.as_stream().ok())
+        .and_then(decoded_stream_content)
+        .filter(|program| program.len() <= MAX_EMBEDDED_FONT)
+        .and_then(TrueTypeFont::parse)
+        .map(Box::new);
+
+    let cid_to_gid = if is_cid {
+        descendant
+            .and_then(|d| d.get(b"CIDToGIDMap").ok())
+            .and_then(|o| match o {
+                // `/Identity` is also the default when the key is absent.
+                Object::Name(name) if name == b"Identity" => None,
+                Object::Reference(id) => doc
+                    .get_object(*id)
+                    .ok()
+                    .and_then(|o| o.as_stream().ok())
+                    .and_then(decoded_stream_content)
+                    .map(|bytes| {
+                        bytes
+                            .chunks_exact(2)
+                            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                            .collect()
+                    }),
+                _ => None,
+            })
+    } else {
+        None
+    };
+
+    let differences = if is_cid {
+        BTreeMap::new()
+    } else {
+        dict.get(b"Encoding")
+            .ok()
+            .and_then(|o| deref_dict(doc, o))
+            .and_then(|enc| enc.get(b"Differences").ok())
+            .and_then(|o| o.as_array().ok())
+            .map(|items| parse_differences(items))
+            .unwrap_or_default()
+    };
+
+    FontResource {
+        base,
+        is_cid,
+        to_unicode,
+        embedded,
+        cid_to_gid,
+        differences,
+    }
+}
+
+/// `/Encoding /Differences`: a code number followed by one name per code.
+fn parse_differences(items: &[Object]) -> BTreeMap<u8, String> {
+    let mut map = BTreeMap::new();
+    let mut code = 0u16;
+    for item in items {
+        match item {
+            Object::Integer(_) | Object::Real(_) => {
+                if let Some(value) = number(item) {
+                    code = value.max(0.0) as u16;
+                }
+            }
+            Object::Name(name) => {
+                if let Ok(byte) = u8::try_from(code) {
+                    map.insert(byte, String::from_utf8_lossy(name).into_owned());
+                }
+                code = code.wrapping_add(1);
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Character named by a `/Differences` glyph name.
+///
+/// Only the forms that actually appear in text-bearing documents are handled:
+/// `uniXXXX`, `uXXXX`, PostScript single-character names, and the common
+/// punctuation names. An unknown name falls through to the WinAnsi byte.
+fn glyph_name_char(name: &str) -> Option<char> {
+    if let Some(hex) = name.strip_prefix("uni") {
+        return hex
+            .get(..4)
+            .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+            .and_then(char::from_u32);
+    }
+    if let Some(hex) = name.strip_prefix('u') {
+        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+    }
+    let mut chars = name.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        return Some(ch);
+    }
+    Some(match name {
+        "space" => ' ',
+        "exclam" => '!',
+        "quotedbl" => '"',
+        "numbersign" => '#',
+        "dollar" => '$',
+        "percent" => '%',
+        "ampersand" => '&',
+        "quotesingle" => '\'',
+        "parenleft" => '(',
+        "parenright" => ')',
+        "asterisk" => '*',
+        "plus" => '+',
+        "comma" => ',',
+        "hyphen" | "minus" => '-',
+        "period" => '.',
+        "slash" => '/',
+        "colon" => ':',
+        "semicolon" => ';',
+        "less" => '<',
+        "equal" => '=',
+        "greater" => '>',
+        "question" => '?',
+        "at" => '@',
+        "bracketleft" => '[',
+        "backslash" => '\\',
+        "bracketright" => ']',
+        "asciicircum" => '^',
+        "underscore" => '_',
+        "grave" => '`',
+        "braceleft" => '{',
+        "bar" => '|',
+        "braceright" => '}',
+        "asciitilde" => '~',
+        "endash" => '\u{2013}',
+        "emdash" => '\u{2014}',
+        "quoteleft" => '\u{2018}',
+        "quoteright" => '\u{2019}',
+        "quotedblleft" => '\u{201C}',
+        "quotedblright" => '\u{201D}',
+        "bullet" => '\u{2022}',
+        "ellipsis" => '\u{2026}',
+        _ => return None,
+    })
+}
+
+/// Parse the `bfchar` / `bfrange` sections of a ToUnicode CMap.
+///
+/// Only the two forms a text-bearing document actually uses are handled; the
+/// rest of a CMap (codespace ranges, notdef ranges) does not change how a code
+/// maps to a character.
+fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
+    let mut map = BTreeMap::new();
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut depth_hex = false;
+    for &byte in cmap {
+        match byte {
+            b'<' if !depth_hex => {
+                depth_hex = true;
+                current.clear();
+            }
+            b'>' if depth_hex => {
+                depth_hex = false;
+                tokens.push(current.clone());
+                current.clear();
+            }
+            b'[' | b']' | b' ' | b'\n' | b'\r' | b'\t' => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ if depth_hex => current.push(byte),
+            _ => current.push(byte),
+        }
+    }
+
+    let value = |token: &[u8]| -> u32 { hex_value(token).unwrap_or(0) };
+    let char_of = |token: &[u8]| -> Option<char> {
+        let units: Vec<u16> = token
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16_lossy(&units);
+        text.chars().next()
+    };
+
+    // Tokens are in file order; beginbfchar/bfrange markers were consumed as
+    // ordinary tokens above, so walk the list and act on the markers.
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let marker = String::from_utf8_lossy(&tokens[index]).into_owned();
+        index += 1;
+        match marker.as_str() {
+            "beginbfchar" => {
+                while index + 1 < tokens.len() {
+                    if String::from_utf8_lossy(&tokens[index]) == "endbfchar" {
+                        index += 1;
+                        break;
+                    }
+                    let code = value(&tokens[index]);
+                    if let Some(ch) = char_of(&tokens[index + 1]) {
+                        map.insert(code, ch);
+                    }
+                    index += 2;
+                }
+            }
+            "beginbfrange" => {
+                while index + 2 < tokens.len() {
+                    if String::from_utf8_lossy(&tokens[index]) == "endbfrange" {
+                        index += 1;
+                        break;
+                    }
+                    let low = value(&tokens[index]);
+                    let high = value(&tokens[index + 1]);
+                    // Array form: <lo> <hi> [ <dst> <dst> … ]
+                    if index + 3 < tokens.len()
+                        && String::from_utf8_lossy(&tokens[index + 2]) == "["
+                    {
+                        index += 3;
+                        let mut code = low;
+                        while index < tokens.len() && String::from_utf8_lossy(&tokens[index]) != "]"
+                        {
+                            if let Some(ch) = char_of(&tokens[index]) {
+                                map.insert(code, ch);
+                            }
+                            code += 1;
+                            index += 1;
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    let Some(first) = char_of(&tokens[index + 2]) else {
+                        index += 3;
+                        continue;
+                    };
+                    let base = first as u32;
+                    for offset in 0..=high.saturating_sub(low) {
+                        if let Some(ch) = char::from_u32(base + offset) {
+                            map.insert(low + offset, ch);
+                        }
+                    }
+                    index += 3;
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn hex_value(token: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    let mut digits = 0;
+    for &b in token {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a') as u32 + 10,
+            b'A'..=b'F' => (b - b'A') as u32 + 10,
+            _ => continue,
+        };
+        value = value * 16 + digit;
+        digits += 1;
+    }
+    (digits > 0).then_some(value)
 }
 
 fn deref_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
@@ -478,9 +970,7 @@ fn execute(
             }
             "Do" => {
                 if let Some(Object::Name(name)) = operands.first() {
-                    draw_xobject(
-                        doc, pixmap, resources, name, state, fonts, depth,
-                    );
+                    draw_xobject(doc, pixmap, resources, name, state, fonts, depth);
                 }
             }
             "BT" => {
@@ -543,15 +1033,13 @@ fn execute(
             }
             "Tj" => {
                 if let Some(Object::String(bytes, _)) = operands.first() {
-                    draw_text(
-                        pixmap, state, &text, bytes, fonts,
-                    );
+                    draw_text(pixmap, state, &text, bytes, fonts, resources);
                 }
             }
             "'" => {
                 text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
                 if let Some(Object::String(bytes, _)) = operands.first() {
-                    draw_text(pixmap, state, &text, bytes, fonts);
+                    draw_text(pixmap, state, &text, bytes, fonts, resources);
                 }
             }
             "\"" => {
@@ -562,7 +1050,7 @@ fn execute(
                     }
                     text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
                     if let Object::String(bytes, _) = &operands[2] {
-                        draw_text(pixmap, state, &text, bytes, fonts);
+                        draw_text(pixmap, state, &text, bytes, fonts, resources);
                     }
                 }
             }
@@ -571,7 +1059,7 @@ fn execute(
                     for item in items {
                         match item {
                             Object::String(bytes, _) => {
-                                draw_text(pixmap, state, &text, bytes, fonts)
+                                draw_text(pixmap, state, &text, bytes, fonts, resources)
                             }
                             other => {
                                 if let Some(k) = number(other) {
@@ -655,7 +1143,7 @@ fn draw_xobject(
 
     match subtype {
         Some(b"Image") => {
-            let Some(image) = decode_image(doc, stream) else {
+            let Some(image) = decode_image(doc, stream, state.fill) else {
                 return;
             };
             // The unit square maps through the CTM.
@@ -692,8 +1180,23 @@ fn draw_xobject(
             }
             inner.path = Path::new();
             let mut stack: Vec<State> = Vec::new();
+            // A form may carry its own dictionary; its text must be decoded with
+            // that font table, otherwise the codes resolve against the page's
+            // fonts (or nothing) and the run disappears.
+            let inner_resources = stream
+                .dict
+                .get(b"Resources")
+                .ok()
+                .and_then(|o| deref_dict(doc, o))
+                .map(|dict| resources_from(doc, dict));
             execute(
-                doc, &ops.operations, pixmap, &mut inner, &mut stack, resources, fonts,
+                doc,
+                &ops.operations,
+                pixmap,
+                &mut inner,
+                &mut stack,
+                inner_resources.as_ref().unwrap_or(resources),
+                fonts,
                 depth + 1,
             );
         }
@@ -727,31 +1230,85 @@ impl Default for TextState {
     }
 }
 
-/// Paint a PDF string. Bytes are interpreted as Latin-1, the common case for the
-/// encodings produced by the tools in this app.
+/// Paint a PDF string.
+///
+/// The bytes are *codes*, not characters: a CID font stores two-byte glyph ids
+/// and a subset font stores whatever the producer chose. `/ToUnicode` turns them
+/// back into characters; without it a simple font is read as WinAnsi (the
+/// encoding of every standard-14 font) and a composite font draws nothing rather
+/// than random Latin letters. Glyphs come from a substituted system font, with a
+/// per-character fallback so a document mixing scripts does not lose characters.
 fn draw_text(
     pixmap: &mut Pixmap,
     state: &mut State,
     text: &TextState,
     bytes: &[u8],
     fonts: &FontSet,
+    resources: &Resources,
 ) {
-    let Some(font) = fonts.primary() else {
+    let resource = text
+        .font
+        .as_ref()
+        .and_then(|name| resources.fonts.get(name));
+    // A document that carries its own glyph program is drawn from it; the
+    // system font is only a stand-in for fonts the file does not embed.
+    let embedded = resource.and_then(|r| r.embedded.as_deref());
+    if embedded.is_none() && fonts.is_empty() {
         return;
+    }
+    let preferred = fonts.pick(resource.map(|r| r.base.as_str()).unwrap_or_default());
+    let size = if text.size.abs() < 0.01 {
+        12.0
+    } else {
+        text.size.abs()
     };
-    let size = if text.size.abs() < 0.01 { 12.0 } else { text.size.abs() };
-    let upem = font.units_per_em();
-    let h_scale = if text.h_scale.abs() < 0.01 { 1.0 } else { text.h_scale };
+    let h_scale = if text.h_scale.abs() < 0.01 {
+        1.0
+    } else {
+        text.h_scale
+    };
+
+    // (character, embedded glyph, is a single-byte space) per code unit.
+    let decoded: Vec<(Option<char>, Option<u16>, bool)> = match resource {
+        Some(font) if font.is_cid => bytes
+            .chunks(2)
+            .map(|pair| {
+                let code = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]) as u32;
+                let ch = font.char_for(code);
+                (ch, font.glyph(code, ch), false)
+            })
+            .collect(),
+        Some(font) => bytes
+            .iter()
+            .map(|&byte| {
+                let code = byte as u32;
+                let ch = font.char_for(code);
+                (ch, font.glyph(code, ch), byte == b' ')
+            })
+            .collect(),
+        None => bytes
+            .iter()
+            .map(|&byte| (win_ansi(byte), None, byte == b' '))
+            .collect(),
+    };
 
     // Pen position in text space; the outline is scaled by size/upem.
     let mut pen = text.line_matrix;
 
-    for &byte in bytes {
-        let ch = byte as char;
-        let gid = font.glyph_for_char(ch);
-
-        if gid != 0 {
-            let to_device = state.ctm.mul(&pen).mul(&Matrix::scale(size / upem, size / upem));
+    for (ch, embedded_gid, is_space) in decoded {
+        let mut step = size * 0.5;
+        // The embedded program wins when it has the glyph; otherwise a system
+        // face that does. A subset without the character falls back per glyph.
+        let drawn = match (embedded, embedded_gid) {
+            (Some(font), Some(gid)) => Some((font, gid)),
+            _ => ch.and_then(|ch| fonts.resolve(preferred, ch)),
+        };
+        if let Some((font, gid)) = drawn {
+            let upem = font.units_per_em();
+            let to_device = state
+                .ctm
+                .mul(&pen)
+                .mul(&Matrix::scale(size / upem, size / upem));
             let mut path = Path::new();
             for contour in font.outline(gid) {
                 if contour.len() < 2 {
@@ -766,37 +1323,70 @@ fn draw_text(
                 path.close();
             }
             raster::fill(pixmap, &path, state.fill);
+            step = font.advance(gid) / upem * size;
         }
 
         // Advance: glyph advance in text space, plus spacing, scaled by Tz.
-        let glyph_advance = font.advance(gid) / upem * size;
-        let mut step = glyph_advance + text.char_spacing * h_scale;
-        if byte == b' ' {
+        step += text.char_spacing * h_scale;
+        if is_space {
             step += text.word_spacing * h_scale;
         }
         pen = pen.mul(&Matrix::translate(step, 0.0));
     }
 }
 
+/// WinAnsi byte -> character.
+///
+/// Latin-1 for 0x20-0x7E and 0xA0-0xFF; the 0x80-0x9F band is where WinAnsi
+/// differs from Latin-1 (typographic quotes, dashes, the euro sign). Reading
+/// that band as Latin-1 is what turned curly quotes into control characters —
+/// and, once a font had no glyph for them, into missing text.
+fn win_ansi(byte: u8) -> Option<char> {
+    const SPECIALS: [char; 32] = [
+        '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+        '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+    ];
+    match byte {
+        0x20..=0x7E | 0xA0..=0xFF => Some(byte as char),
+        0x80..=0x9F => {
+            let ch = SPECIALS[(byte - 0x80) as usize];
+            (ch != '\u{FFFD}').then_some(ch)
+        }
+        _ => None,
+    }
+}
+
 /// Decode an image XObject into RGBA.
-fn decode_image(doc: &Document, stream: &lopdf::Stream) -> Option<ImageRgba> {
+///
+/// The supported encodings cover what actually shows up in text documents:
+/// DCTDecode (JPEG, passed through), FlateDecode and LZWDecode (optionally with
+/// a PNG or TIFF predictor), CCITTFaxDecode (G3 1D/2D and G4) and JBIG2. A
+/// stencil mask (`/ImageMask true`) is painted with the current fill colour
+/// instead of black.
+fn decode_image(doc: &Document, stream: &lopdf::Stream, fill: [f32; 4]) -> Option<ImageRgba> {
     let width = stream.dict.get(b"Width").ok().and_then(number)? as u32;
     let height = stream.dict.get(b"Height").ok().and_then(number)? as u32;
     if width == 0 || height == 0 || width > 8000 || height > 8000 {
         return None;
     }
-
-    let filters: Vec<Vec<u8>> = match stream.dict.get(b"Filter") {
-        Ok(Object::Name(n)) => vec![n.clone()],
-        Ok(Object::Array(arr)) => arr
-            .iter()
-            .filter_map(|o| o.as_name().ok().map(|n| n.to_vec()))
-            .collect(),
-        _ => Vec::new(),
+    let filters = filter_names(stream);
+    let image_mask = stream
+        .dict
+        .get(b"ImageMask")
+        .ok()
+        .and_then(|o| o.as_bool().ok())
+        .unwrap_or(false);
+    let paint = Paint {
+        mask: image_mask,
+        fill,
+        inverted: decode_inverted(stream),
     };
 
-    let is_dct = filters.iter().any(|f| f == b"DCTDecode" || f == b"DCT");
-    if is_dct {
+    // JPEG: hand the original bytes to the decoder, no re-encoding anywhere.
+    if filters.iter().any(|f| f == b"DCTDecode" || f == b"DCT") {
         let image = image::load_from_memory(&stream.content).ok()?;
         let rgba = image.to_rgba8();
         return Some(ImageRgba {
@@ -806,65 +1396,543 @@ fn decode_image(doc: &Document, stream: &lopdf::Stream) -> Option<ImageRgba> {
         });
     }
 
-    let Ok(plain) = stream.decompressed_content() else {
-        return None;
+    // Bilevel codecs hand back a 1-bit raster, not samples: they get their own
+    // path so a 4000-px-wide scan is not mistaken for a 4000-byte row.
+    if let Some(index) = filters
+        .iter()
+        .position(|f| f == b"CCITTFaxDecode" || f == b"CCF")
+    {
+        let payload = payload_before(doc, stream, &filters, index)?;
+        let (gray, cols, rows) = ccitt_gray(doc, stream, index, &payload, height)?;
+        return Some(bilevel_rgba(&gray, cols, rows, paint));
+    }
+    if let Some(index) = filters
+        .iter()
+        .position(|f| f == b"JBIG2Decode" || f == b"JBIG2")
+    {
+        let payload = payload_before(doc, stream, &filters, index)?;
+        let (gray, cols, rows) = jbig2_gray(doc, stream, index, &payload)?;
+        return Some(bilevel_rgba(&gray, cols, rows, paint));
+    }
+
+    // Byte-oriented chain: every stage yields the input of the next one.
+    let mut data = stream.content.clone();
+    for (index, filter) in filters.iter().enumerate() {
+        match filter.as_slice() {
+            b"FlateDecode" | b"Fl" => data = inflate(&data)?,
+            b"LZWDecode" | b"LZW" => {
+                let early = parms(doc, stream, index)
+                    .and_then(|p| p.get(b"EarlyChange").ok())
+                    .and_then(|o| o.as_bool().ok())
+                    .unwrap_or(true);
+                data = lzw_decode(&data, early)?;
+            }
+            _ => return None,
+        }
+        if let Some(params) = parms(doc, stream, index) {
+            let predictor = params
+                .get(b"Predictor")
+                .ok()
+                .and_then(|o| o.as_i64().ok())
+                .unwrap_or(1);
+            if predictor > 1 {
+                let colors = params
+                    .get(b"Colors")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let bpc = params
+                    .get(b"BitsPerComponent")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(8)
+                    .clamp(1, 16) as usize;
+                let columns = params
+                    .get(b"Columns")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                data = undo_predictor(&data, predictor, colors, bpc, columns)?;
+            }
+        }
+    }
+
+    samples_to_rgba(stream, &data, width, height, paint)
+}
+
+/// How a decoded raster should become pixels.
+#[derive(Clone, Copy)]
+struct Paint {
+    /// `/ImageMask true`: painted pixels take `fill`, the rest stay transparent.
+    mask: bool,
+    /// Current non-stroking colour, used by stencil masks.
+    fill: [f32; 4],
+    /// `/Decode` lists the high value first, i.e. black and white are swapped.
+    inverted: bool,
+}
+
+/// Bytes of an auxiliary stream (ToUnicode CMap, JBIG2 globals).
+///
+/// `decompressed_content` refuses a stream without `/Filter`, so an
+/// uncompressed CMap — common in hand-written and older producers — has to be
+/// taken verbatim.
+fn decoded_stream_content(stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    if stream.dict.get(b"Filter").is_ok() {
+        stream.decompressed_content().ok()
+    } else {
+        Some(stream.content.clone())
+    }
+}
+
+/// Filter names in decoding order (a single `/Filter /Name` is a one-element
+/// chain).
+fn filter_names(stream: &lopdf::Stream) -> Vec<Vec<u8>> {
+    match stream.dict.get(b"Filter") {
+        Ok(Object::Name(name)) => vec![name.clone()],
+        Ok(Object::Array(items)) => items
+            .iter()
+            .filter_map(|o| o.as_name().ok().map(|n| n.to_vec()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `/DecodeParms` entry that belongs to `filters[index]`.
+fn parms<'a>(
+    doc: &'a Document,
+    stream: &'a lopdf::Stream,
+    index: usize,
+) -> Option<&'a lopdf::Dictionary> {
+    let value = stream.dict.get(b"DecodeParms").ok()?;
+    match value {
+        // One entry per filter, aligned by position.
+        Object::Array(items) => match items.get(index)? {
+            Object::Dictionary(d) => Some(d),
+            Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            _ => None,
+        },
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    }
+}
+
+/// Bytes a bilevel codec sees: the output of every filter before it.
+///
+/// A CCITT or JBIG2 stage is occasionally wrapped in Flate; feeding the raw
+/// stream content would decode noise.
+fn payload_before(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    filters: &[Vec<u8>],
+    index: usize,
+) -> Option<Vec<u8>> {
+    let mut data = stream.content.clone();
+    for (position, filter) in filters.iter().enumerate().take(index) {
+        data = match filter.as_slice() {
+            b"FlateDecode" | b"Fl" => inflate(&data)?,
+            b"LZWDecode" | b"LZW" => {
+                let early = parms(doc, stream, position)
+                    .and_then(|p| p.get(b"EarlyChange").ok())
+                    .and_then(|o| o.as_bool().ok())
+                    .unwrap_or(true);
+                lzw_decode(&data, early)?
+            }
+            _ => return None,
+        };
+    }
+    Some(data)
+}
+
+/// `/Decode` starts at the high value, i.e. black and white are swapped.
+fn decode_inverted(stream: &lopdf::Stream) -> bool {
+    let Ok(Object::Array(values)) = stream.dict.get(b"Decode") else {
+        return false;
+    };
+    let first = values.first().and_then(number);
+    let second = values.get(1).and_then(number);
+    matches!((first, second), (Some(a), Some(b)) if a > b)
+}
+
+/// Decode a CCITT G3/G4 stream into a 1-byte-per-pixel raster.
+fn ccitt_gray(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    index: usize,
+    payload: &[u8],
+    image_height: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
+
+    let params = parms(doc, stream, index);
+    let get_int = |key: &[u8], default: i64| -> i64 {
+        params
+            .and_then(|p| p.get(key).ok())
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(default)
+    };
+    let get_bool = |key: &[u8], default: bool| -> bool {
+        params
+            .and_then(|p| p.get(key).ok())
+            .and_then(|o| o.as_bool().ok())
+            .unwrap_or(default)
     };
 
+    let k = get_int(b"K", 0);
+    let settings = DecodeSettings {
+        // 1728 is the fax default; PDF producers usually write it explicitly.
+        columns: get_int(b"Columns", 1728).clamp(1, 20_000) as u32,
+        // A `/Rows` smaller than the image height is wrong more often than the
+        // image height is, so the larger value wins (same as Chromium).
+        rows: (get_int(b"Rows", 0).max(i64::from(image_height))).clamp(1, 20_000) as u32,
+        end_of_block: get_bool(b"EndOfBlock", true),
+        end_of_line: get_bool(b"EndOfLine", false),
+        rows_are_byte_aligned: get_bool(b"EncodedByteAlign", false),
+        encoding: if k < 0 {
+            EncodingMode::Group4
+        } else if k == 0 {
+            EncodingMode::Group3_1D
+        } else {
+            EncodingMode::Group3_2D { k: k as u32 }
+        },
+        // Deliberately *not* driven by `/BlackIs1`: that flag describes how the
+        // producer packed the samples, while the fax runs already carry the
+        // visual colour. This adapter emits a luminance raster (0 = dark), so
+        // fax-black is dark whichever way the samples were packed.
+        invert_black: false,
+    };
+
+    struct Gray {
+        out: Vec<u8>,
+        index: usize,
+        rows: u32,
+    }
+    impl Decoder for Gray {
+        fn push_pixels(&mut self, white: bool, count: u32) {
+            let end = (self.index + count as usize).min(self.out.len());
+            if !white {
+                self.out[self.index..end].fill(0);
+            }
+            self.index = end;
+        }
+        fn next_line(&mut self) {
+            self.rows += 1;
+        }
+    }
+
+    let total = settings.columns as usize * settings.rows as usize;
+    let mut decoder = Gray {
+        out: vec![0xFF; total],
+        index: 0,
+        rows: 0,
+    };
+    let mut context = DecoderContext::new(settings);
+    let result = hayro_ccitt::decode(payload, &mut decoder, &mut context);
+    // Partial data is still worth showing: a truncated fax is a page, not an
+    // error message, and the rows before the truncation are correct.
+    if result.is_err() && decoder.rows == 0 {
+        return None;
+    }
+    Some((decoder.out, settings.columns, settings.rows))
+}
+
+/// Decode a JBIG2 stream (with optional shared globals) into a raster.
+fn jbig2_gray(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    index: usize,
+    payload: &[u8],
+) -> Option<(Vec<u8>, u32, u32)> {
+    let globals = parms(doc, stream, index)
+        .and_then(|p| p.get(b"JBIG2Globals").ok())
+        .and_then(|o| o.as_reference().ok())
+        .and_then(|id| doc.get_object(id).ok())
+        .and_then(|o| o.as_stream().ok())
+        .and_then(decoded_stream_content);
+
+    let image = hayro_jbig2::Image::new_embedded(payload, globals.as_deref()).ok()?;
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 || width > 20_000 || height > 20_000 {
+        return None;
+    }
+
+    struct Gray {
+        out: Vec<u8>,
+        index: usize,
+    }
+    impl hayro_jbig2::Decoder for Gray {
+        fn push_pixel(&mut self, black: bool) {
+            if self.index < self.out.len() && black {
+                self.out[self.index] = 0;
+            }
+            self.index += 1;
+        }
+        fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+            let count = chunk_count as usize * 8;
+            let end = (self.index + count).min(self.out.len());
+            if black {
+                self.out[self.index..end].fill(0);
+            }
+            self.index = end;
+        }
+        fn next_line(&mut self) {}
+    }
+
+    let mut decoder = Gray {
+        out: vec![0xFF; width as usize * height as usize],
+        index: 0,
+    };
+    image.decode(&mut decoder).ok()?;
+    Some((decoder.out, width, height))
+}
+
+/// Turn a 1-byte-per-pixel black/white raster into RGBA.
+///
+/// For a stencil mask the "painted" pixels take the current fill colour and the
+/// rest stay transparent, which is how scanned logos and signatures are stored.
+fn bilevel_rgba(gray: &[u8], width: u32, height: u32, paint: Paint) -> ImageRgba {
+    let mut data = Vec::with_capacity(width as usize * height as usize * 4);
+    let ink = [
+        (paint.fill[0] * 255.0).clamp(0.0, 255.0) as u8,
+        (paint.fill[1] * 255.0).clamp(0.0, 255.0) as u8,
+        (paint.fill[2] * 255.0).clamp(0.0, 255.0) as u8,
+    ];
+    for &value in gray.iter().take(width as usize * height as usize) {
+        let mut dark = value < 128;
+        if paint.inverted {
+            dark = !dark;
+        }
+        if paint.mask {
+            if dark {
+                data.extend_from_slice(&[ink[0], ink[1], ink[2], 255]);
+            } else {
+                data.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        } else if dark {
+            data.extend_from_slice(&[0, 0, 0, 255]);
+        } else {
+            data.extend_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    ImageRgba {
+        width,
+        height,
+        data,
+    }
+}
+
+/// Unpack 8-bit and sub-byte samples, then map them through the colour space.
+fn samples_to_rgba(
+    stream: &lopdf::Stream,
+    plain: &[u8],
+    width: u32,
+    height: u32,
+    paint: Paint,
+) -> Option<ImageRgba> {
     let bits = stream
         .dict
         .get(b"BitsPerComponent")
         .ok()
         .and_then(number)
-        .unwrap_or(8.0) as u32;
-    if bits != 8 {
-        return None;
-    }
-
+        .unwrap_or(8.0)
+        .clamp(1.0, 16.0) as u32;
     let components = match stream.dict.get(b"ColorSpace") {
         Ok(Object::Name(name)) => match name.as_slice() {
             b"DeviceGray" | b"G" => 1usize,
-            b"DeviceRGB" | b"RGB" => 3,
             b"DeviceCMYK" | b"CMYK" => 4,
             _ => 3,
         },
         _ => 3,
     };
-
-    let needed = width as usize * height as usize * components;
-    if plain.len() < needed {
+    if paint.mask && bits != 1 {
         return None;
+    }
+    let samples = unpack_samples(plain, width, height, components, bits)?;
+    if paint.mask {
+        // A mask has one component and paints where the sample is "on".
+        let gray: Vec<u8> = samples.iter().map(|&s| 255 - s).collect();
+        return Some(bilevel_rgba(&gray, width, height, paint));
     }
 
     let mut data = Vec::with_capacity(width as usize * height as usize * 4);
     match components {
         1 => {
-            for &v in &plain[..needed] {
-                data.extend_from_slice(&[v, v, v, 255]);
+            for &value in &samples {
+                let mut value = value;
+                if paint.inverted {
+                    value = 255 - value;
+                }
+                data.extend_from_slice(&[value, value, value, 255]);
             }
         }
         4 => {
-            for chunk in plain[..needed].chunks_exact(4) {
-                let c = chunk[0] as f32 / 255.0;
-                let m = chunk[1] as f32 / 255.0;
-                let y = chunk[2] as f32 / 255.0;
-                let k = chunk[3] as f32 / 255.0;
-                data.push(((1.0 - (c + k).min(1.0)) * 255.0) as u8);
-                data.push(((1.0 - (m + k).min(1.0)) * 255.0) as u8);
-                data.push(((1.0 - (y + k).min(1.0)) * 255.0) as u8);
+            for chunk in samples.chunks_exact(4) {
+                let mut c = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                if paint.inverted {
+                    // Inverting CMYK means inverting all four inks.
+                    c = [255 - c[0], 255 - c[1], 255 - c[2], 255 - c[3]];
+                }
+                let k = c[3] as f32 / 255.0;
+                for &ink in &c[..3] {
+                    let v = ink as f32 / 255.0;
+                    data.push(((1.0 - (v + k).min(1.0)) * 255.0) as u8);
+                }
                 data.push(255);
             }
         }
         _ => {
-            for chunk in plain[..needed].chunks_exact(3) {
+            for chunk in samples.chunks_exact(3) {
                 data.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
         }
     }
-
-    let _ = doc;
     Some(ImageRgba {
         width,
         height,
         data,
     })
+}
+
+/// Expand samples of `bits` width into one byte per sample (high bit first).
+fn unpack_samples(
+    plain: &[u8],
+    width: u32,
+    height: u32,
+    components: usize,
+    bits: u32,
+) -> Option<Vec<u8>> {
+    let count = width as usize * height as usize * components;
+    if bits == 8 {
+        if plain.len() < count {
+            return None;
+        }
+        return Some(plain[..count].to_vec());
+    }
+    if bits > 8 {
+        // 16-bit samples are extremely rare in page content; scaling them down
+        // by taking the high byte keeps the image recognisable.
+        if plain.len() < count * 2 {
+            return None;
+        }
+        return Some(plain.chunks_exact(2).take(count).map(|c| c[0]).collect());
+    }
+
+    let per_byte = (8 / bits) as usize;
+    let max = ((1u32 << bits) - 1) as f32;
+    let mut out = Vec::with_capacity(count);
+    'outer: for &byte in plain {
+        for slot in 0..per_byte {
+            let shift = 8 - bits * (slot as u32 + 1);
+            let raw = (byte >> shift) & ((1u32 << bits) - 1) as u8;
+            out.push((raw as f32 / max * 255.0).round() as u8);
+            if out.len() == count {
+                break 'outer;
+            }
+        }
+    }
+    (out.len() == count).then_some(out)
+}
+
+/// Undo a PNG (`10..=15`) or TIFF (`2`) predictor, row by row.
+fn undo_predictor(
+    data: &[u8],
+    predictor: i64,
+    colors: usize,
+    bits: usize,
+    columns: usize,
+) -> Option<Vec<u8>> {
+    let bpp = (colors * bits).div_ceil(8);
+    let row_len = (columns * colors * bits).div_ceil(8);
+    if bpp == 0 || row_len == 0 {
+        return None;
+    }
+
+    if predictor == 2 {
+        // TIFF: each sample is stored as the delta to the previous one.
+        if bits != 8 {
+            return None;
+        }
+        let mut out = data.to_vec();
+        for row in out.chunks_mut(row_len) {
+            for index in bpp..row.len() {
+                row[index] = row[index].wrapping_add(row[index - bpp]);
+            }
+        }
+        return Some(out);
+    }
+
+    // PNG predictors carry a filter-type byte in front of every row.
+    let stride = row_len + 1;
+    let rows = data.len() / stride;
+    let mut out = Vec::with_capacity(rows * row_len);
+    let mut previous = vec![0u8; row_len];
+    for row_index in 0..rows {
+        let start = row_index * stride;
+        let filter = data[start];
+        let row = &data[start + 1..start + stride];
+        let mut current = vec![0u8; row_len];
+        for index in 0..row_len {
+            let raw = row[index] as i32;
+            let left = if index >= bpp {
+                current[index - bpp] as i32
+            } else {
+                0
+            };
+            let up = previous[index] as i32;
+            let up_left = if index >= bpp {
+                previous[index - bpp] as i32
+            } else {
+                0
+            };
+            let value = match filter {
+                0 => raw,
+                1 => raw + left,
+                2 => raw + up,
+                3 => raw + (left + up) / 2,
+                4 => {
+                    // Paeth
+                    let p = left + up - up_left;
+                    let pa = (p - left).abs();
+                    let pb = (p - up).abs();
+                    let pc = (p - up_left).abs();
+                    if pa <= pb && pa <= pc {
+                        raw + left
+                    } else if pb <= pc {
+                        raw + up
+                    } else {
+                        raw + up_left
+                    }
+                }
+                _ => return None,
+            };
+            current[index] = value as u8;
+        }
+        out.extend_from_slice(&current);
+        previous = current;
+    }
+    Some(out)
+}
+
+/// zlib/inflate decode.
+fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// PDF LZW decode (`/EarlyChange` chooses between the two code-width rules).
+fn lzw_decode(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
+    use weezl::{decode::Decoder, BitOrder};
+    let mut decoder = if early_change {
+        // PDF's default is the TIFF variant, which widens one symbol sooner.
+        Decoder::with_tiff_size_switch(BitOrder::Msb, 8)
+    } else {
+        Decoder::new(BitOrder::Msb, 8)
+    };
+    decoder.decode(data).ok()
 }

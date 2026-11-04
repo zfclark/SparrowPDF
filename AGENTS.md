@@ -1,7 +1,7 @@
 # 轻雀 PDF（SparrowPDF）协作与交付规范
 
-> 本文件是仓库内**唯一**的工程协作契约，面向人类开发者与 AI 编码代理（Claude Code、Codex、Cursor、Copilot Workspace 等）。
-> 与 `README.md` 冲突时，以本文件为准；与代码现状冲突时，先修文档或代码，不允许两套标准并行。
+> 本文件是仓库内**唯一**的工程协作契约，面向人类开发者与 AI 编码代理（Claude Code、Codex、Cursor、Copilot Workspace 等）。  
+> 与 `README.md` 冲突时，以本文件为准；与代码现状冲突时，先修文档或代码，不允许两套标准并行。  
 > 维护责任：发布负责人。每次流程变更必须同步修改本文件，并随代码一起提交。
 
 ---
@@ -30,36 +30,40 @@
 
 ### 1.1 定位与硬性约束
 
-| 项目 | 说明 |
-| --- | --- |
-| 产品名 | 轻雀 PDF / SparrowPDF |
-| 形态 | 单机桌面应用（Windows / macOS），单文件可执行 |
-| 语言 | Rust，edition 2021，MSRV 1.95（CI 固定 1.97.1） |
-| 界面 | egui / eframe 0.37，Glow 后端，无 WebView |
-| 数据流 | **纯本地**：不联网、不上传、无遥测、无账号体系 |
-| 工具数 | 12 项，分组：生成 2 / 结构操作 6 / 页面编辑 2 / 安全 1 / 转换 1 |
-| 安装形态 | 绿色 exe（Windows）、`.app` 打包为 DMG（macOS） |
+| 项目   | 说明                                           |
+| ---- | -------------------------------------------- |
+| 产品名  | 轻雀 PDF / SparrowPDF                          |
+| 形态   | 单机桌面应用（Windows / macOS），单文件可执行               |
+| 语言   | Rust，edition 2021，MSRV 1.95（CI 固定 1.97.1）    |
+| 界面   | egui / eframe 0.37，Glow 后端，无 WebView         |
+| 数据流  | **纯本地**：不联网、不上传、无遥测、无账号体系                    |
+| 工具数  | 12 项，分组：生成 2 / 结构操作 6 / 页面编辑 2 / 安全 1 / 转换 1 |
+| 安装形态 | 绿色 exe（Windows）、`.app` 打包为 DMG（macOS）        |
 
 破坏性约束（任何改动都不得违反）：
 
 1. 不引入网络请求、埋点、崩溃上报、自动更新检查。
-2. 不引入需要 C/C++ 系统库编译的新依赖（当前仅 `libz-sys` 通过 `cc` 编译，属既有例外）。
-3. 不改动 `LICENSE`（MIT，版权人 霖海）。
-4. 不提交二进制产物、构建缓存、本地调试素材。
+2. 不改动 `LICENSE`（MIT，版权人 霖海）。
+3. 不提交二进制产物、构建缓存、本地调试素材。
+4. 新增依赖仍须过第 5.8 节的论证（体积、许可证、维护状态），并在 1.2 节登记。
 
 ### 1.2 技术栈
 
-| 依赖 | 用途 |
-| --- | --- |
-| `eframe` / `egui` 0.37 | 窗口与 immediate-mode UI |
-| `egui_dnd` 0.18 | 页面/文件拖拽排序 |
-| `rfd` 0.17 | 系统文件/文件夹选择对话框 |
-| `lopdf` 0.39 | PDF 对象模型、读写、加密 |
-| `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入 |
-| `kamadak-exif` 0.6 | JPEG 的 EXIF 方向读取 |
-| `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
-| `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
-| `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |
+| 依赖                                    | 用途                             |
+| ------------------------------------- | ------------------------------ |
+| `eframe` / `egui` 0.37                | 窗口与 immediate-mode UI          |
+| `egui_dnd` 0.18                       | 页面/文件拖拽排序                      |
+| `rfd` 0.17                            | 系统文件/文件夹选择对话框                  |
+| `lopdf` 0.39                          | PDF 对象模型、读写、加密                 |
+| `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入                  |
+| `kamadak-exif` 0.6                    | JPEG 的 EXIF 方向读取               |
+| `image` 0.25（jpeg, png）               | 图片解码、PNG 编码                    |
+| `allsorts` 0.16（flate2_rust）          | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
+| `weezl` 0.2                            | LZW 解码（图像 `/LZWDecode`）           |
+| `hayro-ccitt` 0.4                      | CCITT G3/G4 传真解码（`/CCITTFaxDecode`） |
+| `hayro-jbig2` 0.3（std）                | JBIG2 解码（`/JBIG2Decode`），含共享全局段 |
+| `flate2` 1（rust_backend）              | zlib 解压（图像 `/FlateDecode` 与预测器流水线） |
+| `winresource` 0.1（build-dep）          | 向 Windows exe 注入图标与清单          |
 
 ---
 
@@ -90,9 +94,10 @@ main.rs ── 启动窗口、内嵌图标、运行 eframe
 app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、worker 轮询、结果渲染
    │
    ├── ui/        纯表现层（不得出现 PDF / 图片库类型）
-   │    ├── theme.rs     设计令牌 + 组件（卡片、按钮、输入框、状态色、结果区）
-   │    ├── sidebar.rs   工具导航 + 外观切换
+   │    ├── theme.rs     设计令牌 + 组件（卡片、按钮、输入框、状态色、结果区、外链打开）
+   │    ├── sidebar.rs   工具导航 + 外观切换 + 关于入口
    │    ├── status.rs    底部操作条（主按钮、进度、结果区）
+   │    ├── about.rs     关于弹窗（版本、作者、项目地址）
    │    ├── preview.rs   缩略图预览（图片与 PDF 页面，逐帧限流渲染）
    │    ├── prefs.rs     外观偏好持久化（%LOCALAPPDATA%\sparrowpdf\ui.pref）
    │    └── panels/      每个工具一个面板文件，与 tools/ 一一对应
@@ -111,12 +116,13 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    │    ├── ttf.rs      TrueType/OpenType 解析（支持 .ttc 集合）
    │    └── logging.rs  追加式文件日志（%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log）
    │
-   └── model.rs   领域模型（无 IO、无第三方 PDF 类型）：ToolId / ToolGroup / ToolError / TaskState
+   ├── model.rs   领域模型（无 IO、无第三方 PDF 类型）：ToolId / ToolGroup / ToolError / TaskState
+   └── version.rs 版本号唯一来源：Cargo 三段 + 日期位，拼出 V主.副.修订.YYYYMMDD
 ```
 
 **依赖方向（硬约束）**
 
-- `ui/` → `model`、`tools`（仅选项类型与 trait 签名）、`engine::logging`
+- `ui/` → `model`、`tools`（选项类型、trait 签名，以及预览所需的纯函数：`collect_images`、`preview_page_numbers`、`ordered_pages`）、`engine::logging`
 - `tools/` → `engine`、`model`、`lopdf` / `medpdf` / `image`
 - `engine/` → `model`（错误类型）与各自领域库
 - `model.rs` → 仅标准库
@@ -124,15 +130,15 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 
 ### 2.3 关键文件职责
 
-| 文件 | 职责 | 修改风险 |
-| --- | --- | --- |
-| `src/model.rs` | 工具注册表与错误模型；新增工具必须在此登记 | 高：影响全部面板与测试 |
-| `src/tools/mod.rs` | `Tool` 契约、选项枚举、进度/取消通道、工厂函数 | 高 |
-| `src/engine/pdf_io.rs` | 唯一的落盘入口（原子写）、密码打开、可写性探测 | 高：写坏即数据丢失 |
-| `src/engine/worker.rs` | 线程生命周期、panic 捕获、取消传播 | 中 |
-| `src/app.rs` | 输出路径解析与回退、任务编排、结果状态机 | 中高 |
-| `src/ui/theme.rs` | 全部视觉令牌与通用控件 | 中：改动影响所有面板 |
-| `build.rs` | Windows 清单与图标；提权策略 | 中：可令程序无法启动 |
+| 文件                     | 职责                          | 修改风险        |
+| ---------------------- | --------------------------- | ----------- |
+| `src/model.rs`         | 工具注册表与错误模型；新增工具必须在此登记       | 高：影响全部面板与测试 |
+| `src/tools/mod.rs`     | `Tool` 契约、选项枚举、进度/取消通道、工厂函数 | 高           |
+| `src/engine/pdf_io.rs` | 唯一的落盘入口（原子写）、密码打开、可写性探测     | 高：写坏即数据丢失   |
+| `src/engine/worker.rs` | 线程生命周期、panic 捕获、取消传播        | 中           |
+| `src/app.rs`           | 输出路径解析与回退、任务编排、结果状态机        | 中高          |
+| `src/ui/theme.rs`      | 全部视觉令牌与通用控件                 | 中：改动影响所有面板  |
+| `build.rs`             | Windows 清单与图标；提权策略          | 中：可令程序无法启动  |
 
 ---
 
@@ -140,20 +146,20 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 
 ### 3.1 工具清单
 
-| 分组 | 工具 | 输入 | 产物 |
-| --- | --- | --- | --- |
-| 生成 | 图片合并为 PDF | 多张 JPG/PNG | 单个 PDF |
-| 生成 | 批量转换 | 多个文件夹 | 每个文件夹一个 PDF |
-| 结构操作 | PDF 合并 | ≥2 个 PDF | 单个 PDF |
-| 结构操作 | PDF 拆分 | 1 个 PDF | 按页码范围 / 每 N 页 / 逐页输出 |
-| 结构操作 | 页面旋转 | 1 个 PDF | 旋转后的 PDF |
-| 结构操作 | 删除页面 | 1 个 PDF | 删页后的 PDF |
-| 结构操作 | 页面重排 | 1 个 PDF | 重排后的 PDF |
-| 结构操作 | 提取页面 | 1 个 PDF | 抽取页组成的新 PDF |
-| 页面编辑 | 文本水印 | 1 个 PDF | 叠加文字水印的 PDF |
-| 页面编辑 | 图片水印 | 1 个 PDF + 1 图 | 叠加图片水印的 PDF |
-| 安全 | 加密 / 解密 | 1 个 PDF | AES-256 加密或移除密码 |
-| 转换 | PDF 转图片 | 1 个 PDF | 每页 PNG/JPEG |
+| 分组   | 工具        | 输入            | 产物                   |
+| ---- | --------- | ------------- | -------------------- |
+| 生成   | 图片合并为 PDF | 多张 JPG/PNG    | 单个 PDF               |
+| 生成   | 批量转换      | 多个文件夹         | 每个文件夹一个 PDF          |
+| 结构操作 | PDF 合并    | ≥2 个 PDF      | 单个 PDF               |
+| 结构操作 | PDF 拆分    | 1 个 PDF       | 按页码范围 / 每 N 页 / 逐页输出 |
+| 结构操作 | 页面旋转      | 1 个 PDF       | 旋转后的 PDF             |
+| 结构操作 | 删除页面      | 1 个 PDF       | 删页后的 PDF             |
+| 结构操作 | 页面重排      | 1 个 PDF       | 重排后的 PDF             |
+| 结构操作 | 提取页面      | 1 个 PDF       | 抽取页组成的新 PDF          |
+| 页面编辑 | 文本水印      | 1 个 PDF       | 叠加文字水印的 PDF          |
+| 页面编辑 | 图片水印      | 1 个 PDF + 1 图 | 叠加图片水印的 PDF          |
+| 安全   | 加密 / 解密   | 1 个 PDF       | AES-256 加密或移除密码      |
+| 转换   | PDF 转图片   | 1 个 PDF       | 每页 PNG/JPEG          |
 
 ### 3.2 统一契约
 
@@ -168,17 +174,19 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-- `ToolRequest`：`inputs: Vec<InputFile>`、`output: PathBuf`、`options: ToolOptions`、`password: Option<String>`。
+- `ToolRequest`：`inputs: Vec<InputFile>`、`output: PathBuf`、`options: ToolOptions`、`password: Option<String>`、`conflict: ConflictPolicy`。
 - `ToolOptions`：每工具一个变体，保证 `execute` 签名统一且类型安全。
 - `Progress::report(fraction, msg)`：把进度送回 UI（内部限幅 0~1）。
 - `CancelFlag = Arc<AtomicBool>`：**循环体内**必须调用 `check_cancel(cancel)?`。
-- 成功返回 `ToolOutcome { summary, outputs }`；部分失败返回 `ToolError::PartialSuccess`。
+- 成功返回 `ToolOutcome { summary, outputs }`。
+- 部分失败返回 `ToolError::PartialSuccess { succeeded, failed, detail, outputs }`，**必须**携带已产出的文件：应用壳把它映射成「已完成 + 注意」的结果卡，用户仍能打开产物；缺 `outputs` 会把可用的结果显示成一次彻底失败。
+- **同名文件**：工具必须先生成本次要写的全部路径，再经 `pdf_io::resolve_outputs(&paths, req.conflict)` 换取最终路径，之后才可落盘。`ConflictPolicy::Report`（默认）返回 `ToolError::OutputExists { paths }` 且不写任何文件；`Overwrite` 替换；`Unique` 追加 `-2`、`-3`。禁止绕过这套解析直接写 `req.output`，也不得在工具内部弹窗或自行询问。
 
 ### 3.3 落盘与自校验流水线（所有工具必须遵守）
 
 1. 解析参数 → 尽早失败（`validate`）。
 2. 逐项处理，每步 `check_cancel` + `progress.report`。
-3. **统一经 `pdf_io::save_document`（或 `write_file`）落盘**：先写同目录临时文件，再 `rename` 覆盖，避免半成品；权限错误由 `write_error_detail` 映射为中文提示。
+3. **统一经 `pdf_io::save_document`（或 `write_file`）落盘，并把 `req.conflict` 一并传入**：两者在写之前会再复核一次目标是否存在（`ConflictPolicy::Report` 时直接返回 `OutputExists`），先写同目录临时文件再 `rename`，避免半成品；权限错误由 `write_error_detail` 映射为中文提示。规划与落盘之间可能隔几分钟的渲染，这次复核是防静默覆盖的第二道闸。
 4. 落盘后**重新打开产物断言**（`validate::assert_page_count` 等）；断言失败要删除产物并返回 `ValidationFailed`。
 5. 不得在工具内部直接 `fs::write` 或 `File::create` 绕过第 3 步。
 
@@ -196,6 +204,7 @@ pub trait Tool: Send + Sync {
 - **数字感知排序**：文件名中的数字按数值比较（`1, 2, 10` 而非 `1, 10, 2`）；无法提取数字的按系统列举顺序稳定排在后面。
 - **输出命名**：`<文件夹名>.pdf` 写回文件夹自身；指定输出目录时重名加 `-2`、`-3` 后缀。
 - **两图一页**：默认按顺序两两配对；勾选「指定合并序号」后仅在给定序号对之间合并（如 `1-2,5-6`），其余单独成页。
+- **页面方向统一**：两图一页的 A4 方向属于**整份文档**而非单张页面。单图页（奇数尾页、被合并序号排除的图片）与合并页使用同一方向、同一外边距；`PagePolicy` 在写第一页之前确定一次，落盘后用 `validate::assert_page_orientation` 断言全书方向一致，缺一页即判失败。
 - **页码语义**：合并页以**输出 PDF 的实际页序**连续编号（预览标签即最终页码），图片编号另行在悬停中提示。
 - **容错**：单个文件夹失败不中断整批，最终以 `PartialSuccess` 汇报；空文件夹跳过；非图片文件忽略。
 
@@ -214,21 +223,49 @@ pub trait Tool: Send + Sync {
 
 ### 3.8 PDF → 图片 与 页面预览（`engine/render.rs`）
 
-- 纯 Rust 软件光栅器，按 DPI 缩放（默认 300，范围 36–600，附耗时提示）。
+- 内置软件光栅器，按 DPI 缩放（默认 300，范围 36–600，附耗时提示）。
 - `render_page_thumbnails` 按页批量渲染缩略图；UI 侧每帧限量渲染，避免大文档卡顿。
-- 内置光栅器只绘制嵌入字体、矢量图与图片：未嵌入的标准 14 字体文本可能不显示。此限制仅影响应用内预览，真实阅读器打开正常。
+- 填充遵循 PDF 语义：子路径**隐式闭合**（闭合边不得丢失），水平方向按像素累计覆盖率后只合成一次，实心区域才是设定颜色。
+- **文本取字**：字节是编码不是字符。优先按 `/ToUnicode` 反查（CID 字体按两字节码），其次 `/Encoding /Differences`（`uniXXXX`、`uXXXX`、单字符名与常用标点名），最后简单字体按 WinAnsi（含 0x80–0x9F 专用区）解释；复合字体缺映射且无内嵌程序则不画。
+- **字形来源**：优先用文档内嵌的 TrueType 程序（`/FontFile2`，经 `/FontDescriptor` 取得；CID 字体按其 `/CIDToGIDMap` 把 CID 换成 glyph id，缺省为 `/Identity`），这样子集字体的任意编码都能画对。文件未内嵌时按 `/BaseFont` 选系统黑体 / 宋体 / 等宽替换，单字缺字形时逐字回退。不得为取字去执行文档内的字体程序（只解析轮廓），也不得把内嵌程序当系统字体加载到全局缓存。
+- **表单资源**：Form XObject 若自带 `/Resources`，其内容必须用该字典解析（`resources_from`）。沿用页面资源会让表单内的文字与图片用错字体表，表现为整段文字消失。
+- **矩阵合成**：`raster::Matrix::mul` 必须与 `apply` 同一约定（列向量，`x' = a·x + c·y + e`）。两者不一致会让所有 `cm` / `/Rotate` / Form `/Matrix` 叠加后的几何整体错位（曾表现为整页空白），新增变换代码后请跑 `matrix_mul_*` 单元测试。
+- **图像解码**：支持 DCTDecode、FlateDecode、LZWDecode（`/EarlyChange` 两种码宽规则）、CCITTFaxDecode（K<0 为 G4，K=0 为 G3 一维，K>0 为 G3 二维）与 JBIG2（含 `/JBIG2Globals`）；支持 `/Predictor` 2（TIFF）与 10–15（PNG），1/2/4/8/16 位采样，`/ImageMask` 按当前填充色绘制。
+  - 无 `/Filter` 的流是原样采样，不能用 `decompressed_content`（lopdf 会因缺少 `/Filter` 报错），要先判断再取 `content`。
+  - CCITT 的 `/BlackIs1` 描述采样打包方式，不影响画面；适配器一律输出「0 = 深色」的亮度栅格。
+  - 解码失败只跳过该图像，不得按原样当像素画（会得到噪点），也不得 panic：`render_page` 的返回类型是 `Result`，一条坏图不该让整页失败。
+- **重排预览**（`preview::show_page_order`）：按 `tools::reorder::ordered_pages` 的同一映射渲染输出页序，标签为输出页码；源页缩略图按页号缓存，拖动只重排不重渲染。预览与产物的页码序列由这条共享映射保证一致。
 
 ### 3.9 应用壳（`src/app.rs`）
 
+- **面板顺序即布局契约**：先 `Panel::left`（侧边栏），再 `Panel::bottom`（结果卡 + 操作条），最后 `CentralPanel`。先建底部面板时结果卡会横跨整个窗口并吃掉侧边栏高度，完成一次任务就把「加密与解密 / PDF 转图片」挤出可视区。
+- **同一时刻只允许一个任务**：`start()` 在 `self.worker.is_some()` 时直接返回；切换工具后仍在跑的任务由底部条显示「X 处理中」并提供取消，切回该工具时状态与结果仍在。
+- **卡片等宽**：`theme::card` / `tinted_card` 用 `set_min_width(ui.available_width())` 撑满内容列；按内容自适应会得到参差不齐的卡片堆。
+- **同名文件对话框**（`ui/conflict.rs`）：工具返回 `OutputExists` 后由 `poll_worker` 转成模态提问，选择「覆盖」或「另存为新文件」，可勾选「本次后续均执行此操作」写入会话策略；取消即什么都不做。回答后 `answer_conflict` 用一次性策略重跑，工具此前未写盘，无需清理半成品。
+- **会话策略可见可撤**：勾选后底部操作条显示「同名文件：覆盖 / 另存为新文件」并提供「重置」，点击即恢复「每次都询问」。策略只存在于内存，重启应用即清空，不得写进偏好文件。
+- **关于弹窗**（`ui/about.rs`）：入口固定在侧边栏底部，带当前版本号；以 `egui::Modal` 居中覆盖全窗。选模态而非第 13 个工具页，是因为「关于」属于外壳而非 PDF 操作，且模态在 760×520 最小窗口下仍可用（正文超长时只滚动正文，关闭按钮始终可见）。外部链接只经 `theme::open_url` 交给系统默认浏览器，打开失败时保留地址并提供「复制链接」，不得静默失败。
+
+|   |   |   |
+| - | - | - |
+
+|   |   |   |
+| - | - | - |
+
 - **状态机**：`Idle → Ready → Running{fraction,message} → Done{summary,outputs,note} | Failed | Cancelled`，按工具独立保存。
-- **输出路径解析**：用户指定优先；否则与源文件同目录；目录不可写时按
-  `Documents\SparrowPDF → Documents → OneDrive\Documents\SparrowPDF → OneDrive\Documents → Desktop → Downloads → 用户目录 → TEMP`
+- **输出路径解析**：用户指定优先；否则与源文件同目录；目录不可写时按  
+  `Documents\SparrowPDF → Documents → OneDrive\Documents\SparrowPDF → OneDrive\Documents → Desktop → Downloads → 用户目录 → TEMP`  
   回退，并在结果区标注「已改存到…」；决策结果缓存，避免每帧探测。
 - **执行前预检**：`preflight_output` 向上寻找最近已存在祖先判断可写性，权限不足立即给出中文提示。
 - **拖放**：按当前工具接受的文件类型过滤。
 
+
 ### 3.10 平台集成
 
+|   |   |   |
+| - | - | - |
+
+|  |  |  |
+| --- | --- | --- |
 - **日志**：`engine::logging::log("INFO"|"WARN"|"ERROR", msg)`，追加写入 `%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log`；`SPARROW_LOG_DIR` 可覆盖（测试与便携使用）。
 - **Windows 清单**（`build.rs`）：`requireAdministrator` + `longPathAware` + `dpiAware`；仅注入主程序（`winresource::compile_for("sparrowpdf")`），否则测试可执行文件也会被要求提权。
 - **免提权变体**：`SPARROW_AS_INVOKER=1 cargo build --release`，适合按用户安装、需要拖放正常的场景。
@@ -253,17 +290,18 @@ cargo test --release --lib --test integration
 - `panic = "unwind"` 是**功能依赖**：worker 依赖 `catch_unwind` 把 panic 转成可见错误，不得改回 `abort`。
 - `strip = true` + `lto = true` + `opt-level = "z"` 共同压体积；CI 有 20 MB（UPX 前）硬门禁与 12 MB 软目标。
 
+
 ### 4.3 测试策略
 
 | 层级 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 集成测试 | `tests/integration.rs`（19 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号 |
+| 集成测试 | `tests/integration.rs`（44 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字 |
 | 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
 
 规则：
 
 - 新增或修改工具行为 → **必须**补一条集成测试，断言产物结构（页数、MediaBox、矩阵、XObject 等），不只断言「执行成功」。
-- 测试的临时目录走 `CARGO_TARGET_TMPDIR`（工作区内），不写系统 temp，避免受限环境失败。
+- 测试的临时目录走 `CARGO_TARGET_TMPDIR`（工作区内），不写系统 temp，避免受限环境失败。注意它只存在于**编译期**环境，必须用 `option_env!` 读取，运行时 `std::env::var` 永远取不到（会静默退回系统 temp）。
 - 测试夹具由测试自行生成（`make_pdf` / `make_image`），不依赖仓库内二进制。
 
 ### 4.4 提交前质量门（必须全绿）
@@ -285,7 +323,7 @@ cargo test --release --lib --test integration
 5. **注释**：解释「为什么」，不解释「是什么」；模块顶部写职责与不变量。
 6. **命名**：类型 `UpperCamelCase`，函数/变量 `snake_case`，常量 `SCREAMING_SNAKE_CASE`；缩写按词处理（`PdfToImage`、`pdf_io`）。
 7. **性能**：大文档路径必须可取消、可报告进度；UI 线程内不做解码/光栅化（走 worker 或逐帧预算）。
-8. **依赖**：新增 crate 需论证（体积、许可证、是否纯 Rust），并同步更新本文件 1.2 节。
+8. **依赖**：新增 crate 需论证（体积、许可证、维护状态、是否为渲染引入外部进程或系统库），并同步更新本文件 1.2 节。
 
 ---
 
@@ -378,14 +416,14 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 | 功能 | `feat/<scope>-<简述>` | `main` | `main`（squash） | ≤ 3 天 |
 | 缺陷 | `fix/<scope>-<简述>` | `main` | `main`（squash） | ≤ 1 天 |
 | 维护 | `ci/<简述>`、`docs/<简述>`、`build/<简述>` | `main` | `main`（squash） | ≤ 1 天 |
-| 发布 | `release/<x.y.z>` | `main` | `main` + `vX.Y.Z` tag | 发布窗口内 |
-| 紧急修复 | `hotfix/<x.y.z>` | 线上 tag | `main` + 新 tag | ≤ 1 天 |
+| 发布 | `release/<主.副.修订>` | `main` | `main` + `V主.副.修订.YYYYMMDD` tag | 发布窗口内 |
+| 紧急修复 | `hotfix/<主.副.修订>` | 线上 tag | `main` + 新 tag | ≤ 1 天 |
 
 规则：
 
 1. `main` 受保护：禁止直接推送，必须经评审合并；历史保持线性（squash 或 rebase-and-merge，不产生无意义 merge commit）。
 2. 分支名全小写、用连字符分隔，不含中文与空格。
-3. 发布以 **tag 为准**：`vX.Y.Z` 打在 `main` 上，tag 一旦推送不得移动或复用。
+3. 发布以 **tag 为准**：`V主.副.修订.YYYYMMDD`（如 `V0.4.2.20261104`）打在 `main` 上，tag 一旦推送不得移动或复用。
 4. 禁止对 `main` 强制推送；`hotfix` 必须同时回合 `main`，避免双线分叉。
 5. 远程同步用 `git pull --rebase`，本地分支可随意整理，已共享的分支不改写。
 
@@ -436,7 +474,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 **5）发布**
 
 - 输入：`main` 上通过评审的提交。
-- 动作：确认版本号（`Cargo.toml` + `Cargo.lock`）→ 更新 `CHANGELOG.md` → 打 annotated tag `vX.Y.Z` → 推送分支与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、版本号正确、图标正确）。
+- 动作：确认版本号（`Cargo.toml` + `Cargo.lock` 的前三段、`src/version.rs` 的日期位，三处与 tag 对齐）→ 更新 `CHANGELOG.md` → 打 annotated tag `V主.副.修订.YYYYMMDD` → 推送分支与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）。
 - 交付物：tag、Release 页面（含变更摘要与产物校验信息）、更新后的 CHANGELOG。
 - 准出：双平台产物可下载且可运行；`guard` 校验（tag 格式、版本一致、打包资源齐全）通过。
 - 回滚预案：产物异常时删除 Release 并标记 tag 作废，修复后升 patch 版本重新发布；不得移动既有 tag。
@@ -458,7 +496,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 ### 8.1 文件与来源
 
 - 位置：仓库根目录 `CHANGELOG.md`，格式遵循 **Keep a Changelog 1.1.0**。
-- 版本号遵循 **Semantic Versioning 2.0.0**。
+- 版本号遵循本文件 8.3 节的五位规则（`V主.副.修订.YYYYMMDD`），不采用 SemVer 作为对外版本号。
 - 唯一事实来源是**已合并到 `main` 的提交与 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
 - 顺序：新版本在上；未发布内容置于 `[Unreleased]`。
 
@@ -477,23 +515,28 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 
 ### 8.3 版本号规则
 
-| 变更性质 | 当前 0.x 阶段 | 1.0.0 之后 |
-| --- | --- | --- |
-| 破坏性变更（`type!` 或 `BREAKING CHANGE`） | minor +1（`0.4.2 → 0.5.0`） | major +1 |
-| 新增功能（`feat`） | minor +1 | minor +1 |
-| 修复/性能/杂务（`fix`/`perf`/`chore`） | patch +1 | patch +1 |
-| 纯文档、测试、CI | 不发版 | 不发版 |
+对外版本号为五位：`V主版本.副版本.修订版本.日期`，示例 `V0.4.2.20261104`。
 
-补充规则：
+| 位 | 含义 | 调整时机 | 决定人 |
+| --- | --- | --- | --- |
+| 1 | 版本前缀 `V`（version 缩写） | 固定，不变 | — |
+| 2 | 主版本号 | 功能模块有较大变动（新增模块、整体架构变化） | 项目经理 |
+| 3 | 副版本号 | 功能有一定增加或变化（如权限控制、自定义视图） | 项目经理 |
+| 4 | 修订版本号 | Bug 修复与小改动；可高频发布，修掉一个严重 bug 即可发 | 项目经理 |
+| 5 | 日期版本号 | 改动当天的日期 `YYYYMMDD`，每天改动都要更新 | 开发人员 |
 
-- 版本号必须三处一致：`Cargo.toml`、`Cargo.lock`、git tag。
-- 0.x 阶段视为「对外接口未稳定」，破坏性变更允许在 minor 中发生，但必须在该版本条目首行用「**不兼容**：」标明。
+落地方式（三处必须与 tag 对齐，缺一即视为版本漂移）：
+
+- `Cargo.toml` / `Cargo.lock`：只保存前三段且**不带 `V`、不带日期**（Cargo 强制 SemVer 三段，例 `0.4.2`）。
+- `src/version.rs`：日期位 `DATE`（8 位）；展示版本由 `version::display()` 拼成 `V0.4.2.20261104`，界面与文档不得自行拼字符串。
+- git tag：全串 `V主.副.修订.YYYYMMDD`。发布流水线的 guard 校验格式、前三段与 Cargo 一致、日期位与 `version.rs` 一致，任一不符直接失败。
 - 一次发布只对应一个 tag；tag 使用 annotated tag，内容为该版本 CHANGELOG 摘要。
+- 破坏性变更在该版本条目首行用「**不兼容**：」标明。
 
 ### 8.4 条目格式
 
 ```
-## [x.y.z] - YYYY-MM-DD
+## [V主.副.修订.YYYYMMDD] - YYYY-MM-DD
 
 ### 分类
 
@@ -521,7 +564,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 ### Added
 - **批量转换**：支持指定合并序号（如 `1-2,5-6`），未列出的图片单独成页
 
-## [0.4.2] - 2026-11-02
+## [V0.4.2.20261102] - 2026-11-02
 
 ### Added
 - **外观**：侧边栏新增「浅色 / 深色」切换，选择持久化并在下次启动沿用
@@ -529,7 +572,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 ### Fixed
 - **界面**：侧边栏底部的隐私说明与外观入口不再被滚动区挤出可视范围
 
-## [0.4.1] - 2026-11-01
+## [V0.4.1.20261101] - 2026-11-01
 
 ### Changed
 - **保存**：源目录不可写时自动改存「文档\SparrowPDF」，结果区标注实际位置并提供「打开所在文件夹」
@@ -538,7 +581,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 ### Fixed
 - **输出**：写入失败不再静默，错误提示与日志均有明确记录
 
-## [0.4.0] - 2026-11-01
+## [V0.4.0.20261101] - 2026-11-01
 
 ### Added
 - **页面预览**：旋转、删除、提取、拆分面板支持缩略图预览，可收起展开
@@ -555,18 +598,18 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 - **文本水印**：中文不再输出问号，改用系统 TrueType 字形渲染为透明位图叠加
 - **字体解析**：修复 `.ttc` 集合字体表偏移错误导致字形全部丢失
 
-[Unreleased]: https://github.com/zfclark/SparrowPDF/compare/v0.4.2...HEAD
-[0.4.2]: https://github.com/zfclark/SparrowPDF/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/zfclark/SparrowPDF/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/zfclark/SparrowPDF/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/zfclark/SparrowPDF/compare/V0.4.2.20261102...HEAD
+[V0.4.2.20261102]: https://github.com/zfclark/SparrowPDF/compare/V0.4.1.20261101...V0.4.2.20261102
+[V0.4.1.20261101]: https://github.com/zfclark/SparrowPDF/compare/V0.4.0.20261101...V0.4.1.20261101
+[V0.4.0.20261101]: https://github.com/zfclark/SparrowPDF/compare/V0.3.0.20261031...V0.4.0.20261101
 ```
 
 ### 8.6 维护流程
 
 1. 开发阶段：如有必要，先在 `[Unreleased]` 下累积条目（可选，避免冲突）。
 2. 发布前：发布负责人从合并记录中提炼条目，归类并核对措辞，确认无内部术语泄漏。
-3. 发版时：把 `[Unreleased]` 内容归档为 `## [x.y.z] - 日期`，替换比较链接，提交信息用 `chore(release): 版本号 A -> B`。
-4. tag 消息取该版本条目作为摘要，使 `git show vX.Y.Z` 与 CHANGELOG 一致。
+3. 发版时：把 `[Unreleased]` 内容归档为 `## [V主.副.修订.YYYYMMDD] - 日期`，同步 `src/version.rs` 的日期位，替换比较链接，提交信息用 `chore(release): 版本号 A -> B`。
+4. tag 消息取该版本条目作为摘要，使 `git show V主.副.修订.YYYYMMDD` 与 CHANGELOG 一致。
 5. 已发布条目**只增不改**；如需更正，追加新版本条目说明。
 
 ---
@@ -584,11 +627,13 @@ cargo test --release --lib --test integration
 cargo build --release --locked
 SPARROW_AS_INVOKER=1 cargo build --release      # Windows 免提权变体
 
-# 版本与标签
+# 版本与标签（五位：V主.副.修订.YYYYMMDD）
+# 改版本前三段：Cargo.toml 的 version 与 Cargo.lock 同步（cargo check 自动写锁文件）
+# 改日期位：src/version.rs 的 DATE，改成发布当天
 cargo check --release                            # 同步 Cargo.lock 中的版本号
-git tag -a vX.Y.Z -m "<该版本变更摘要>"
+git tag -a V0.4.2.20261104 -m "<该版本变更摘要>"
 git push origin main
-git push origin vX.Y.Z
+git push origin V0.4.2.20261104
 
 # 日志与偏好定位（排查用）
 %LOCALAPPDATA%\sparrowpdf\sparrowpdf.log

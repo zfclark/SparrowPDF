@@ -5,8 +5,7 @@ use egui::Ui;
 use crate::model::{ImageFormat, ToolId};
 use crate::tools::ToolOptions;
 use crate::ui::panels::{
-    FormState, add_files_button, input_list, multi_output_note, output_selector,
-    password_field,
+    add_files_button, input_list, multi_output_note, output_selector, password_field, FormState,
 };
 use crate::ui::theme;
 
@@ -23,12 +22,15 @@ pub fn show(ui: &mut Ui, form: &mut FormState) {
             theme::field_row_hover(
                 ui,
                 "DPI",
-                "纯 Rust 软件渲染，不依赖 PDFium / MuPDF；复杂矢量与透明效果可能有差异",
+                "内置渲染器，复杂矢量与透明效果可能有差异",
                 |ui| {
                     theme::number_input(ui, dpi, 36..=600, |d| d.speed(1.0).suffix(" DPI"));
                 },
             );
-            theme::hint(ui, "DPI 范围 36–600；默认 300，越高越清晰、文件越大、耗时越长");
+            theme::hint(
+                ui,
+                "DPI 范围 36–600；默认 300，越高越清晰、文件越大、耗时越长",
+            );
             theme::field_row(ui, "格式", |ui| {
                 ui.radio_value(format, ImageFormat::Png, "PNG");
                 ui.radio_value(format, ImageFormat::Jpeg, "JPEG");

@@ -5,10 +5,10 @@
 # 取舍记录。
 #
 # 一、按副本修正的四处（现有文件原本是错的或不完整的）
-#   1. tag 过滤器：'v[0-9]+.[0-9]+.[0-9]+' → 'v[0-9]*.[0-9]*.[0-9]*'。
+#   1. tag 过滤器：'v[0-9]+.[0-9]+.[0-9]+' → 'V[0-9]*.[0-9]*.[0-9]*.[0-9]*'。
 #      Actions 的 tag 过滤是 glob 不是正则，'+' 在那里的含义是字面加号，等于
-#      要求 tag 里真的出现 '+'——推 v0.4.2 根本不会触发流水线。副本的 '*' 才
-#      对；严格性由 guard 里的 grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' 兜住，
+#      要求 tag 里真的出现 '+'——推 V0.4.2.20261104 根本不会触发流水线。放宽成
+#      '*' 才对；严格性由 guard 里的 grep -E 兜住（格式 + 日期位必须是 8 位），
 #      glob 放宽不会放过非法 tag（只影响「能否触发」，不影响「触发后是否合规」）。
 #   2. 可达性检查：'$TAG' → HEAD。checkout 已按 ref 检出到 tag 指向的提交，
 #      HEAD 与之等价；而 workflow_dispatch 手填的 tag 在本地未必有同名 ref
@@ -75,11 +75,11 @@ name: 🚀 版本构建发布
 
 on:
   push:
-    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+    tags: ["V[0-9]*.[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "要构建的已有 tag（如 v0.4.2）"
+        description: "要构建的已有 tag（如 V0.4.2.20261104）"
         required: true
 
 permissions:
@@ -99,6 +99,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      date: ${{ steps.ver.outputs.date }}
       tag: ${{ steps.ver.outputs.tag }}
     steps:
       - name: 检出 tag 提交
@@ -111,28 +112,39 @@ jobs:
         id: ver
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # 五位版本 V主.副.修订.日期：去掉 V 前缀与最后一段，即 Cargo 版本。
+          CORE="${TAG#V}"
+          CORE="${CORE%.*}"
           {
             echo "tag=$TAG"
-            echo "version=${TAG#v}"
+            echo "version=$CORE"
+            echo "date=${TAG##*.}"
           } >> "$GITHUB_OUTPUT"
-          echo "构建 $TAG（Cargo 版本 ${TAG#v}）"
+          echo "构建 $TAG（Cargo 版本 $CORE，日期位 ${TAG##*.}）"
 
-      - name: 校验 tag 格式，且与 Cargo.toml / Cargo.lock 一致
+      - name: 校验 tag 格式，且与 Cargo.toml / Cargo.lock / version.rs 一致
         run: |
           TAG="${{ steps.ver.outputs.tag }}"
           V="${{ steps.ver.outputs.version }}"
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag $TAG 不符合 vX.Y.Z 格式"; exit 1
+          D="${{ steps.ver.outputs.date }}"
+          if ! printf '%s' "$TAG" | grep -Eq '^V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]{8}$'; then
+            echo "::error::tag $TAG 不符合 V主.副.修订.YYYYMMDD 格式"; exit 1
           fi
           CARGO_V="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
           if [ "$CARGO_V" != "$V" ]; then
-            echo "::error::Cargo.toml 版本 $CARGO_V 与 tag ${V} 不一致"; exit 1
+            echo "::error::Cargo.toml 版本 $CARGO_V 与 tag 前三段 ${V} 不一致"; exit 1
           fi
           # 锁文件版本没跟上时，--locked 构建会在几分钟后才失败；这里先拦下来。
           LOCK_V="$(grep -A1 '^name = "sparrowpdf"$' Cargo.lock \
             | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
           if [ "$LOCK_V" != "$V" ]; then
-            echo "::error::Cargo.lock 里 sparrowpdf 是 $LOCK_V，与 tag ${V} 不一致（本地跑一次 cargo check 同步锁文件再提交）"; exit 1
+            echo "::error::Cargo.lock 里 sparrowpdf 是 $LOCK_V，与 tag 前三段 ${V} 不一致（本地跑一次 cargo check 同步锁文件再提交）"; exit 1
+          fi
+          # 日期位是产品版本的一部分：tag 与源码里的日期不一致，装出来的
+          # 关于页就会和 tag 对不上，属于必须拦下的版本漂移。
+          SRC_D="$(sed -n 's/^pub const DATE: &str = "\(.*\)";$/\1/p' src/version.rs | head -1)"
+          if [ "$SRC_D" != "$D" ]; then
+            echo "::error::src/version.rs 的日期位 $SRC_D 与 tag 的 $D 不一致（发布当天更新 version.rs）"; exit 1
           fi
 
       - name: 确认 tag 已合入 main
@@ -285,6 +297,9 @@ jobs:
       - name: 打包 SparrowPDF.app
         run: |
           V="${{ needs.guard.outputs.version }}"
+          # CFBundleVersion 用日期位当 build 号（Apple 建议单调递增的整数），
+          # 对外展示的短版本仍是三段核心版本；完整五位版本在应用「关于」页。
+          D="${{ needs.guard.outputs.date }}"
           APP="SparrowPDF.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp universal/SparrowPDF "$APP/Contents/MacOS/SparrowPDF"
@@ -299,7 +314,7 @@ jobs:
             <key>CFBundleExecutable</key><string>SparrowPDF</string>
             <key>CFBundleIconFile</key><string>app</string>
             <key>CFBundleIdentifier</key><string>com.sparrowpdf.app</string>
-            <key>CFBundleVersion</key><string>$V</string>
+            <key>CFBundleVersion</key><string>$D</string>
             <key>CFBundleShortVersionString</key><string>$V</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>

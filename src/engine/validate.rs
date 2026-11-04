@@ -24,23 +24,49 @@ pub fn assert_page_count(
     let doc = reopen(path)?;
     let actual = if doc.is_encrypted() {
         let Some(pw) = password else {
-            return fail(
-                path,
-                "产物已加密但未提供校验密码，无法核对页数".to_string(),
-            );
+            return fail(path, "产物已加密但未提供校验密码，无法核对页数".to_string());
         };
         let bytes = std::fs::read(path).map_err(|e| ToolError::ReadFailed {
             path: path.to_path_buf(),
             detail: e.to_string(),
         })?;
-        let opened = lopdf::Document::load_mem_with_password(&bytes, pw)
-            .map_err(|e| fail::<lopdf::Document>(path, format!("产物无法用校验密码打开：{e}")).err().unwrap())?;
+        let opened = lopdf::Document::load_mem_with_password(&bytes, pw).map_err(|e| {
+            fail::<lopdf::Document>(path, format!("产物无法用校验密码打开：{e}"))
+                .err()
+                .unwrap()
+        })?;
         pdf_io::page_count(&opened)
     } else {
         pdf_io::page_count(&doc)
     };
     if actual != expected_pages {
-        return fail(path, format!("页数不符：期望 {expected_pages}，实际 {actual}"));
+        return fail(
+            path,
+            format!("页数不符：期望 {expected_pages}，实际 {actual}"),
+        );
+    }
+    Ok(())
+}
+
+/// Assert every page of the artifact shares one orientation.
+///
+/// Image→PDF layouts fix the page orientation once per document, so a mixed
+/// result is always a defect in the page loop (typically a page type that
+/// lost the shared policy) rather than user intent. `expect_landscape` is
+/// `true` for A4 landscape, `false` for A4 portrait.
+pub fn assert_page_orientation(path: &Path, expect_landscape: bool) -> Result<(), ToolError> {
+    let doc = reopen(path)?;
+    for (page_num, page_id) in doc.get_pages() {
+        let [x0, y0, x1, y1] = pdf_io::page_media_box(&doc, page_id);
+        let is_landscape = (x1 - x0) > (y1 - y0);
+        if is_landscape != expect_landscape {
+            let want = if expect_landscape { "横向" } else { "纵向" };
+            let got = if is_landscape { "横向" } else { "纵向" };
+            return fail(
+                path,
+                format!("第 {page_num} 页方向与全书不一致：期望{want}，实际{got}"),
+            );
+        }
     }
     Ok(())
 }
@@ -95,7 +121,11 @@ pub fn assert_dctdecode_count(path: &Path, expected: usize) -> Result<(), ToolEr
         let Object::Stream(stream) = object else {
             continue;
         };
-        let subtype = stream.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
+        let subtype = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
         if subtype != Some(b"Image".as_slice()) {
             continue;
         }
@@ -153,11 +183,10 @@ pub fn assert_jpeg_soi_bytes(path: &Path, min_count: usize) -> Result<(), ToolEr
 /// fixed validation-helper shape in case text output returns.
 #[allow(dead_code)]
 pub fn assert_non_empty_text(path: &Path) -> Result<(), ToolError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| ToolError::ReadFailed {
-            path: path.to_path_buf(),
-            detail: e.to_string(),
-        })?;
+    let text = std::fs::read_to_string(path).map_err(|e| ToolError::ReadFailed {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
     if text.trim().is_empty() {
         return fail(path, "文本内容为空".to_string());
     }

@@ -6,70 +6,123 @@
 
 use egui::{RichText, Ui};
 
-use crate::model::TaskState;
+use crate::model::{ConflictPolicy, TaskState, ToolId};
 use crate::ui::panels::{PanelAction, PanelView};
 use crate::ui::theme;
 
-pub fn show(ui: &mut Ui, state: &TaskState, view: &PanelView) -> PanelAction {
+pub fn show(
+    ui: &mut Ui,
+    state: &TaskState,
+    view: &PanelView,
+    busy_elsewhere: Option<ToolId>,
+    session_conflict: Option<ConflictPolicy>,
+) -> PanelAction {
     let mut action = PanelAction::None;
 
-    egui::Panel::bottom("sparrow_bottom").show(ui, |ui| {
-        if theme::result_area(ui, state) == theme::ResultAction::RetryInDocuments {
-            action = PanelAction::RetryInDocuments;
-        }
-
-        // Hairline between the content above and the action row.
-        let rect = ui.available_rect_before_wrap();
-        ui.painter()
-            .hline(rect.x_range(), rect.top(), theme::hairline(ui));
-        ui.add_space(theme::GAP_S);
-
-        ui.horizontal(|ui| {
-            ui.add_space(theme::GAP_XS);
-            theme::status_dot(ui, dot_color(ui, state));
-            ui.add_space(theme::GAP_XS);
-            ui.label(RichText::new(state_label(state)).strong());
-
-            match state {
-                TaskState::Running { progress, message } => {
-                    ui.add_space(theme::GAP_S);
-                    ui.add(
-                        egui::ProgressBar::new(*progress)
-                            .desired_width(120.0)
-                            .show_percentage(),
-                    );
-                    ui.add_space(theme::GAP_XS);
-                    ui.label(RichText::new(message).weak());
-                }
-                TaskState::Idle
-                | TaskState::Validating
-                | TaskState::Ready
-                | TaskState::Done { .. }
-                | TaskState::Failed { .. }
-                | TaskState::Cancelled => {}
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let busy = state.is_busy();
-                let clickable = !busy && view.can_run;
-                if theme::primary_button(ui, "执行", clickable).clicked() && clickable {
-                    action = PanelAction::Run;
-                }
-                if busy {
-                    if theme::button(ui, "取消").clicked() {
-                        action = PanelAction::Cancel;
-                    }
-                    ui.add_space(theme::GAP_XS);
-                    ui.spinner();
-                } else if !view.can_run {
-                    ui.label(RichText::new(view.hint).weak());
-                }
-            });
-        });
-        ui.add_space(theme::GAP_S);
+    // Same lateral gutter as the content column, so the result banner and the
+    // action row line up with the cards instead of running to the divider.
+    let frame = egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
+        left: theme::GAP_M as i8 + 4,
+        right: theme::GAP_M as i8 + 4,
+        top: theme::GAP_XS as i8,
+        bottom: theme::GAP_XS as i8,
     });
 
+    egui::Panel::bottom("sparrow_bottom")
+        .frame(frame)
+        .show(ui, |ui| {
+            if theme::result_area(ui, state) == theme::ResultAction::RetryInDocuments {
+                action = PanelAction::RetryInDocuments;
+            }
+
+            // Hairline between the content above and the action row.
+            let rect = ui.available_rect_before_wrap();
+            ui.painter()
+                .hline(rect.x_range(), rect.top(), theme::hairline(ui));
+            ui.add_space(theme::GAP_S);
+
+            ui.horizontal(|ui| {
+                ui.add_space(theme::GAP_XS);
+                theme::status_dot(ui, dot_color(ui, state));
+                ui.add_space(theme::GAP_XS);
+                ui.label(RichText::new(state_label(state)).strong());
+
+                match state {
+                    TaskState::Running { progress, message } => {
+                        ui.add_space(theme::GAP_S);
+                        ui.add(
+                            egui::ProgressBar::new(*progress)
+                                .desired_width(120.0)
+                                .show_percentage(),
+                        );
+                        ui.add_space(theme::GAP_XS);
+                        ui.label(RichText::new(message).weak());
+                    }
+                    // A task running under another tool: keep the bar honest about
+                    // why this panel cannot start.
+                    _ if busy_elsewhere.is_some() => {
+                        ui.add_space(theme::GAP_S);
+                        ui.label(
+                            RichText::new(format!(
+                                "「{}」处理中，完成后可执行",
+                                busy_elsewhere.map(|t| t.label()).unwrap_or_default()
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    _ => {}
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let busy = state.is_busy();
+                    let clickable = !busy && busy_elsewhere.is_none() && view.can_run;
+                    if theme::primary_button(ui, "执行", clickable).clicked() && clickable {
+                        action = PanelAction::Run;
+                    }
+                    // A task started from another tool is still cancellable from
+                    // here: switching tools used to hide the only way to stop it.
+                    if busy || busy_elsewhere.is_some() {
+                        if theme::button(ui, "取消").clicked() {
+                            action = PanelAction::Cancel;
+                        }
+                        ui.add_space(theme::GAP_XS);
+                        ui.spinner();
+                    } else if !view.can_run {
+                        ui.label(RichText::new(view.hint).weak());
+                    }
+
+                    // "本次后续均执行此操作" outlives the dialog, so the bar
+                    // says what the session is committed to and offers a way
+                    // back without restarting the app.
+                    if let Some(policy) = session_conflict {
+                        if theme::small_button(ui, "重置")
+                            .on_hover_text("恢复为「每次都询问」")
+                            .clicked()
+                        {
+                            action = PanelAction::ClearConflictPolicy;
+                        }
+                        ui.label(
+                            RichText::new(format!("同名文件：{}", conflict_label(policy)))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+            });
+            ui.add_space(theme::GAP_S);
+        });
+
     action
+}
+
+/// What the remembered answer does, in the words the dialog used.
+fn conflict_label(policy: ConflictPolicy) -> &'static str {
+    match policy {
+        ConflictPolicy::Report => "每次询问",
+        ConflictPolicy::Overwrite => "覆盖",
+        ConflictPolicy::Unique => "另存为新文件",
+    }
 }
 
 fn state_label(state: &TaskState) -> &'static str {

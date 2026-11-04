@@ -3,7 +3,8 @@
 //! The page order is kept as a drag list of page labels. `egui_dnd` reorders the
 //! list; the tool receives the resulting 0-based source indices. The list loads
 //! itself as soon as a file is staged (see [`ensure_loaded`]), so reordering is
-//! drag-only.
+//! drag-only. A live thumbnail strip below the list shows the pages in the
+//! composed order, labeled with their output page numbers.
 
 use std::path::PathBuf;
 
@@ -12,8 +13,9 @@ use egui::Ui;
 use crate::model::ToolId;
 use crate::tools::ToolOptions;
 use crate::ui::panels::{
-    FormState, add_files_button, drag_handle, input_list, output_selector, password_field,
+    add_files_button, drag_handle, input_list, output_selector, password_field, FormState,
 };
+use crate::ui::preview::{self, PreviewState};
 use crate::ui::theme;
 
 /// A row in the page-order list.
@@ -37,7 +39,12 @@ pub struct ReorderState {
     pub last_attempt: Option<(PathBuf, String)>,
 }
 
-pub fn show(ui: &mut Ui, form: &mut FormState, reorder: &mut ReorderState) {
+pub fn show(
+    ui: &mut Ui,
+    form: &mut FormState,
+    reorder: &mut ReorderState,
+    preview_state: &mut PreviewState,
+) {
     let tool = ToolId::Reorder;
 
     theme::card(ui, "输入 PDF", |ui| {
@@ -63,11 +70,19 @@ pub fn show(ui: &mut Ui, form: &mut FormState, reorder: &mut ReorderState) {
                 }
                 theme::hint(ui, &format!("共 {} 页", reorder.total_pages));
             });
+            let mut position = 0u32;
             egui_dnd::dnd(ui, egui::Id::unique("reorder-pages")).show_vec(
                 &mut reorder.rows,
                 |ui, item, handle, _state| {
+                    // Row position = output page number; the label is the
+                    // source page, so the two together spell out the mapping.
+                    position += 1;
                     ui.horizontal(|ui| {
                         handle.ui(ui, drag_handle);
+                        ui.add_sized(
+                            egui::vec2(32.0, theme::ROW_H),
+                            egui::Label::new(egui::RichText::new(format!("P{position}")).weak()),
+                        );
                         ui.label(item.label.clone());
                     });
                 },
@@ -79,6 +94,18 @@ pub fn show(ui: &mut Ui, form: &mut FormState, reorder: &mut ReorderState) {
         }
         password_field(ui, form);
     });
+
+    // Live output preview: reflects the row order above and the saved PDF.
+    let order: Vec<usize> = reorder.rows.iter().map(|row| row.source).collect();
+    let path = form.inputs.first().map(|input| input.path.clone());
+    let password = (!form.password.is_empty()).then(|| form.password.clone());
+    preview::show_page_order(
+        ui,
+        path.as_deref(),
+        &order,
+        password.as_deref(),
+        preview_state,
+    );
 
     theme::card(ui, "输出", |ui| {
         output_selector(ui, form, "reordered.pdf", &["pdf"], false);

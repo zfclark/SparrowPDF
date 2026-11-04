@@ -23,7 +23,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use crate::model::{ImageFormat, InputFile, PageRangeMode, RotationDegrees, ToolError, ToolId, ToolOutcome, WatermarkPlacement, WorkerMsg};
+use crate::model::{
+    ImageFormat, InputFile, PageRangeMode, RotationDegrees, ToolError, ToolId, ToolOutcome,
+    WatermarkPlacement, WorkerMsg,
+};
+
+pub use crate::model::ConflictPolicy;
 
 /// Cancellation flag shared between the UI thread and a worker.
 pub type CancelFlag = Arc<AtomicBool>;
@@ -194,6 +199,8 @@ pub struct ToolRequest {
     pub options: ToolOptions,
     /// Password supplied by the user for encrypted inputs, if any.
     pub password: Option<String>,
+    /// How to handle outputs that already exist on disk.
+    pub conflict: ConflictPolicy,
 }
 
 /// Progress sink handed to [`Tool::execute`]. Cheap to clone, ignores send
@@ -234,7 +241,10 @@ pub trait Tool: Send + Sync {
     /// The UI renders headings from [`ToolId::label`] so it can reuse a
     /// `&'static str` lookup, but the interface keeps `name` because the spec
     /// fixes the four-method shape (id / name / validate / execute).
-    #[allow(dead_code, reason = "fixed Tool interface member; UI renders via ToolId::label")]
+    #[allow(
+        dead_code,
+        reason = "fixed Tool interface member; UI renders via ToolId::label"
+    )]
     fn name(&self) -> &'static str {
         self.id().label()
     }

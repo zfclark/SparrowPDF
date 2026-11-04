@@ -4,9 +4,7 @@ use egui::Ui;
 
 use crate::model::{ToolId, WatermarkPlacement};
 use crate::tools::ToolOptions;
-use crate::ui::panels::{
-    FormState, add_files_button, input_list, output_selector, password_field,
-};
+use crate::ui::panels::{add_files_button, input_list, output_selector, password_field, FormState};
 use crate::ui::theme;
 
 /// Frequently used watermark tints, shown as one-click swatches next to the
@@ -46,17 +44,15 @@ pub fn show(ui: &mut Ui, form: &mut FormState) {
                     theme::text_input(ui, text, "请输入水印文字，例如：内部资料");
                 },
             );
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    egui::vec2(theme::LABEL_W, theme::ROW_H),
-                    egui::Label::new("字号"),
-                );
+            theme::field_row(ui, "字号", |ui| {
                 theme::number_input(ui, font_size, 6.0..=200.0, |d| d.speed(1.0));
                 ui.add_space(theme::GAP_S);
                 ui.label("颜色");
                 ui.color_edit_button_srgb(color);
                 // Quick presets: one click sets the tint without opening the
-                // color picker. Rendered as small filled squares.
+                // color picker. Rendered as small filled squares, spaced away
+                // from the picker so the two are not read as one control.
+                ui.add_space(theme::GAP_S);
                 for preset in PRESET_COLORS {
                     let (name, rgb) = *preset;
                     let button = egui::Button::new("")

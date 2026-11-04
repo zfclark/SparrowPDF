@@ -1,6 +1,9 @@
 [package]
 name = "sparrowpdf"
-version = "0.4.2"
+# Cargo 只接受 SemVer 三段：这里保存五位版本号的前三段（主.副.修订），
+# 不带 V 前缀、不带日期位。日期位在 src/version.rs 维护，展示用完整版本
+# （V0.5.0.20261104）由两者拼出，发布 tag 用同一格式。
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
@@ -26,6 +29,16 @@ kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
+
+# Image codecs the software rasterizer needs and `image` cannot provide:
+# LZW (PDF /LZWDecode), CCITT G3/G4 (/CCITTFaxDecode) and JBIG2 (/JBIG2Decode).
+# All three are pure Rust (no C toolchain), small, and MIT/Apache-2.0.
+weezl = "0.2"
+# zlib decode for /FlateDecode; already in the tree via `image`, declared
+# explicitly because the rasterizer calls it directly.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+hayro-ccitt = "0.4"
+hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"] }
 
 [build-dependencies]
 # Embeds assets/app.ico into the Windows executable (taskbar / Explorer icon).

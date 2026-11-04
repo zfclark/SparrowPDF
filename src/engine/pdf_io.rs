@@ -6,10 +6,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lopdf::Document;
 use lopdf::dictionary;
+use lopdf::Document;
 
-use crate::model::ToolError;
+use crate::model::{ConflictPolicy, ToolError};
 
 /// Open a PDF, converting every library error into a [`ToolError`].
 ///
@@ -52,12 +52,26 @@ pub fn open_document(path: &Path, password: Option<&str>) -> Result<Document, To
     // Belt and braces: if the trailer still references /Encrypt, the password was
     // accepted by the handler but the content was not fully decrypted.
     if doc.is_encrypted() {
-        doc.decrypt(password).map_err(|_| ToolError::WrongPassword {
-            path: path.to_path_buf(),
-        })?;
+        doc.decrypt(password)
+            .map_err(|_| ToolError::WrongPassword {
+                path: path.to_path_buf(),
+            })?;
     }
 
     Ok(doc)
+}
+
+/// Whether the file declares `/Encrypt` on disk.
+///
+/// Answering this needs no password (`lopdf` reads the trailer but cannot
+/// decrypt object streams), which is what lets the decrypt tool say "this file
+/// is not encrypted" instead of demanding a password that cannot exist.
+pub fn is_encrypted(path: &Path) -> Result<bool, ToolError> {
+    let doc = Document::load(path).map_err(|e| ToolError::ReadFailed {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+    Ok(doc.is_encrypted())
 }
 
 /// Open a PDF that is expected to be a normal, unencrypted working document.
@@ -104,7 +118,12 @@ pub fn dir_is_writable(dir: &Path) -> bool {
 
 /// Save `doc` to `path` through a sibling temp file, so a failed write never
 /// leaves a half-written artifact behind.
-pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
+pub fn save_document(
+    doc: &mut Document,
+    path: &Path,
+    policy: ConflictPolicy,
+) -> Result<(), ToolError> {
+    ensure_still_free(path, policy)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
@@ -124,18 +143,19 @@ pub fn save_document(doc: &mut Document, path: &Path) -> Result<(), ToolError> {
     })?;
 
     // `doc.save` wrote to the temp path; move it into place.
-    fs::rename(&tmp, path).or_else(|_| {
-        // Windows can refuse a cross-device rename or an existing target.
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })
-    .map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        ToolError::WriteFailed {
-            path: path.to_path_buf(),
-            detail: write_error_detail(&e),
-        }
-    })?;
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            // Windows can refuse a cross-device rename or an existing target.
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            ToolError::WriteFailed {
+                path: path.to_path_buf(),
+                detail: write_error_detail(&e),
+            }
+        })?;
 
     Ok(())
 }
@@ -164,7 +184,8 @@ pub fn page_count_of(path: &Path, password: Option<&str>) -> Result<u32, ToolErr
 }
 
 /// Write a file to disk with a mapped error.
-pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+pub fn write_file(path: &Path, bytes: &[u8], policy: ConflictPolicy) -> Result<(), ToolError> {
+    ensure_still_free(path, policy)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
@@ -267,6 +288,97 @@ pub fn page_media_box(doc: &Document, page_id: lopdf::ObjectId) -> [f32; 4] {
     medpdf::get_page_media_box(doc, page_id).unwrap_or([0.0, 0.0, 595.0, 842.0])
 }
 
+/// Decide the final path of every planned output before anything is written.
+///
+/// `Report` returns every clashing path at once (not just the first) so the UI
+/// can say "3 个文件已存在" and offer a single decision for the whole run.
+/// `Unique` keeps the previous files and picks `name-2`, `name-3`, …; names
+/// reserved by the same run are skipped too, so two planned files can never be
+/// renamed onto each other.
+pub fn resolve_outputs(
+    planned: &[std::path::PathBuf],
+    policy: ConflictPolicy,
+) -> Result<Vec<std::path::PathBuf>, ToolError> {
+    match policy {
+        ConflictPolicy::Report => {
+            let existing: Vec<_> = planned.iter().filter(|p| p.exists()).cloned().collect();
+            if existing.is_empty() {
+                Ok(planned.to_vec())
+            } else {
+                Err(ToolError::OutputExists { paths: existing })
+            }
+        }
+        ConflictPolicy::Overwrite => Ok(planned.to_vec()),
+        ConflictPolicy::Unique => {
+            let mut taken: std::collections::BTreeSet<std::path::PathBuf> =
+                planned.iter().cloned().collect();
+            let mut resolved = Vec::with_capacity(planned.len());
+            for path in planned {
+                resolved.push(unique_path(path, &mut taken)?);
+            }
+            Ok(resolved)
+        }
+    }
+}
+
+/// [`resolve_outputs`] for a tool that writes exactly one file.
+pub fn resolve_output(path: &Path, policy: ConflictPolicy) -> Result<PathBuf, ToolError> {
+    let mut resolved = resolve_outputs(std::slice::from_ref(&path.to_path_buf()), policy)?;
+    Ok(resolved.remove(0))
+}
+
+/// First free `<stem>-N.<ext>` next to `path`.
+///
+/// Running out of serials is an error, not a fallback: returning the original
+/// path would overwrite the very file the caller asked to preserve.
+fn unique_path(
+    path: &Path,
+    taken: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<PathBuf, ToolError> {
+    if !path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    for serial in 2..10_000u32 {
+        let name = if ext.is_empty() {
+            format!("{stem}-{serial}")
+        } else {
+            format!("{stem}-{serial}.{ext}")
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() && !taken.contains(&candidate) {
+            taken.insert(candidate.clone());
+            return Ok(candidate);
+        }
+    }
+    Err(ToolError::OutputNameExhausted {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Refuse a path that already exists unless the caller asked to overwrite.
+///
+/// `resolve_outputs` runs before a tool starts rendering, which can take
+/// minutes; the file could appear in the meantime (another instance, another
+/// program). Re-checking right before the rename closes that window to the
+/// microseconds between the check and the move.
+fn ensure_still_free(path: &Path, policy: ConflictPolicy) -> Result<(), ToolError> {
+    if policy == ConflictPolicy::Report && path.exists() {
+        return Err(ToolError::OutputExists {
+            paths: vec![path.to_path_buf()],
+        });
+    }
+    Ok(())
+}
+
 /// Delete a file if it exists, ignoring errors (used when verification fails).
 pub fn remove_quietly(path: &Path) {
     let _ = fs::remove_file(path);
@@ -297,11 +409,7 @@ pub fn new_document() -> Document {
 /// `medpdf::copy_page_with_cache` deep-copies every referenced object, shares
 /// resources across calls, re-parents each new page onto `dest`'s `/Pages` node
 /// and appends it to `/Kids`, so the insertion order is the output order.
-pub fn copy_pages(
-    dest: &mut Document,
-    source: &Document,
-    pages: &[u32],
-) -> Result<(), ToolError> {
+pub fn copy_pages(dest: &mut Document, source: &Document, pages: &[u32]) -> Result<(), ToolError> {
     let mut cache: std::collections::BTreeMap<lopdf::ObjectId, lopdf::ObjectId> =
         std::collections::BTreeMap::new();
     for page in pages {

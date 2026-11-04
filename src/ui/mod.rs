@@ -5,6 +5,8 @@
 //! `medpdf`, `medpdf_image`, `image` or `kamadak_exif` type is imported anywhere
 //! under `ui/`.
 
+pub mod about;
+pub mod conflict;
 pub mod panels;
 pub mod prefs;
 pub mod preview;

@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::engine::worker::{WorkerHandle, spawn};
-use crate::model::{TaskState, ToolError, ToolId, WorkerMsg};
+use crate::engine::worker::{spawn, WorkerHandle};
+use crate::model::{ConflictPolicy, TaskState, ToolError, ToolId, WorkerMsg};
 use crate::tools::ToolRequest;
-use crate::ui::panels::{FormState, PanelAction, ReorderState, panel_view};
+use crate::ui::panels::{panel_view, FormState, PanelAction, ReorderState};
 use crate::ui::{panels, sidebar, status, theme};
 
 /// App icon, embedded at compile time from the shipped launcher icon.
@@ -25,8 +25,6 @@ pub struct SparrowApp {
     reorder: ReorderState,
     /// App icon, decoded once from the bytes already embedded for the window.
     icon: Option<egui::TextureHandle>,
-    /// TEMP verification hook; removed after the visual check.
-    probe: Probe,
     /// Cached directory-writability probe results, so the fallback check in
     /// `resolve_output` never touches the filesystem more than once per
     /// directory (it runs on every readiness refresh otherwise).
@@ -40,16 +38,14 @@ pub struct SparrowApp {
     preview: crate::ui::preview::PreviewState,
     /// Saved appearance choice; `None` follows the operating-system theme.
     theme_pref: Option<crate::ui::prefs::ThemePref>,
-}
-
-/// TEMP: environment-driven screenshot probe for visual verification.
-struct Probe {
-    out: Option<String>,
-    files: Vec<PathBuf>,
-    dark: bool,
-    done: bool,
-    failed: bool,
-    frames: u64,
+    /// State of the About modal (open flag plus its last link error).
+    about: crate::ui::about::AboutState,
+    /// State of the "output already exists" modal.
+    conflict: crate::ui::conflict::ConflictState,
+    /// Policy for the *next* run, set by the conflict dialog (one-shot).
+    pending_policy: Option<ConflictPolicy>,
+    /// Policy remembered for the rest of the session ("本次后续均执行此操作").
+    session_policy: Option<ConflictPolicy>,
 }
 
 impl SparrowApp {
@@ -57,26 +53,10 @@ impl SparrowApp {
         configure_style(&cc.egui_ctx);
         install_cjk_fallback(&cc.egui_ctx);
 
-        // TEMP probe setup (removed after the visual check).
-        let probe = Probe {
-            out: std::env::var("SPARROW_SHOT").ok(),
-            files: std::env::var("SPARROW_SHOT_FILES")
-                .ok()
-                .map(|v| v.split(';').map(PathBuf::from).collect())
-                .unwrap_or_default(),
-            dark: std::env::var("SPARROW_SHOT_DARK").is_ok(),
-            done: std::env::var("SPARROW_SHOT_DONE").is_ok(),
-            failed: std::env::var("SPARROW_SHOT_FAIL").is_ok(),
-            frames: 0,
-        };
-        // Appearance: the screenshot probe wins, then the saved user choice.
-        // With neither, leave egui alone so the app keeps following the
-        // operating-system theme (pinning a guess here would freeze the first
-        // frame into the wrong mode).
-        let theme_pref = probe
-            .dark
-            .then_some(crate::ui::prefs::ThemePref::Dark)
-            .or_else(crate::ui::prefs::load);
+        // Appearance: apply the saved choice. Without one, leave egui alone so
+        // the app keeps following the operating-system theme (pinning a guess
+        // here would freeze the first frame into the wrong mode).
+        let theme_pref = crate::ui::prefs::load();
         if let Some(pref) = theme_pref {
             cc.egui_ctx.set_theme(if pref.is_dark() {
                 egui::Theme::Dark
@@ -84,70 +64,12 @@ impl SparrowApp {
                 egui::Theme::Light
             });
         }
-        let mut current = ToolId::ImageToPdf;
-        if let Ok(label) = std::env::var("SPARROW_SHOT_TOOL") {
-            if let Some(tool) = ToolId::ALL.into_iter().find(|t| t.label() == label) {
-                current = tool;
-            }
-        }
-        let mut form = FormState::new();
-        for path in &probe.files {
-            form.inputs.push(crate::model::InputFile::new(path.clone()));
-        }
-        // TEMP probe option presets, for screenshotting specific UI states.
-        if std::env::var("SPARROW_SHOT_TWOPAGE").is_ok() {
-            if let crate::tools::ToolOptions::FolderToPdf { mode, .. } = form.options_mut(current) {
-                *mode = crate::tools::BatchPageMode::TwoPerPage;
-            }
-        }
-        if std::env::var("SPARROW_SHOT_PAIRPORTRAIT").is_ok() {
-            if let crate::tools::ToolOptions::FolderToPdf {
-                pair_orientation, ..
-            } = form.options_mut(current)
-            {
-                *pair_orientation = crate::tools::Orientation::Portrait;
-            }
-        }
-        if let Ok(spec) = std::env::var("SPARROW_SHOT_MERGESPEC") {
-            if let crate::tools::ToolOptions::FolderToPdf {
-                use_merge_spec,
-                merge_spec,
-                ..
-            } = form.options_mut(current)
-            {
-                *use_merge_spec = true;
-                *merge_spec = spec;
-            }
-        }
+        let current = ToolId::ImageToPdf;
+        let form = FormState::new();
         let mut states = std::collections::BTreeMap::new();
         for id in ToolId::ALL {
             states.insert(id, TaskState::Idle);
         }
-        if probe.done {
-            states.insert(
-                current,
-                TaskState::Done {
-                    summary: "已合并 2 个文件，共 5 页".to_string(),
-                    outputs: vec![
-                        PathBuf::from("E:\\output\\merged.pdf"),
-                        PathBuf::from("E:\\output\\merged-2.pdf"),
-                    ],
-                    note: Some("源文件夹不可写，输出已改存到「文档\\SparrowPDF」".to_string()),
-                },
-            );
-        }
-        if probe.failed {
-            states.insert(
-                current,
-                TaskState::Failed {
-                    error: crate::model::ToolError::ReadFailed {
-                        path: PathBuf::from("E:\\broken.pdf"),
-                        detail: "文件已损坏或不是有效的 PDF".to_string(),
-                    },
-                },
-            );
-        }
-
         Self {
             current,
             form,
@@ -155,12 +77,15 @@ impl SparrowApp {
             worker: None,
             reorder: ReorderState::default(),
             icon: load_icon(&cc.egui_ctx),
-            probe,
             writable_cache: std::collections::BTreeMap::new(),
             fallback_cache: std::collections::BTreeMap::new(),
             task_note: None,
             preview: crate::ui::preview::PreviewState::new(),
             theme_pref,
+            about: crate::ui::about::AboutState::default(),
+            conflict: crate::ui::conflict::ConflictState::default(),
+            pending_policy: None,
+            session_policy: None,
         }
     }
 
@@ -235,12 +160,50 @@ impl SparrowApp {
                 self.worker = None;
                 true
             }
-            Some(Err(err)) => {
-                self.states.insert(tool_id, TaskState::Failed { error: err });
+            // A partial run *did* produce files. Reporting it as a plain
+            // failure hid the outputs and made a usable result look like a
+            // crash; keep the artifacts clickable and put the reason in the
+            // warning note instead.
+            Some(Err(ToolError::PartialSuccess {
+                succeeded,
+                failed,
+                detail,
+                outputs,
+            })) => {
+                self.states.insert(
+                    tool_id,
+                    TaskState::Done {
+                        summary: format!("部分成功：成功 {succeeded} 个，失败 {failed} 个"),
+                        outputs,
+                        note: Some(detail),
+                    },
+                );
                 self.worker = None;
                 true
             }
-            None => had_progress,
+            // Nothing was written: turn the clash into a question. The tool
+            // stops before touching the disk, so the dialog can retry the same
+            // run with the policy the user picked.
+            Some(Err(ToolError::OutputExists { paths })) => {
+                crate::engine::logging::log(
+                    "INFO",
+                    &format!("输出文件已存在（{} 个），等待用户选择", paths.len()),
+                );
+                self.conflict.ask(tool_id, paths);
+                self.states.insert(tool_id, TaskState::Idle);
+                self.worker = None;
+                true
+            }
+            Some(Err(err)) => {
+                self.states
+                    .insert(tool_id, TaskState::Failed { error: err });
+                self.worker = None;
+                true
+            }
+            // Keep repainting while the worker lives, even when this frame
+            // produced no message: switching tools must not freeze a running
+            // task's progress.
+            None => had_progress || self.worker.is_some(),
         }
     }
 
@@ -255,20 +218,39 @@ impl SparrowApp {
     /// Runs the `Validating -> Ready -> Running` transitions of the state
     /// machine so the status bar shows each step, not just "processing".
     fn start(&mut self) {
+        // One task at a time. A second `spawn` used to overwrite the live
+        // handle, so the first task's progress and result were dropped and its
+        // state stayed at "处理中" forever.
+        if let Some((running, _)) = &self.worker {
+            crate::engine::logging::log(
+                "WARN",
+                &format!("已有任务在运行（{running}），忽略本次执行请求"),
+            );
+            return;
+        }
         let tool_id = self.current;
         self.states.insert(tool_id, TaskState::Validating);
 
-        let request = match self.build_request(tool_id) {
+        // One-shot choice from the conflict dialog first, then the session
+        // choice, then "tell me" (the tool reports the clash instead of writing).
+        let policy = self
+            .pending_policy
+            .take()
+            .or(self.session_policy)
+            .unwrap_or_default();
+        let request = match self.build_request(tool_id, policy) {
             Ok(request) => request,
             Err(err) => {
-                self.states.insert(tool_id, TaskState::Failed { error: err });
+                self.states
+                    .insert(tool_id, TaskState::Failed { error: err });
                 return;
             }
         };
 
         let tool = crate::tools::tool_for(tool_id);
         if let Err(err) = tool.validate(&request) {
-            self.states.insert(tool_id, TaskState::Failed { error: err });
+            self.states
+                .insert(tool_id, TaskState::Failed { error: err });
             return;
         }
 
@@ -276,11 +258,9 @@ impl SparrowApp {
         // user sees a specific message immediately instead of a failure after
         // processing.
         if let Err(err) = preflight_output(tool_id, &request) {
-            crate::engine::logging::log(
-                "ERROR",
-                &format!("输出位置预检失败：{err}"),
-            );
-            self.states.insert(tool_id, TaskState::Failed { error: err });
+            crate::engine::logging::log("ERROR", &format!("输出位置预检失败：{err}"));
+            self.states
+                .insert(tool_id, TaskState::Failed { error: err });
             return;
         }
 
@@ -337,6 +317,41 @@ impl SparrowApp {
         }
     }
 
+    /// Apply the conflict dialog's answer and rerun the interrupted task.
+    ///
+    /// The tool stopped before writing anything, so retrying with the chosen
+    /// policy is the whole operation — no partial output to clean up.
+    fn answer_conflict(&mut self, policy: ConflictPolicy, remember: bool) {
+        let Some(tool) = self.conflict.tool else {
+            self.conflict.close();
+            return;
+        };
+        self.conflict.close();
+        self.pending_policy = Some(policy);
+        if remember {
+            self.session_policy = Some(policy);
+        }
+        crate::engine::logging::log(
+            "INFO",
+            &format!(
+                "同名文件处理方式：{}（仅本次{}）",
+                match policy {
+                    ConflictPolicy::Overwrite => "覆盖",
+                    ConflictPolicy::Unique => "另存为新文件",
+                    ConflictPolicy::Report => "重新询问",
+                },
+                if remember {
+                    "，本次会话内沿用"
+                } else {
+                    ""
+                }
+            ),
+        );
+        if tool == self.current {
+            self.start();
+        }
+    }
+
     /// Retry the current task with its output redirected into the writable
     /// fallback folder (offered by the failure card).
     fn retry_in_documents(&mut self) {
@@ -354,12 +369,13 @@ impl SparrowApp {
                 .first()
                 .map(|f| f.path.clone())
                 .unwrap_or_else(|| PathBuf::from("output.pdf"));
-            dir.join(format!("{}{}.pdf", file_stem(&source), output_suffix(tool)))
+            dir.join(format!(
+                "{}{}.pdf",
+                file_stem(&source),
+                output_suffix_for(tool, self.form.options_for(tool))
+            ))
         };
-        crate::engine::logging::log(
-            "INFO",
-            &format!("按用户选择改存到：{}", target.display()),
-        );
+        crate::engine::logging::log("INFO", &format!("按用户选择改存到：{}", target.display()));
         self.form.output = Some(target);
         self.start();
     }
@@ -381,7 +397,9 @@ impl SparrowApp {
         }
 
         let tool_id = self.current;
-        let Ok(request) = self.build_request(tool_id) else {
+        // Readiness is a pure pre-flight: it must never consume the pending
+        // policy or ask about existing files.
+        let Ok(request) = self.build_request(tool_id, ConflictPolicy::Report) else {
             return;
         };
         let tool = crate::tools::tool_for(tool_id);
@@ -401,7 +419,11 @@ impl SparrowApp {
         }
     }
 
-    fn build_request(&mut self, tool_id: ToolId) -> Result<ToolRequest, ToolError> {
+    fn build_request(
+        &mut self,
+        tool_id: ToolId,
+        policy: ConflictPolicy,
+    ) -> Result<ToolRequest, ToolError> {
         let inputs = self.form.inputs.clone();
         let output = self.resolve_output(tool_id);
 
@@ -416,6 +438,7 @@ impl SparrowApp {
             output,
             options: self.form.options_for(tool_id).clone(),
             password,
+            conflict: policy,
         })
     }
 
@@ -453,7 +476,7 @@ impl SparrowApp {
             return parent;
         }
 
-        let suffix = output_suffix(tool_id);
+        let suffix = output_suffix_for(tool_id, self.form.options_for(tool_id));
         let ext = "pdf";
         parent.join(format!("{}{suffix}.{ext}", file_stem(&source)))
     }
@@ -529,17 +552,17 @@ impl SparrowApp {
             self.states.insert(
                 self.current,
                 TaskState::Failed {
-                    error: ToolError::UnsupportedFormat {
-                        path: None,
-                        detail,
-                    },
+                    error: ToolError::UnsupportedFormat { path: None, detail },
                 },
             );
             return;
         }
 
         panels::append_inputs(self.current, &mut self.form, filtered);
-        if matches!(self.states.get(&self.current), Some(TaskState::Failed { .. })) {
+        if matches!(
+            self.states.get(&self.current),
+            Some(TaskState::Failed { .. })
+        ) {
             self.states.insert(self.current, TaskState::Idle);
         }
     }
@@ -556,7 +579,7 @@ impl SparrowApp {
             ToolId::Split => panels::split::show(ui, form, preview),
             ToolId::Rotate => panels::rotate::show(ui, form, preview),
             ToolId::DeletePages => panels::delete_pages::show(ui, form, preview),
-            ToolId::Reorder => panels::reorder::show(ui, form, &mut self.reorder),
+            ToolId::Reorder => panels::reorder::show(ui, form, &mut self.reorder, preview),
             ToolId::Extract => panels::extract::show(ui, form, preview),
             ToolId::TextWatermark => panels::text_watermark::show(ui, form),
             ToolId::ImageWatermark => panels::image_watermark::show(ui, form),
@@ -580,9 +603,11 @@ impl eframe::App for SparrowApp {
 
         self.refresh_readiness();
 
-        let view = panel_view(self.current, &self.form, &self.reorder);
-        let action = status::show(ui, self.state(), &view);
-
+        // Sidebar first: it must keep its full height for the whole session.
+        // Creating the bottom bar first made every result banner eat ~120 pt off
+        // the tool list, so finishing a task pushed 加密与解密 / PDF 转图片 out of
+        // view. Declaring the sidebar first confines the bar to the content
+        // column, which is also where the reported result belongs.
         let dark = matches!(ctx.theme(), egui::Theme::Dark);
         let side = sidebar::show(ui, self.current, self.icon.as_ref(), dark);
         if let Some(dark) = side.theme {
@@ -596,11 +621,38 @@ impl eframe::App for SparrowApp {
                 self.states.insert(tool, TaskState::Idle);
             }
         }
+        if side.about {
+            self.about.show();
+        }
+
+        // Readiness is computed after a possible tool switch, so the action bar
+        // never shows the previous tool's state for a frame.
+        let view = panel_view(self.current, &self.form, &self.reorder);
+        // A task started from another tool keeps running here; the bar must
+        // explain why this panel cannot start instead of silently ignoring the
+        // click.
+        let busy_elsewhere = self
+            .worker
+            .as_ref()
+            .map(|(running, _)| *running)
+            .filter(|running| *running != self.current);
+        let action = status::show(ui, self.state(), &view, busy_elsewhere, self.session_policy);
 
         // CentralPanel last: it fills whatever the sidebar and bottom bar leave.
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
+        //
+        // The explicit margins give the content column a symmetric gutter;
+        // without them cards ran edge to edge into the window border and their
+        // right border disappeared under the scroll bar. The base frame stays
+        // `central_panel` (theme-aware fill): an empty `Frame::new()` leaves the
+        // panel unpainted and the window shows through unblended.
+        let frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin {
+            left: 16,
+            right: 16,
+            top: theme::GAP_M as i8,
+            bottom: theme::GAP_S as i8,
+        });
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading(self.current.label());
                 ui.add_space(theme::GAP_S);
                 ui.label(egui::RichText::new(self.current.description()).weak());
@@ -618,35 +670,41 @@ impl eframe::App for SparrowApp {
             PanelAction::Run => self.start(),
             PanelAction::Cancel => self.cancel(),
             PanelAction::RetryInDocuments => self.retry_in_documents(),
+            PanelAction::ClearConflictPolicy => {
+                self.session_policy = None;
+                crate::engine::logging::log("INFO", "已恢复同名文件「每次都询问」");
+            }
             PanelAction::None => {}
         }
 
-        if self.poll_worker() || self.state().is_busy() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // Drawn after every panel so the backdrop covers the whole window; the
+        // modal keeps its own foreground layer and blocks input to the tools
+        // underneath while it is open.
+        if self.about.open {
+            crate::ui::about::show(&ctx, &mut self.about, self.icon.as_ref());
         }
 
-        // TEMP: capture the rendered frame and exit once animations settled.
-        self.probe.frames += 1;
-        if self.probe.out.is_some() {
-            // egui stops repainting once idle; keep frames coming so the
-            // screenshot lands after animations settle.
-            ctx.request_repaint_after(std::time::Duration::from_millis(32));
-            if self.probe.frames == 60 {
-                let out = self.probe.out.clone().unwrap();
-                ctx.request_screenshot(move |img| {
-                    let w = img.size[0] as u32;
-                    let h = img.size[1] as u32;
-                    let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-                    let _ = image::save_buffer(
-                        &out,
-                        &bytes,
-                        w,
-                        h,
-                        image::ExtendedColorType::Rgba8,
-                    );
-                    std::process::exit(0);
-                });
+        // Same layer as the About modal, drawn after it so the more urgent
+        // question stays on top if both are somehow open.
+        let conflict_choice = crate::ui::conflict::show(&ctx, &mut self.conflict);
+        match conflict_choice {
+            crate::ui::conflict::ConflictChoice::None => {}
+            crate::ui::conflict::ConflictChoice::Cancel => {
+                let tool = self.conflict.tool.unwrap_or(self.current);
+                self.conflict.close();
+                crate::engine::logging::log("INFO", "用户取消了覆盖同名文件");
+                self.states.insert(tool, TaskState::Cancelled);
             }
+            crate::ui::conflict::ConflictChoice::Overwrite { remember } => {
+                self.answer_conflict(ConflictPolicy::Overwrite, remember);
+            }
+            crate::ui::conflict::ConflictChoice::Unique { remember } => {
+                self.answer_conflict(ConflictPolicy::Unique, remember);
+            }
+        }
+
+        if self.poll_worker() || self.state().is_busy() || self.worker.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 }
@@ -668,6 +726,19 @@ fn output_suffix(tool_id: ToolId) -> &'static str {
         ToolId::TextWatermark | ToolId::ImageWatermark => "_watermarked",
         ToolId::Encrypt => "_secured",
         _ => "_out",
+    }
+}
+
+/// [`output_suffix`] for tools whose suffix depends on the chosen action.
+///
+/// Decrypting used to land in `<name>_secured.pdf`, which reads as the
+/// opposite of what happened.
+fn output_suffix_for(tool_id: ToolId, options: &crate::tools::ToolOptions) -> &'static str {
+    match (tool_id, options) {
+        (ToolId::Encrypt, crate::tools::ToolOptions::Encrypt { encrypt: false, .. }) => {
+            "_decrypted"
+        }
+        _ => output_suffix(tool_id),
     }
 }
 
@@ -717,10 +788,7 @@ fn home_dir() -> Option<PathBuf> {
 /// The folder batch tool with its default (empty) output path writes into
 /// each folder itself; per-folder problems are tolerated and reported by the
 /// tool, so this check skips that case.
-fn preflight_output(
-    tool_id: ToolId,
-    request: &crate::tools::ToolRequest,
-) -> Result<(), ToolError> {
+fn preflight_output(tool_id: ToolId, request: &crate::tools::ToolRequest) -> Result<(), ToolError> {
     if request.output.as_os_str().is_empty() {
         return Ok(());
     }
@@ -777,9 +845,34 @@ fn configure_style(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(6.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
         style.spacing.interact_size = egui::vec2(40.0, 24.0);
+        // Sliders share one width so every option row lines up with the text
+        // inputs instead of leaving a 100 pt stub + floating value box.
+        style.spacing.slider_width = 280.0;
+        // Narrow, contrast-tuned scroll bars: the stock 12 pt solid bar read as
+        // a second divider inside the sidebar. Floating bars draw over the
+        // gutter the panels already leave free, so they never cover a border.
+        style.spacing.scroll = egui::style::ScrollStyle {
+            bar_width: 5.0,
+            foreground_color: true,
+            // Keep a faint handle even when idle: at the minimum window size
+            // the sidebar needs to scroll, and an invisible scroll bar made the
+            // last two tools look absent rather than below the fold.
+            dormant_handle_opacity: 0.35,
+            ..egui::style::ScrollStyle::default()
+        };
 
         // Snappier than the 0.2 s default; drives the sidebar crossfade.
         style.animation_time = 0.15;
+
+        // In dark mode egui fills the radio circle / checkbox square with
+        // gray(60) and draws no outline, which is invisible against the
+        // gray(27) panel: an unchecked option looked disabled. `bg_fill` is the
+        // checkbox background only (buttons use `weak_bg_fill`), so raising it
+        // brightens the option markers without restyling buttons.
+        if style.visuals.dark_mode {
+            style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(88);
+            style.visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(104);
+        }
 
         // One corner radius for every built-in control, so hand-styled chrome
         // and stock widgets agree.
@@ -817,7 +910,11 @@ fn install_cjk_fallback(ctx: &egui::Context) {
         ("simsun", r"C:\Windows\Fonts\simsun.ttc", 0),
         ("pingfang", "/System/Library/Fonts/PingFang.ttc", 0),
         ("hiragino", "/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
-        ("noto-cjk", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        (
+            "noto-cjk",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            0,
+        ),
     ];
 
     for (name, path, index) in CANDIDATES {

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::engine::{pdf_io, validate};
 use crate::model::{PageRangeMode, ToolError, ToolId, ToolOutcome};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel, ensure_dir,
+    check_cancel, ensure_dir, CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct Split;
@@ -84,7 +84,10 @@ impl Tool for Split {
                 .map(|p| (format!("{stem}_p{p:03}.pdf"), vec![p]))
                 .collect(),
             PageRangeMode::Explicit => {
-                vec![(format!("{stem}_part1.pdf"), pdf_io::parse_pages(&spec, total)?)]
+                vec![(
+                    format!("{stem}_part1.pdf"),
+                    pdf_io::parse_pages(&spec, total)?,
+                )]
             }
             PageRangeMode::EveryN => (0..total)
                 .step_by(every_n)
@@ -99,18 +102,22 @@ impl Tool for Split {
                 .collect(),
         };
 
+        // Every target name is known before the first file is written, so a
+        // clash is reported once for the whole run instead of mid-way through.
+        let planned: Vec<PathBuf> = groups.iter().map(|(name, _)| out_dir.join(name)).collect();
+        let targets = pdf_io::resolve_outputs(&planned, req.conflict)?;
+
         let mut outputs: Vec<PathBuf> = Vec::with_capacity(groups.len());
-        for (index, (name, pages)) in groups.iter().enumerate() {
+        for (index, ((_, pages), out)) in groups.iter().zip(targets).enumerate() {
             check_cancel(cancel)?;
             progress.report(
                 index as f32 / groups.len() as f32,
                 format!("生成第 {}/{} 个文件", index + 1, groups.len()),
             );
 
-            let out = out_dir.join(name);
             let mut dest = pdf_io::new_document();
             pdf_io::copy_pages(&mut dest, &source, pages)?;
-            pdf_io::save_document(&mut dest, &out)?;
+            pdf_io::save_document(&mut dest, &out, req.conflict)?;
             validate::assert_page_count(&out, pages.len() as u32, None)?;
             outputs.push(out);
         }
@@ -161,6 +168,17 @@ pub(crate) fn single_input(req: &ToolRequest) -> Result<&Path, ToolError> {
             detail: "请先选择一个 PDF 文件".to_string(),
         }),
     }
+}
+
+/// Reject a document with no pages before a tool claims it processed it.
+pub(crate) fn ensure_not_empty(total: u32, path: &Path) -> Result<(), ToolError> {
+    if total == 0 {
+        return Err(ToolError::UnsupportedFormat {
+            path: Some(path.to_path_buf()),
+            detail: "文档没有页面".to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_pdf(path: &Path) -> Result<(), ToolError> {

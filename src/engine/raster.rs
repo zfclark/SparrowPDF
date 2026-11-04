@@ -71,8 +71,8 @@ impl Pixmap {
         let mut rgb = Vec::with_capacity((self.width as usize) * (self.height as usize) * 3);
         for chunk in self.data.chunks_exact(4) {
             let a = chunk[3] as f32 / 255.0;
-            for c in 0..3 {
-                let v = chunk[c] as f32 * a + 255.0 * (1.0 - a);
+            for &channel in &chunk[..3] {
+                let v = channel as f32 * a + 255.0 * (1.0 - a);
                 rgb.push(v.round().clamp(0.0, 255.0) as u8);
             }
         }
@@ -181,14 +181,21 @@ impl Matrix {
     }
 
     /// `self * other` — applies `other` first, then `self` (PDF convention).
+    ///
+    /// `apply` uses the column-vector form `x' = a·x + c·y + e`,
+    /// `y' = b·x + d·y + f`, so the product must be the plain matrix product of
+    /// the two column-vector matrices. Mixing the two conventions here made
+    /// every composed transform (`cm` before `Do`/`Tj`, page `/Rotate`,
+    /// form-XObject `/Matrix`) collapse: the translation term of `other` was
+    /// scaled by `self`'s translation instead of its rotation.
     pub fn mul(&self, other: &Matrix) -> Matrix {
         Matrix {
-            a: self.a * other.a + self.b * other.c,
-            b: self.a * other.b + self.b * other.d,
-            c: self.c * other.a + self.d * other.c,
-            d: self.c * other.b + self.d * other.d,
-            e: self.e * other.a + self.f * other.c + other.e,
-            f: self.e * other.b + self.f * other.d + other.f,
+            a: self.a * other.a + self.c * other.b,
+            b: self.b * other.a + self.d * other.b,
+            c: self.a * other.c + self.c * other.d,
+            d: self.b * other.c + self.d * other.d,
+            e: self.a * other.e + self.c * other.f + self.e,
+            f: self.b * other.e + self.d * other.f + self.f,
         }
     }
 
@@ -222,17 +229,18 @@ fn fill_rule(pixmap: &mut Pixmap, path: &Path, color: [f32; 4], even_odd: bool) 
         return;
     }
 
-    // Gather edges once. Filled contours are implicitly closed.
+    // Gather edges once. A fill closes every subpath implicitly, whether or
+    // not the path was built with `close`: skipping the wrap-around edge for
+    // closed contours dropped exactly one edge per shape, which left
+    // axis-aligned rectangles (a PDF `re`) with a single crossing edge and
+    // therefore no fill at all.
     let mut edges: Vec<(f32, f32, f32, f32, i32)> = Vec::new();
-    for (index, contour) in path.contours.iter().enumerate() {
+    for contour in path.contours.iter() {
         if contour.len() < 2 {
             continue;
         }
-        let closed = path.closed.get(index).copied().unwrap_or(false);
         let mut points = contour.clone();
-        if !closed {
-            points.push(contour[0]);
-        }
+        points.push(contour[0]);
         for pair in points.windows(2) {
             let (x0, y0) = pair[0];
             let (x1, y1) = pair[1];
@@ -261,10 +269,17 @@ fn fill_rule(pixmap: &mut Pixmap, path: &Path, color: [f32; 4], even_odd: bool) 
         .ceil()
         .min(pixmap.height as f32) as i64;
 
+    // Coverage of the row being scanned, accumulated over the vertical
+    // sub-samples and blended exactly once per pixel. Blending per sub-sample
+    // would compose the same colour four times (1 - (1 - 1/4)^4 ≈ 0.68), so
+    // solid areas came out ~30% too light.
+    let mut coverage = vec![0.0f32; pixmap.width as usize];
+
     for y in min_y..max_y {
         if y < 0 || y >= pixmap.height as i64 {
             continue;
         }
+        coverage.iter_mut().for_each(|c| *c = 0.0);
         for s in 0..SAMPLES {
             let sy = y as f32 + (s as f32 + 0.5) / SAMPLES as f32;
             let spans = if even_odd {
@@ -291,9 +306,13 @@ fn fill_rule(pixmap: &mut Pixmap, path: &Path, color: [f32; 4], even_odd: bool) 
                     if overlap <= 0.0 {
                         continue;
                     }
-                    let coverage = overlap.clamp(0.0, 1.0) / SAMPLES as f32;
-                    pixmap.blend(x as u32, y as u32, color, coverage);
+                    coverage[x as usize] += overlap.clamp(0.0, 1.0) / SAMPLES as f32;
                 }
+            }
+        }
+        for (x, cov) in coverage.iter().enumerate() {
+            if *cov > 0.0 {
+                pixmap.blend(x as u32, y as u32, color, cov.min(1.0));
             }
         }
     }
@@ -398,12 +417,7 @@ pub fn stroke(pixmap: &mut Pixmap, path: &Path, color: [f32; 4], width: f32) {
 }
 
 /// Draw an axis-aligned image into the pixmap, sampling nearest-neighbour.
-pub fn draw_image(
-    pixmap: &mut Pixmap,
-    image: &ImageRgba,
-    corners: [Point; 4],
-    alpha: f32,
-) {
+pub fn draw_image(pixmap: &mut Pixmap, image: &ImageRgba, corners: [Point; 4], alpha: f32) {
     if image.width == 0 || image.height == 0 || alpha <= 0.0 {
         return;
     }
@@ -459,4 +473,49 @@ pub struct ImageRgba {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Matrix;
+
+    /// `mul` must compose in the same convention `apply` evaluates, otherwise
+    /// any `cm` / `/Rotate` / form matrix lands the geometry somewhere else
+    /// (images ended up a whole page-height below the page and rendered blank).
+    #[test]
+    fn matrix_mul_matches_apply_order() {
+        let base = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 595.28);
+        let cm = Matrix::new(824.0, 0.0, 0.0, 595.28, 8.0, 0.0);
+
+        // `self * other` applies `other` first.
+        let composed = base.mul(&cm);
+        let p = composed.apply((0.0, 0.0));
+        assert!((p.0 - 8.0).abs() < 0.01, "x = {}", p.0);
+        assert!((p.1 - 595.28).abs() < 0.01, "y = {}", p.1);
+
+        let p = composed.apply((1.0, 1.0));
+        assert!((p.0 - 832.0).abs() < 0.01, "x = {}", p.0);
+        assert!(p.1.abs() < 0.01, "y = {}", p.1);
+    }
+
+    #[test]
+    fn matrix_mul_rotation_maps_the_page_box() {
+        // A 841.89 x 595.28 page with /Rotate 90: the visual box is
+        // 595.28 x 841.89, which is what `render_page` feeds the base matrix.
+        let base = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 841.89);
+        let rotate = Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 841.89);
+        let composed = base.mul(&rotate);
+        // User-space origin is the bottom-right corner of the visual box.
+        let p = composed.apply((0.0, 0.0));
+        assert!(
+            (p.0 - 0.0).abs() < 0.01 && (p.1 - 0.0).abs() < 0.01,
+            "{p:?}"
+        );
+        // (841.89, 0) runs up the left edge of the rotated page.
+        let p = composed.apply((841.89, 0.0));
+        assert!(
+            (p.0 - 0.0).abs() < 0.05 && (p.1 - 841.89).abs() < 0.05,
+            "{p:?}"
+        );
+    }
 }

@@ -1,18 +1,17 @@
-//! Tool 11: PDF to images, using the pure-Rust rasterizer.
+//! Tool 11: PDF to images, using the built-in rasterizer.
 //!
-//! Priority per the spec: oxidize-pdf, then oxpdf-render, then lopdf + a manual
-//! rasterizer. Neither `oxidize-pdf` (which documents that page rasterization
-//! needs an external renderer) nor `oxpdf-render` (not published) can rasterize,
-//! so the manual path in `engine::render` is used. If that fails, the tool
-//! returns an internal error — it never falls back to PDFium.
+//! Every page is rasterized in-process by `engine::render` and encoded with the
+//! `image` crate; a page that cannot be rendered fails the page with a
+//! readable message instead of producing a silently blank file.
 
 use std::path::PathBuf;
 
 use crate::engine::{pdf_io, render, validate};
 use crate::model::{ImageFormat, ToolError, ToolId, ToolOutcome};
 use crate::tools::{
-    CancelFlag, Progress, Tool, ToolOptions, ToolRequest, check_cancel, ensure_dir,
+    check_cancel, ensure_dir,
     split::{ensure_pdf, single_input},
+    CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct PdfToImage;
@@ -73,9 +72,18 @@ impl Tool for PdfToImage {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "page".to_string());
 
+        // Plan every image path first: a collision must be reported before the
+        // first page is rasterized (rendering a 300 DPI document is slow).
+        let planned: Vec<PathBuf> = pages
+            .iter()
+            .map(|(page_num, _)| {
+                out_dir.join(format!("{stem}_p{page_num:03}.{}", format.extension()))
+            })
+            .collect();
+        let targets = pdf_io::resolve_outputs(&planned, req.conflict)?;
         let mut outputs: Vec<PathBuf> = Vec::with_capacity(pages.len());
 
-        for (index, (page_num, page_id)) in pages.iter().enumerate() {
+        for (index, ((page_num, page_id), out)) in pages.iter().zip(targets).enumerate() {
             check_cancel(cancel)?;
             progress.report(
                 index as f32 / pages.len() as f32,
@@ -97,15 +105,18 @@ impl Tool for PdfToImage {
                 detail: format!("第 {page_num} 页编码失败：{e}"),
             })?;
 
-            let out = out_dir.join(format!("{stem}_p{page_num:03}.{}", format.extension()));
-            pdf_io::write_file(&out, &bytes)?;
+            pdf_io::write_file(&out, &bytes, req.conflict)?;
             validate::assert_image(&out, width, height)?;
             outputs.push(out);
         }
 
         progress.report(1.0, "完成".to_string());
         Ok(ToolOutcome::success(
-            format!("已导出 {} 张 {} 图片（{dpi} DPI）", outputs.len(), format.label()),
+            format!(
+                "已导出 {} 张 {} 图片（{dpi} DPI）",
+                outputs.len(),
+                format.label()
+            ),
             outputs,
         ))
     }
