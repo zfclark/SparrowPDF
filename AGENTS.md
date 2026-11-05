@@ -38,7 +38,7 @@
 | 界面   | egui / eframe 0.37，Glow 后端，无 WebView         |
 | 数据流  | **纯本地**：不联网、不上传、无遥测、无账号体系                    |
 | 工具数  | 12 项，分组：生成 2 / 结构操作 6 / 页面编辑 2 / 安全 1 / 转换 1 |
-| 安装形态 | 绿色 exe（Windows）、`.app` 打包为 DMG（macOS）        |
+| 安装形态 | 绿色 exe（Windows x64 / arm64）、`.app` 打包为 DMG（macOS 通用版） |
 
 破坏性约束（任何改动都不得违反）：
 
@@ -81,7 +81,7 @@ SparrowPDF/
 ├── tests/integration.rs  # 端到端集成测试（不启动 GUI，直接调 Tool）
 ├── README.md             # 面向用户的功能与安装说明
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
-└── .github/workflows/    # 发布流水线（tag 触发，构建双平台并产出 Release）
+└── .github/workflows/    # 发布流水线（tag 触发，产出 Windows x64 / arm64 与 macOS 通用版）
 ```
 
 本地开发期目录（**不入库**，已在 `.gitignore` 中）：`target/`、`.probe/`（截图与调试素材）、`.workbuddy/`（本机代理工作数据）。
@@ -498,6 +498,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 - 位置：仓库根目录 `CHANGELOG.md`，格式遵循 **Keep a Changelog 1.1.0**。
 - 版本号遵循本文件 8.3 节的五位规则（`V主.副.修订.YYYYMMDD`），不采用 SemVer 作为对外版本号。
 - 唯一事实来源是**已合并到 `main` 的提交与 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
+- 发布流水线按 tag 原样截取对应版本条目（`## [V主.副.修订.YYYYMMDD]` 到下一个二级标题为止），作为 GitHub Release 的更新说明；条目缺了 guard 直接失败，所以每条必须独立可读、不依赖上下文。
 - 顺序：新版本在上；未发布内容置于 `[Unreleased]`。
 
 ### 8.2 变更分类（固定六类，顺序不变）

@@ -1,382 +1,458 @@
 # 轻雀 PDF 发布流水线
 #
-# 本文件由用户提供的 release 副本合并而来，采信原则：结构、步骤与行为以副本
-# 为准；版本与构建环境按「官方推荐 + 可复现」另行确定（见「二」）。以下是
-# 取舍记录。
+# 触发
+#   · 推 tag 自动运行：tag 必须是 V主.副.修订.YYYYMMDD，如 V0.5.0.20261104。
+#   · 手动重跑某个 tag：gh workflow run release.yml --ref V0.5.0.20261104
+#     （网页的 Run workflow 面板只能选分支，选不了 tag；REST dispatches 的 ref
+#     同样可用）。手动触发执行的是「所选 tag 上的工作流文件」，所以改了流程
+#     要生效，必须先出新 tag。
+#   · 版本号一律从 ref 现算（github.ref_name），没有手工输入；非 tag 的 ref 在
+#     guard 第一步就失败。
 #
-# 一、按副本修正的四处（现有文件原本是错的或不完整的）
-#   1. tag 过滤器：'v[0-9]+.[0-9]+.[0-9]+' → 'V[0-9]*.[0-9]*.[0-9]*.[0-9]*'。
-#      Actions 的 tag 过滤是 glob 不是正则，'+' 在那里的含义是字面加号，等于
-#      要求 tag 里真的出现 '+'——推 V0.4.2.20261104 根本不会触发流水线。放宽成
-#      '*' 才对；严格性由 guard 里的 grep -E 兜住（格式 + 日期位必须是 8 位），
-#      glob 放宽不会放过非法 tag（只影响「能否触发」，不影响「触发后是否合规」）。
-#   2. 可达性检查：'$TAG' → HEAD。checkout 已按 ref 检出到 tag 指向的提交，
-#      HEAD 与之等价；而 workflow_dispatch 手填的 tag 在本地未必有同名 ref
-#      （fetch-depth: 0 保证的是远端分支），用 HEAD 不会偶发失败。
-#   3. DMG 兜底命令：现有第二条 hdiutil 缺 -o，产物名不受控；副本两条都带 -o。
-#   4. UPX 下载：-sSL → -fsSL（4xx/5xx 直接失败，不会把错误页当 zip 存下来），
-#      Expand-Archive 补 -Force（覆盖上一次的解压目录）。
+# 产物
+#   SparrowPDF-windows-x64.exe / SparrowPDF-windows-arm64.exe /
+#   SparrowPDF-macos-universal.dmg（macOS 11+，Intel 与 Apple Silicon 通用）
+#   Release 的更新说明取自 CHANGELOG.md 里 `## [V主.副.修订.YYYYMMDD]` 那一条，
+#   原样搬运，不生成机器摘要；条目缺失会在 guard 阶段失败。
 #
-# 二、版本策略：动作跟随官方推荐，工具链钉死
-#   1. 第三方动作取各仓库当前推荐的大版本（既是官方 README 的示例版本，也是
-#      仍在维护的最新稳定大版本，不是预发布）：
-#        actions/checkout@v7          actions/cache@v6
-#        actions/upload-artifact@v7   actions/download-artifact@v8
-#        softprops/action-gh-release@v3            UPX 5.3.0
-#      构建要求：checkout v5 起改用 node24 运行时，需要 Actions Runner
-#      ≥ 2.327.1；本流水线只用 GitHub 托管 runner（满足），不涉及自建 runner。
-#      附带收益：v5+ 默认拒绝在 pull_request_target / workflow_run 触发时为 fork
-#      代码做检出（须显式 allow-unsafe-pr-checkout 才放开）。本流水线只有 tag
-#      与手动触发，用不到这条，但少了日后被人改成 PR 触发时的隐患。
-#   2. Rust 工具链固定 1.97.1，不用 @stable：
-#      · 符合构建要求：Cargo.toml 声明 rust-version = 1.95，1.97.1 满足且有余量；
-#        本项目的开发与全部实测（19 个集成测试、发布构建、release 产物体积
-#        校验）都在这个版本上完成，CI 与本地完全一致，不会有「本地能编、CI 报
-#        错」的漂移。
-#      · 稳定优先：@stable 是滚动标签，某次升级带来的新 lint 或新默认值就可能
-#        让流水线在没有任何代码改动时失败；钉死版本才能保证同一个 tag 在任何
-#        时候重跑都得到同样的产物。
-#      · @1.97.1 是 dtolnay/rust-toolchain 为该版本维护的分支（同时锁住 action
-#        代码），with.toolchain 再显式写一次，防止分支默认值变化。
-#   3. 维护节奏：动作在官方发布新大版本且旧版进入弃用期时升一档；Rust 在需要
-#      新特性或安全修复时升到当时的补丁版，并同步更新本注释。
-#   4. runner 标签保持 ubuntu-latest / windows-latest / macos-latest：日期化
-#      镜像（如 windows-2022）被 GitHub 退役后会直接不可用，反而降低可用性；
-#      真正决定产物的是上面的工具链，已经钉死。
-#
-# 三、合并与删除（4 个 job；step 由 21 → 22，净增 1 个，但重复与空跑都减少了）
-#   * tag 解析与版本解析合并为一个 step，且把 tag 也做成 job output：下游 4 处
-#     '${{ github.event.inputs.tag || github.ref_name }}' 收敛为
-#     '${{ needs.guard.outputs.tag }}'，全文件该表达式由 7 处降到 3 处（剩下 3 处
-#     都在 guard 自己身上——outputs 尚未产出，只能现算）。影响：改取值逻辑只需
-#     改一处；guard 是两个 build job 的 needs，不存在「输出还没算出来就用」的
-#     时序问题。
-#   * Cargo.lock 一致性校验并入原有的「tag 与 Cargo.toml 一致」step，三条校验
-#     共享一次读取；这一步本身就是放错位置的失败拦截。
-#   * 删除 macOS 两个切片后的显式 strip（共两条命令）：Cargo.toml 的
-#     [profile.release] strip = true 已在链接期完成同样工作，Windows 侧也仅依赖
-#     该设置、没有额外 strip。删除后通用二进制体积不变，25 MB 上限继续守着体积
-#     回退，只是少两次对 10 MB 级二进制的整文件重写。
-#   * Windows 调试段扫描改为单次字符串查找：原实现是逐字节 × 逐字符的嵌套循环
-#     （12 MB 量级要上亿次比较，PowerShell 里几十秒），换成一次 ASCII 解码 +
-#     Contains，语义相同、耗时降到毫秒级。
-#   * guard 新增「打包资源齐全」与「Cargo.lock 版本同步」两条 fail-fast（这就是
-#     step 净增的那 1 个）：原本要等 macOS 编译十几分钟、或 --locked 构建失败才
-#     暴露的问题，现在 10 秒内报错，省掉两个 runner 的空跑。
-#   * 权限收敛：workflow 级 contents: read，仅 publish 提权到 write。
-#   * 每个 job 加 timeout-minutes，避免卡住的 runner 吃掉 6 小时默认上限。
-#
-# 四、仓库布局
-#   .github/workflows/ 下只保留本文件。「release - 副本.yml」同样是合法
-#   workflow 文件名，会与本文件抢同一个 tag 触发（同一 concurrency 组只会
-#   串行，第二个照样重复创建 Release），已移到 .probe/ 作为存档。
+# 改这个文件前需要知道的几条
+#   · 工具链钉死 Rust 1.97.1。dtolnay/rust-toolchain 的分支名即版本，action.yml
+#     只声明 targets / target / components，写 with.toolchain 会被忽略并报
+#     "Unexpected input(s)"；升级就是换 @x.y.z 标签，两处一起改。
+#   · Windows 两个架构走同一份矩阵步骤。两个 exe 都叫 sparrowpdf.exe，上传前
+#     必须按架构重命名，否则 download-artifact 的 merge-multiple 会互相覆盖。
+#   · macOS 的 MACOSX_DEPLOYMENT_TARGET=11.0 必须与 Info.plist 的
+#     LSMinimumSystemVersion 一致；hdiutil 的 UDZO 只能配 HFS+；签名之后必须
+#     codesign --verify，否则坏包会以绿勾发出去。
+#   · guard 是所有构建 job 的 needs，只做只读校验（tag 格式、与 Cargo.toml /
+#     Cargo.lock / version.rs 一致、打包资源齐全），让错误在 10 秒内暴露，
+#     而不是等 macOS 编完十几分钟。
+#   · 权限默认 contents: read，只有 publish 提权到 write。
+#   · 免费版限额：并发 20 作业、单作业 6 小时、矩阵 256 作业、缓存 10 GB。
+#     本流水线最多 5 个作业、每个 ≤60 分钟，均在限额内；公开仓库的标准 runner
+#     不计费。macOS runner 排队没有优先级，遇到排队超时被取消，用界面的
+#     Re-run failed jobs 重跑即可。
 
 name: 🚀 版本构建发布
 
 on:
-  push:
-    tags: ["V[0-9]*.[0-9]*.[0-9]*.[0-9]*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "要构建的已有 tag（如 V0.4.2.20261104）"
-        required: true
+    push:
+        tags: ["V[0-9]*.[0-9]*.[0-9]*.[0-9]*"]
+    # 无输入：构建哪个版本，由运行在哪个 ref 上决定（用法见文件头「触发」）。
+    workflow_dispatch:
 
 permissions:
-  contents: read
+    contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
-  cancel-in-progress: false
+    # 同一 tag 的两次运行串行，避免两条流水线同时建 Release。手动触发时
+    # ref_name 就是所选的 tag，与推 tag 天然落到同一组。
+    group: release-${{ github.ref_name }}
+    cancel-in-progress: false
 
 env:
-  CARGO_TERM_COLOR: always
+    CARGO_TERM_COLOR: always
 
 jobs:
-  guard:
-    name: 🔍 发布前校验
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      version: ${{ steps.ver.outputs.version }}
-      date: ${{ steps.ver.outputs.date }}
-      tag: ${{ steps.ver.outputs.tag }}
-    steps:
-      - name: 检出 tag 提交
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
-          fetch-depth: 0
+    guard:
+        name: 🔍 发布前校验
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        outputs:
+            version: ${{ steps.ver.outputs.version }}
+            date: ${{ steps.ver.outputs.date }}
+            tag: ${{ steps.ver.outputs.tag }}
+        steps:
+            # 必须先钉住触发来源：push 只会在 tag 上触发，但 workflow_dispatch 可以在
+            # 任意分支上误点。这里先拦一道，10 秒内给出正确用法，而不是拿着分支名
+            # 去猜版本、或者在 guard 末尾才因为格式不符报一个看不懂的错。
+            - name: 校验触发来源是 tag
+              run: |
+                  if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+                    echo "::error::本流水线必须在 tag 上运行（当前 ref_type=${GITHUB_REF_TYPE}，ref=${GITHUB_REF}）"
+                    echo "::error::手动运行请把 tag 指定为 ref：gh workflow run release.yml --ref V0.5.0.20261104"
+                    exit 1
+                  fi
+                  echo "运行 ref：${GITHUB_REF_NAME}（tag）"
 
-      - name: 解析 tag 与版本号
-        id: ver
-        run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          # 五位版本 V主.副.修订.日期：去掉 V 前缀与最后一段，即 Cargo 版本。
-          CORE="${TAG#V}"
-          CORE="${CORE%.*}"
-          {
-            echo "tag=$TAG"
-            echo "version=$CORE"
-            echo "date=${TAG##*.}"
-          } >> "$GITHUB_OUTPUT"
-          echo "构建 $TAG（Cargo 版本 $CORE，日期位 ${TAG##*.}）"
+            # 不写 ref：默认检出触发用的那个 ref，也就是这个 tag 本身。
+            - name: 检出 tag 提交
+              uses: actions/checkout@v7
+              with:
+                  # merge-base 对比 origin/main 需要完整历史
+                  fetch-depth: 0
 
-      - name: 校验 tag 格式，且与 Cargo.toml / Cargo.lock / version.rs 一致
-        run: |
-          TAG="${{ steps.ver.outputs.tag }}"
-          V="${{ steps.ver.outputs.version }}"
-          D="${{ steps.ver.outputs.date }}"
-          if ! printf '%s' "$TAG" | grep -Eq '^V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]{8}$'; then
-            echo "::error::tag $TAG 不符合 V主.副.修订.YYYYMMDD 格式"; exit 1
-          fi
-          CARGO_V="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$CARGO_V" != "$V" ]; then
-            echo "::error::Cargo.toml 版本 $CARGO_V 与 tag 前三段 ${V} 不一致"; exit 1
-          fi
-          # 锁文件版本没跟上时，--locked 构建会在几分钟后才失败；这里先拦下来。
-          LOCK_V="$(grep -A1 '^name = "sparrowpdf"$' Cargo.lock \
-            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
-          if [ "$LOCK_V" != "$V" ]; then
-            echo "::error::Cargo.lock 里 sparrowpdf 是 $LOCK_V，与 tag 前三段 ${V} 不一致（本地跑一次 cargo check 同步锁文件再提交）"; exit 1
-          fi
-          # 日期位是产品版本的一部分：tag 与源码里的日期不一致，装出来的
-          # 关于页就会和 tag 对不上，属于必须拦下的版本漂移。
-          SRC_D="$(sed -n 's/^pub const DATE: &str = "\(.*\)";$/\1/p' src/version.rs | head -1)"
-          if [ "$SRC_D" != "$D" ]; then
-            echo "::error::src/version.rs 的日期位 $SRC_D 与 tag 的 $D 不一致（发布当天更新 version.rs）"; exit 1
-          fi
+            - name: 解析 tag 与版本号
+              id: ver
+              run: |
+                  TAG="${GITHUB_REF_NAME}"
+                  # 五位版本 V主.副.修订.日期：去掉 V 前缀与最后一段，即 Cargo 版本。
+                  CORE="${TAG#V}"
+                  CORE="${CORE%.*}"
+                  {
+                    echo "tag=$TAG"
+                    echo "version=$CORE"
+                    echo "date=${TAG##*.}"
+                  } >> "$GITHUB_OUTPUT"
+                  echo "构建 $TAG（Cargo 版本 $CORE，日期位 ${TAG##*.}）"
 
-      - name: 确认 tag 已合入 main
-        run: |
-          git fetch origin main --quiet
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "::error::当前提交不在 main 分支上"; exit 1
-          fi
+            - name: 校验 tag 格式，且与 Cargo.toml / Cargo.lock / version.rs 一致
+              run: |
+                  TAG="${{ steps.ver.outputs.tag }}"
+                  V="${{ steps.ver.outputs.version }}"
+                  D="${{ steps.ver.outputs.date }}"
+                  if ! printf '%s' "$TAG" | grep -Eq '^V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]{8}$'; then
+                    echo "::error::tag $TAG 不符合 V主.副.修订.YYYYMMDD 格式"; exit 1
+                  fi
+                  CARGO_V="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+                  if [ "$CARGO_V" != "$V" ]; then
+                    echo "::error::Cargo.toml 版本 $CARGO_V 与 tag 前三段 ${V} 不一致"; exit 1
+                  fi
+                  # 锁文件版本没跟上时，--locked 构建会在几分钟后才失败；这里先拦下来。
+                  LOCK_V="$(grep -A1 '^name = "sparrowpdf"$' Cargo.lock \
+                    | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
+                  if [ "$LOCK_V" != "$V" ]; then
+                    echo "::error::Cargo.lock 里 sparrowpdf 是 $LOCK_V，与 tag 前三段 ${V} 不一致（本地跑一次 cargo check 同步锁文件再提交）"; exit 1
+                  fi
+                  # 日期位是产品版本的一部分：tag 与源码里的日期不一致，装出来的
+                  # 关于页就会和 tag 对不上，属于必须拦下的版本漂移。
+                  SRC_D="$(sed -n 's/^pub const DATE: &str = "\(.*\)";$/\1/p' src/version.rs | head -1)"
+                  if [ "$SRC_D" != "$D" ]; then
+                    echo "::error::src/version.rs 的日期位 $SRC_D 与 tag 的 $D 不一致（发布当天更新 version.rs）"; exit 1
+                  fi
+                  # 发布页的「更新说明」直接取 CHANGELOG 里这一版的条目，缺了就没有
+                  # 可发的内容；在这里拦下，省得等两个 runner 跑完才在 publish 报错。
+                  if ! grep -qF "## [$TAG]" CHANGELOG.md; then
+                    echo "::error::CHANGELOG.md 缺少 ## [$TAG] 条目（发布页的更新说明取自这里）"; exit 1
+                  fi
 
-      - name: 校验打包资源齐全
-        run: |
-          MISSING=0
-          for f in assets/app.ico assets/app.icns; do
-            if [ ! -s "$f" ]; then
-              echo "::error::缺少打包资源 $f（Windows 图标由 build.rs 嵌入，macOS 图标由打包步骤复制）"
-              MISSING=1
-            fi
-          done
-          exit "$MISSING"
+            - name: 确认 tag 已合入 main
+              run: |
+                  git fetch origin main --quiet
+                  if ! git merge-base --is-ancestor HEAD origin/main; then
+                    echo "::error::当前提交不在 main 分支上"; exit 1
+                  fi
 
-  build-windows:
-    name: 🖥️ Windows x64
-    needs: guard
-    runs-on: windows-latest
-    timeout-minutes: 60
-    steps:
-      - name: 检出 tag 提交
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.guard.outputs.tag }}
+            - name: 校验打包资源齐全
+              run: |
+                  MISSING=0
+                  for f in assets/app.ico assets/app.icns; do
+                    if [ ! -s "$f" ]; then
+                      echo "::error::缺少打包资源 $f（Windows 图标由 build.rs 嵌入，macOS 图标由打包步骤复制）"
+                      MISSING=1
+                    fi
+                  done
+                  exit "$MISSING"
 
-      - name: 安装 Rust（固定 1.97.1）
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          toolchain: "1.97.1"
-          targets: x86_64-pc-windows-msvc
+    build-windows:
+        name: 🖥️ Windows ${{ matrix.arch }}
+        needs: guard
+        runs-on: windows-latest
+        timeout-minutes: 60
+        # x64 与 arm64 只差一个三元组，因此用矩阵而不是复制一份 job：矩阵保证
+        # 两个架构走完全相同的步骤（编译、清单校验、体积上限、重命名），不会出现
+        # 「新加的架构少校验了一步」这种只在发布之后才被发现的问题。
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: x64
+                      rust_target: x86_64-pc-windows-msvc
+                      asset: SparrowPDF-windows-x64.exe
+                    - arch: arm64
+                      rust_target: aarch64-pc-windows-msvc
+                      asset: SparrowPDF-windows-arm64.exe
+        steps:
+            - name: 检出 tag 提交
+              uses: actions/checkout@v7
+              with:
+                  ref: ${{ needs.guard.outputs.tag }}
 
-      - name: 缓存依赖
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+            - name: 安装 Rust（固定 1.97.1）
+              uses: dtolnay/rust-toolchain@1.97.1
+              with:
+                  # 版本由 @1.97.1 这个分支本身决定：该分支把 toolchain 写死在
+                  # action.yml 的 env 里，声明的输入只有 targets/target/components
+                  # 三个。多传一个 with.toolchain 会被忽略，还会触发
+                  # "Unexpected input(s)" 警告（编辑器把整行标红）。
+                  targets: ${{ matrix.rust_target }}
 
-      - name: 🔨 编译 release
-        run: cargo build --release --locked
+            - name: 缓存依赖
+              uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  # 两个矩阵 job 的 runner.os 都是 Windows，键里必须带架构：否则它们
+                  # 抢同一个缓存键，后保存的一方被拒绝，恢复时还可能拿到另一架构的
+                  # target/ 白解压一遍。
+                  key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-
 
-      - name: 🔎 校验清单、调试段与体积
-        shell: pwsh
-        run: |
-          $exe = "target/release/sparrowpdf.exe"
-          if (-not (Test-Path $exe)) { throw "找不到 exe" }
-          $bytes = [System.IO.File]::ReadAllBytes($exe)
-          # 一次解码后查找子串：原来的逐字节 × 逐字符双循环在 12 MB 上要做
-          # 上亿次比较，PowerShell 里往往要几十秒。
-          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-          if ($text.Contains(".debug_")) {
-            throw "release exe 里仍有 .debug_ 段（检查 Cargo.toml 的 strip 配置）"
-          }
-          # 提权清单是 v0.4.1 起的产品行为：写受保护目录依赖它。build.rs 或
-          # 构建方式一变就可能被静默丢掉，那样发出去的包会悄悄降权。
-          if (-not $text.Contains("requireAdministrator")) {
-            throw "exe 缺少 requireAdministrator 清单（检查 build.rs 的 winresource 配置）"
-          }
-          $mb = [math]::Round($bytes.Length / 1MB, 2)
-          if ($bytes.Length -gt 20MB) { throw "exe 为 $mb MB，超过 20 MB 上限（UPX 前）" }
-          Write-Host "exe 正常：$mb MB，无调试段，清单完整"
+            - name: 🔨 编译 release
+              run: cargo build --release --locked --target ${{ matrix.rust_target }}
 
-      - name: 🗜️ UPX 压缩（失败不中断）
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          Copy-Item target/release/sparrowpdf.exe upx-input.exe -Force
-          curl.exe -fsSL -o upx.zip https://github.com/upx/upx/releases/download/v5.3.0/upx-5.3.0-win64.zip
-          Expand-Archive upx.zip -DestinationPath upx -Force
-          & (Get-ChildItem upx -Recurse -Filter upx.exe).FullName --best target/release/sparrowpdf.exe
-          # UPX 会重写节表与资源目录；万一它吃掉 RT_MANIFEST，exe 就不再请求
-          # 管理员权限。这种概率很低，但代价是产品行为变了，所以压缩后复查，
-          # 丢清单就回退到未压缩版本（本步骤 continue-on-error，不会拦住发布）。
-          $after = [System.IO.File]::ReadAllBytes("target/release/sparrowpdf.exe")
-          if (-not [System.Text.Encoding]::ASCII.GetString($after).Contains("requireAdministrator")) {
-            Write-Warning "UPX 后清单丢失，回退到未压缩版本"
-            Copy-Item upx-input.exe target/release/sparrowpdf.exe -Force
-          }
-          $sz = (Get-Item target/release/sparrowpdf.exe).Length
-          if ($sz -gt 12MB) { Write-Warning "UPX 后为 $([math]::Round($sz/1MB,2)) MB，超过 12 MB 目标" }
-          Remove-Item upx-input.exe, upx.zip -Force -Recurse
+            - name: 🔎 校验清单、调试段与体积
+              shell: pwsh
+              run: |
+                  $exe = "target/${{ matrix.rust_target }}/release/sparrowpdf.exe"
+                  if (-not (Test-Path $exe)) { throw "找不到 exe" }
+                  $bytes = [System.IO.File]::ReadAllBytes($exe)
+                  # 整文件解码一次再查子串：逐字节比较在 12 MB 上要上亿次，
+                  # 在 PowerShell 里要跑几十秒。
+                  $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+                  if ($text.Contains(".debug_")) {
+                    throw "release exe 里仍有 .debug_ 段（检查 Cargo.toml 的 strip 配置）"
+                  }
+                  # 提权清单是产品的既定行为：写受保护目录依赖它。build.rs 或
+                  # 构建方式一变就可能被静默丢掉，包会悄悄降权。
+                  if (-not $text.Contains("requireAdministrator")) {
+                    throw "exe 缺少 requireAdministrator 清单（检查 build.rs 的 winresource 配置）"
+                  }
+                  $mb = [math]::Round($bytes.Length / 1MB, 2)
+                  if ($bytes.Length -gt 20MB) { throw "exe 为 $mb MB，超过 20 MB 上限（UPX 前）" }
+                  Write-Host "exe 正常：$mb MB，无调试段，清单完整"
 
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v7
-        with:
-          name: SparrowPDF-windows-x64
-          path: target/release/sparrowpdf.exe
-          if-no-files-found: error
+            # UPX 自 5.x 起带 p_w64pe_arm64，两个架构都能压，配置保持一致；
+            # 万一某个架构压不了，continue-on-error 也不会拦住发布。
+            - name: 🗜️ UPX 压缩（失败不中断）
+              continue-on-error: true
+              shell: pwsh
+              run: |
+                  $exe = "target/${{ matrix.rust_target }}/release/sparrowpdf.exe"
+                  Copy-Item $exe upx-input.exe -Force
+                  curl.exe -fsSL -o upx.zip https://github.com/upx/upx/releases/download/v5.3.0/upx-5.3.0-win64.zip
+                  Expand-Archive upx.zip -DestinationPath upx -Force
+                  & (Get-ChildItem upx -Recurse -Filter upx.exe).FullName --best $exe
+                  # UPX 会重写节表与资源目录；万一它吃掉 RT_MANIFEST，exe 就不再请求
+                  # 管理员权限。这种概率很低，但代价是产品行为变了，所以压缩后复查，
+                  # 丢清单就回退到未压缩版本（本步骤 continue-on-error，不会拦住发布）。
+                  $after = [System.IO.File]::ReadAllBytes($exe)
+                  if (-not [System.Text.Encoding]::ASCII.GetString($after).Contains("requireAdministrator")) {
+                    Write-Warning "UPX 后清单丢失，回退到未压缩版本"
+                    Copy-Item upx-input.exe $exe -Force
+                  }
+                  $sz = (Get-Item $exe).Length
+                  if ($sz -gt 12MB) { Write-Warning "UPX 后为 $([math]::Round($sz/1MB,2)) MB，超过 12 MB 目标" }
+                  Remove-Item upx-input.exe, upx.zip -Force -Recurse
 
-  build-macos:
-    name: 💻 macOS 通用版
-    needs: guard
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - name: 检出 tag 提交
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.guard.outputs.tag }}
+            # 两个架构的 exe 同名（都叫 sparrowpdf.exe），直接上传会在 publish 里
+            # merge-multiple 到同一个 dist/ 目录、互相覆盖。先按架构重命名，产物
+            # 名即 Release 附件名，下载页上一眼能分清 x64 与 arm64。
+            - name: 重命名产物
+              shell: pwsh
+              run: |
+                  $src = "target/${{ matrix.rust_target }}/release/sparrowpdf.exe"
+                  Copy-Item $src "${{ matrix.asset }}" -Force
+                  Write-Host "产物：${{ matrix.asset }}（$([math]::Round((Get-Item "${{ matrix.asset }}").Length/1MB,2)) MB）"
 
-      - name: 安装 Rust（固定 1.97.1）
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          toolchain: "1.97.1"
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+            - name: 上传构建产物
+              uses: actions/upload-artifact@v7
+              with:
+                  name: SparrowPDF-windows-${{ matrix.arch }}
+                  path: ${{ matrix.asset }}
+                  if-no-files-found: error
 
-      - name: 缓存依赖
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+    build-macos:
+        name: 💻 macOS 通用版（arm64 + x86_64）
+        needs: guard
+        runs-on: macos-latest
+        timeout-minutes: 60
+        env:
+            # 显式声明部署目标，与 Info.plist 的 LSMinimumSystemVersion 对齐。
+            # 不写的话下限由 runner 上的 SDK 决定：镜像一升级就可能把产物抬到
+            # 新系统，CI 全绿、用户装到旧 Mac 上起不来。
+            MACOSX_DEPLOYMENT_TARGET: "11.0"
+        steps:
+            - name: 检出 tag 提交
+              uses: actions/checkout@v7
+              with:
+                  ref: ${{ needs.guard.outputs.tag }}
 
-      # 不再单独 strip：Cargo.toml 的 [profile.release] strip = true 在链接期
-      # 就完成了符号剥离，Windows 侧同样只依赖这一设置。少一次对 10 MB 级
-      # 二进制的整文件重写，产物大小不变。
-      - name: 🔨 编译 arm64 与 x86_64
-        run: |
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+            - name: 安装 Rust（固定 1.97.1）
+              uses: dtolnay/rust-toolchain@1.97.1
+              with:
+                  # 同上：版本来自分支名，不要写 with.toolchain。
+                  targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: 合并为通用二进制
-        run: |
-          mkdir -p universal
-          lipo -create \
-            target/aarch64-apple-darwin/release/sparrowpdf \
-            target/x86_64-apple-darwin/release/sparrowpdf \
-            -output universal/SparrowPDF
-          ARCHS="$(lipo -archs universal/SparrowPDF)"
-          echo "架构：$ARCHS"
-          case "$ARCHS" in *x86_64*) ;; *) echo "::error::缺少 x86_64 架构"; exit 1;; esac
-          case "$ARCHS" in *arm64*) ;; *) echo "::error::缺少 arm64 架构"; exit 1;; esac
-          SZ=$(stat -f%z universal/SparrowPDF)
-          if [ "$SZ" -gt $((25 * 1024 * 1024)) ]; then
-            echo "::error::通用二进制 $SZ 字节，超过 25 MB 上限"; exit 1
-          fi
+            # 免费版没有 runner 优先级，macOS 又是排队最久的池子。把 runner 的
+            # 真实身份（镜像版本、CPU 架构、Xcode、rustc）打进日志：出问题时能
+            # 一眼分清是镜像变了、架构不对，还是单纯排队。
+            - name: 🩺 运行环境自检
+              run: |
+                  sw_vers
+                  echo "架构：$(uname -m)"
+                  xcodebuild -version
+                  rustc -vV
+                  echo "部署目标：$MACOSX_DEPLOYMENT_TARGET"
 
-      - name: 打包 SparrowPDF.app
-        run: |
-          V="${{ needs.guard.outputs.version }}"
-          # CFBundleVersion 用日期位当 build 号（Apple 建议单调递增的整数），
-          # 对外展示的短版本仍是三段核心版本；完整五位版本在应用「关于」页。
-          D="${{ needs.guard.outputs.date }}"
-          APP="SparrowPDF.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp universal/SparrowPDF "$APP/Contents/MacOS/SparrowPDF"
-          cp assets/app.icns "$APP/Contents/Resources/app.icns"
-          cat > "$APP/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>轻雀 PDF</string>
-            <key>CFBundleDisplayName</key><string>轻雀 PDF</string>
-            <key>CFBundleExecutable</key><string>SparrowPDF</string>
-            <key>CFBundleIconFile</key><string>app</string>
-            <key>CFBundleIdentifier</key><string>com.sparrowpdf.app</string>
-            <key>CFBundleVersion</key><string>$D</string>
-            <key>CFBundleShortVersionString</key><string>$V</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
-            <key>NSHighResolutionCapable</key><true/>
-            <key>NSPrincipalClass</key><string>NSApplication</string>
-            <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-            <key>CFBundleDocumentTypes</key>
-            <array>
-              <dict>
-                <key>CFBundleTypeName</key><string>PDF Document</string>
-                <key>CFBundleTypeRole</key><string>Editor</string>
-                <key>LSItemContentTypes</key>
-                <array><string>com.adobe.pdf</string></array>
-              </dict>
-            </array>
-          </dict>
-          </plist>
-          PLIST
-          # ad-hoc 签名：没有 Developer ID 也能让 Gatekeeper 放行本地构建，
-          # 对外分发仍需真正的证书与公证（与本次合并无关，保持原行为）。
-          codesign --force --sign - "$APP"
+            - name: 缓存依赖
+              uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-universal-cargo-release-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-universal-cargo-release-
 
-      - name: 💿 制作 DMG
-        run: |
-          V="${{ needs.guard.outputs.version }}"
-          mkdir -p dmgsrc
-          cp -R SparrowPDF.app dmgsrc/
-          hdiutil create -volname "SparrowPDF $V" -srcfolder dmgsrc -format UDZO \
-            -o SparrowPDF-macos-universal.dmg 2>/dev/null || \
-          hdiutil create -volname "SparrowPDF $V" -srcfolder dmgsrc -format UDZO \
-            -fs APFS -o SparrowPDF-macos-universal.dmg
-          ls -la SparrowPDF-macos-universal.dmg
+            # 不单独 strip：Cargo.toml 的 [profile.release] strip = true 已在
+            # 链接期完成剥离，Windows 侧同样只依赖这一设置。
+            - name: 🔨 编译 arm64 与 x86_64
+              run: |
+                  cargo build --release --locked --target aarch64-apple-darwin
+                  cargo build --release --locked --target x86_64-apple-darwin
 
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v7
-        with:
-          name: SparrowPDF-macos-universal
-          path: SparrowPDF-macos-universal.dmg
-          if-no-files-found: error
+            - name: 合并为通用二进制
+              run: |
+                  mkdir -p universal
+                  lipo -create \
+                    target/aarch64-apple-darwin/release/sparrowpdf \
+                    target/x86_64-apple-darwin/release/sparrowpdf \
+                    -output universal/SparrowPDF
+                  ARCHS="$(lipo -archs universal/SparrowPDF)"
+                  echo "架构：$ARCHS"
+                  case "$ARCHS" in *x86_64*) ;; *) echo "::error::缺少 x86_64 架构"; exit 1;; esac
+                  case "$ARCHS" in *arm64*) ;; *) echo "::error::缺少 arm64 架构"; exit 1;; esac
+                  SZ=$(stat -f%z universal/SparrowPDF)
+                  if [ "$SZ" -gt $((25 * 1024 * 1024)) ]; then
+                    echo "::error::通用二进制 $SZ 字节，超过 25 MB 上限"; exit 1
+                  fi
 
-  publish:
-    name: 🎉 发布 Release
-    needs: [guard, build-windows, build-macos]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # 只有这一步需要写权限（创建 / 更新 Release），其余 job 保持只读。
-    permissions:
-      contents: write
-    steps:
-      - name: 下载构建产物
-        uses: actions/download-artifact@v8
-        with:
-          merge-multiple: true
-          path: dist
+            - name: 打包 SparrowPDF.app
+              run: |
+                  V="${{ needs.guard.outputs.version }}"
+                  # CFBundleVersion 用日期位当 build 号（Apple 建议单调递增的整数），
+                  # 对外展示的短版本仍是三段核心版本；完整五位版本在应用「关于」页。
+                  D="${{ needs.guard.outputs.date }}"
+                  APP="SparrowPDF.app"
+                  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+                  cp universal/SparrowPDF "$APP/Contents/MacOS/SparrowPDF"
+                  cp assets/app.icns "$APP/Contents/Resources/app.icns"
+                  cat > "$APP/Contents/Info.plist" <<PLIST
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                  <plist version="1.0">
+                  <dict>
+                    <key>CFBundleName</key><string>轻雀 PDF</string>
+                    <key>CFBundleDisplayName</key><string>轻雀 PDF</string>
+                    <key>CFBundleExecutable</key><string>SparrowPDF</string>
+                    <key>CFBundleIconFile</key><string>app</string>
+                    <key>CFBundleIdentifier</key><string>com.sparrowpdf.app</string>
+                    <key>CFBundleVersion</key><string>$D</string>
+                    <key>CFBundleShortVersionString</key><string>$V</string>
+                    <key>CFBundlePackageType</key><string>APPL</string>
+                    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+                    <key>LSMinimumSystemVersion</key><string>11.0</string>
+                    <key>NSHighResolutionCapable</key><true/>
+                    <key>NSPrincipalClass</key><string>NSApplication</string>
+                    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+                    <key>CFBundleDocumentTypes</key>
+                    <array>
+                      <dict>
+                        <key>CFBundleTypeName</key><string>PDF Document</string>
+                        <key>CFBundleTypeRole</key><string>Editor</string>
+                        <key>LSItemContentTypes</key>
+                        <array><string>com.adobe.pdf</string></array>
+                      </dict>
+                    </array>
+                  </dict>
+                  </plist>
+                  PLIST
+                  # ad-hoc 签名：没有 Developer ID 也能让 Gatekeeper 放行本地
+                  # 构建；对外分发仍需真正的证书与公证。
+                  # 签完立刻验：签名步骤成功不代表产物能通过校验，坏包发出去
+                  # 就是「已损坏，无法打开」，而 CI 只会显示绿勾。
+                  codesign --force --sign - "$APP"
+                  codesign --verify --deep --strict --verbose=2 "$APP"
+                  # 用 sed 而不是 head：head 提前关管道会让 codesign 收到 SIGPIPE，
+                  # 在 pipefail 下这一步就会假失败。
+                  codesign -dv "$APP" 2>&1 | sed -n '1,6p'
 
-      - name: 创建 GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.guard.outputs.tag }}
-          name: 轻雀 PDF ${{ needs.guard.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            dist/sparrowpdf.exe
-            dist/SparrowPDF-macos-universal.dmg
+            - name: 💿 制作 DMG
+              run: |
+                  V="${{ needs.guard.outputs.version }}"
+                  DMG="SparrowPDF-macos-universal.dmg"
+                  rm -rf dmgsrc "$DMG"
+                  mkdir -p dmgsrc
+                  cp -R SparrowPDF.app dmgsrc/
+                  # UDZO 只能配 HFS+。失败后用同名重试吸收偶发的 resource busy，
+                  # 最后 hdiutil verify 校验镜像完整性。
+                  create() {
+                    hdiutil create -volname "SparrowPDF $V" -srcfolder dmgsrc \
+                      -format UDZO -fs HFS+ -o "$DMG"
+                  }
+                  create || { sleep 3; rm -f "$DMG"; create; }
+                  hdiutil verify "$DMG"
+                  ls -la "$DMG"
+
+            - name: 上传构建产物
+              uses: actions/upload-artifact@v7
+              with:
+                  name: SparrowPDF-macos-universal
+                  path: SparrowPDF-macos-universal.dmg
+                  if-no-files-found: error
+
+    publish:
+        name: 🎉 发布 Release
+        needs: [guard, build-windows, build-macos]
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        # 只有这一步需要写权限（创建 / 更新 Release），其余 job 保持只读。
+        permissions:
+            contents: write
+        steps:
+            # 发布页的更新说明取自 CHANGELOG.md，所以要把 tag 上的这份文件取下来。
+            - name: 检出 tag 提交
+              uses: actions/checkout@v7
+              with:
+                  ref: ${{ needs.guard.outputs.tag }}
+
+            - name: 下载构建产物
+              uses: actions/download-artifact@v8
+              with:
+                  merge-multiple: true
+                  path: dist
+
+            # 三个附件来自三个不同的 artifact，靠 merge 落到同一个目录。先打印清单：
+            # 少传/传错时能直接看出缺哪个平台，而不是只看到 release 里少一个文件。
+            - name: 核对附件清单
+              run: ls -la dist
+
+            # 从 "## [V主.副.修订.YYYYMMDD] - 日期" 开始原样截取本版条目（含分类
+            # 小标题），遇到下一个二级标题或文件末尾的链接定义区即停，末尾空行
+            # 去掉。内容以人工撰写的 CHANGELOG 为准，不用 generate_release_notes
+            # 的机器摘要。
+            - name: 提取本版更新说明
+              run: |
+                  TAG="${{ needs.guard.outputs.tag }}"
+                  awk -v h="## [$TAG]" '
+                    index($0, h) == 1 { f = 1 }
+                    f && /^## / && index($0, h) != 1 { exit }
+                    f && /^\[[^]]+\]:/ { exit }
+                    f { buf[++n] = $0 }
+                    END {
+                      while (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--
+                      for (i = 1; i <= n; i++) print buf[i]
+                    }
+                  ' CHANGELOG.md > release-notes.md
+                  if [ ! -s release-notes.md ]; then
+                    echo "::error::没能从 CHANGELOG.md 提取 ## [$TAG] 的内容"; exit 1
+                  fi
+                  echo "---- 发布说明（$(wc -l < release-notes.md) 行）----"
+                  cat release-notes.md
+
+            - name: 创建 GitHub Release
+              uses: softprops/action-gh-release@v3
+              with:
+                  tag_name: ${{ needs.guard.outputs.tag }}
+                  name: 轻雀 PDF ${{ needs.guard.outputs.tag }}
+                  body_path: release-notes.md
+                  # 三个平台缺一不可：某个产物没上传时直接失败，避免发出一个
+                  # 「看起来正常、实际只有两个平台」的 Release。
+                  fail_on_unmatched_files: true
+                  files: |
+                      dist/SparrowPDF-windows-x64.exe
+                      dist/SparrowPDF-windows-arm64.exe
+                      dist/SparrowPDF-macos-universal.dmg

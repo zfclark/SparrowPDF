@@ -29,6 +29,8 @@ desktop.ini
 # Ignore local scratch output.
 dist/
 *.dmg
+# 发布流水线从 CHANGELOG 抽出的发布说明（本地复现 CI 时会生成）
+release-notes.md
 
 # Local debug / verification artifacts (screenshots, fixtures, scratch PDFs).
 .probe/
