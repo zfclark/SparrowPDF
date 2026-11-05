@@ -35,8 +35,8 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    └── version.rs 版本号唯一来源：Cargo 三段 + 日期位
 ```
 
-依赖方向是硬约束，反向引用会让分层失效（`ui/` 一旦拿到 `lopdf::Document`，
-预览与业务就会各自演化出两套页面语义）：
+依赖方向是硬约束。反向依赖会破坏分层：`ui/` 一旦持有 `lopdf::Document`，预览与业务将各自
+演化出两套页面语义。
 
 - `ui/` → `model`、`tools`（选项类型、trait 签名，以及预览所需的纯函数：
   `collect_images`、`preview_page_numbers`、`ordered_pages`）、`engine::logging`
@@ -71,8 +71,8 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 发布版无控制台，所以不要用 `println!`。
 
 **Windows 清单**（`build.rs`）：`requireAdministrator` + `longPathAware` + `dpiAware`。
-清单只注入主程序（`winresource::compile_for("sparrowpdf")`），否则测试可执行文件也会被
-要求提权，`cargo test` 直接跑不起来。
+清单只注入主程序（`winresource::compile_for("sparrowpdf")`），否则测试可执行文件同样
+要求提权，`cargo test` 无法运行。
 
 **免提权变体**：`SPARROW_AS_INVOKER=1 cargo build --release`，清单改为 `asInvoker`。
 适合按用户安装、需要资源管理器拖放正常的场景；写受保护目录会失败，此时程序按
@@ -85,6 +85,6 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 
 ## 4. 已知缺口
 
-- 日志不滚动、不清理：长期使用会持续增长，排查完可手动删除。
-- 偏好文件只有外观一项，损坏时静默回落到跟随系统，不报错。
-- macOS 未做公证，用户需自行解除隔离（README 有一行命令）；这是发布策略，不是代码缺陷。
+- 日志不轮转：文件持续增长，需手动清理。
+- 偏好文件仅存外观一项，损坏时静默回退到跟随系统，不提示。
+- macOS 未做公证，用户需自行解除隔离（命令见 README）；属发布策略，非代码缺陷。
