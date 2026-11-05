@@ -1,37 +1,17 @@
 # 轻雀 PDF 发布流水线
 #
 # 触发
-#   · 推 tag 自动运行：tag 必须是 V主.副.修订.YYYYMMDD，如 V0.5.0.20261104。
-#   · 手动重跑某个 tag：gh workflow run release.yml --ref V0.5.0.20261104
-#     （网页的 Run workflow 面板只能选分支，选不了 tag；REST dispatches 的 ref
-#     同样可用）。手动触发执行的是「所选 tag 上的工作流文件」，所以改了流程
-#     要生效，必须先出新 tag。
-#   · 版本号一律从 ref 现算（github.ref_name），没有手工输入；非 tag 的 ref 在
-#     guard 第一步就失败。
+#   · 推 tag 自动运行：tag 必须是 V主.副.修订.YYYYMMDD，如 V0.5.1.20261106。
+#   · 手动重跑某个 tag：gh workflow run release.yml --ref V0.5.1.20261106
+#     （网页的 Run workflow 面板只能选分支，选不了 tag）。
+#   · 版本号一律从 ref 现算，没有手工输入；非 tag 的 ref 在 guard 第一步失败。
 #
 # 产物
 #   SparrowPDF-windows-x64.exe / SparrowPDF-windows-arm64.exe /
-#   SparrowPDF-macos-universal.dmg（macOS 11+，Intel 与 Apple Silicon 通用）
-#   Release 的更新说明取自 CHANGELOG.md 里 `## [V主.副.修订.YYYYMMDD]` 那一条，
-#   原样搬运，不生成机器摘要；条目缺失会在 guard 阶段失败。
+#   SparrowPDF-macos-universal.dmg。Release 说明取自 CHANGELOG 对应条目。
 #
-# 改这个文件前需要知道的几条
-#   · 工具链钉死 Rust 1.97.1。dtolnay/rust-toolchain 的分支名即版本，action.yml
-#     只声明 targets / target / components，写 with.toolchain 会被忽略并报
-#     "Unexpected input(s)"；升级就是换 @x.y.z 标签，两处一起改。
-#   · Windows 两个架构走同一份矩阵步骤。两个 exe 都叫 sparrowpdf.exe，上传前
-#     必须按架构重命名，否则 download-artifact 的 merge-multiple 会互相覆盖。
-#   · macOS 的 MACOSX_DEPLOYMENT_TARGET=11.0 必须与 Info.plist 的
-#     LSMinimumSystemVersion 一致；hdiutil 的 UDZO 只能配 HFS+；签名之后必须
-#     codesign --verify，否则坏包会以绿勾发出去。
-#   · guard 是所有构建 job 的 needs，只做只读校验（tag 格式、与 Cargo.toml /
-#     Cargo.lock / version.rs 一致、打包资源齐全），让错误在 10 秒内暴露，
-#     而不是等 macOS 编完十几分钟。
-#   · 权限默认 contents: read，只有 publish 提权到 write。
-#   · 免费版限额：并发 20 作业、单作业 6 小时、矩阵 256 作业、缓存 10 GB。
-#     本流水线最多 5 个作业、每个 ≤60 分钟，均在限额内；公开仓库的标准 runner
-#     不计费。macOS runner 排队没有优先级，遇到排队超时被取消，用界面的
-#     Re-run failed jobs 重跑即可。
+# 维护约束（工具链、矩阵重命名、macOS 打包、guard 职责、权限与免费版限额）
+# 见 AGENTS.md 4.5 节。
 
 name: 🚀 版本构建发布
 
@@ -149,9 +129,7 @@ jobs:
         needs: guard
         runs-on: windows-latest
         timeout-minutes: 60
-        # x64 与 arm64 只差一个三元组，因此用矩阵而不是复制一份 job：矩阵保证
-        # 两个架构走完全相同的步骤（编译、清单校验、体积上限、重命名），不会出现
-        # 「新加的架构少校验了一步」这种只在发布之后才被发现的问题。
+        # 两个架构用矩阵而非复制 job：步骤完全一致，不会出现「新架构少校验一步」。
         strategy:
             fail-fast: false
             matrix:
@@ -171,10 +149,7 @@ jobs:
             - name: 安装 Rust（固定 1.97.1）
               uses: dtolnay/rust-toolchain@1.97.1
               with:
-                  # 版本由 @1.97.1 这个分支本身决定：该分支把 toolchain 写死在
-                  # action.yml 的 env 里，声明的输入只有 targets/target/components
-                  # 三个。多传一个 with.toolchain 会被忽略，还会触发
-                  # "Unexpected input(s)" 警告（编辑器把整行标红）。
+                  # 版本由分支名决定，勿写 with.toolchain（未声明输入，只会触发警告）。
                   targets: ${{ matrix.rust_target }}
 
             - name: 缓存依赖
@@ -184,9 +159,7 @@ jobs:
                       ~/.cargo/registry
                       ~/.cargo/git
                       target
-                  # 两个矩阵 job 的 runner.os 都是 Windows，键里必须带架构：否则它们
-                  # 抢同一个缓存键，后保存的一方被拒绝，恢复时还可能拿到另一架构的
-                  # target/ 白解压一遍。
+                  # runner.os 相同，两个矩阵任务必须用不同的键，否则互相覆盖。
                   key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-
 

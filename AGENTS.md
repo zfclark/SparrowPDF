@@ -312,6 +312,50 @@ cargo test --release --lib --test integration
 4. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
 5. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
 
+### 4.5 发布流水线（`.github/workflows/release.yml`）
+
+**触发与版本来源**
+
+- 推 tag（`V主.副.修订.YYYYMMDD`）自动运行；手动重跑用 `gh workflow run release.yml --ref <tag>`。
+  网页的 Run workflow 面板只能选分支，选不了 tag。
+- 版本号一律从 `github.ref_name` 现算，没有手工输入；非 tag 的 ref 在 guard 第一步失败。
+- 手动触发执行的是「所选 tag 上的工作流文件」，改流程要生效必须先出新 tag。
+
+**工具链与动作**
+
+- Rust 固定 1.97.1，`uses: dtolnay/rust-toolchain@1.97.1`，分支名即版本。该 action 只声明
+  `targets` / `target` / `components`，写 `with: toolchain:` 会被忽略并报 "Unexpected input(s)"；
+  升级就是换 `@x.y.z` 标签，两处一起改。
+- 其余动作取各仓库当前稳定大版本（checkout v7、cache v6、upload-artifact v7、
+  download-artifact v8、action-gh-release v3），UPX 5.3.0。不用 `@stable`，不用日期化镜像标签。
+
+**Windows**
+
+- 两个架构走同一份矩阵，步骤必须一致（清单、调试段、体积上限、UPX、重命名）。
+- 两个产物同名 `sparrowpdf.exe`，上传前必须按架构重命名，否则 `download-artifact` 的
+  `merge-multiple` 会互相覆盖；发布附件名即重命名后的名字。
+- 缓存键带 `matrix.arch`，否则两个矩阵任务抢同一个键。
+
+**macOS**
+
+- 通用二进制由 arm64 与 x86_64 两个目标 `lipo -create` 合并，体积上限 25 MB。
+- `MACOSX_DEPLOYMENT_TARGET=11.0` 必须与 Info.plist 的 `LSMinimumSystemVersion` 一致。
+- `hdiutil` 的 `UDZO` 只能配 `HFS+`；失败用同名重试，最后 `hdiutil verify`。
+- 签名是 ad-hoc，签完必须 `codesign --verify`；对外分发仍需 Developer ID 与公证。
+
+**guard 与发布**
+
+- guard 是所有构建 job 的 `needs`，只做只读校验：tag 格式、与 `Cargo.toml` / `Cargo.lock` /
+  `src/version.rs` 一致、`CHANGELOG.md` 有该版本条目、打包资源齐全；目的是让错误在 10 秒内暴露。
+- 只有 publish 提权到 `contents: write`，其余 job 保持只读。
+- Release 正文取自 `CHANGELOG.md` 对应条目，不用平台自动摘要；附件不全由
+  `fail_on_unmatched_files` 拦下。
+
+**免费版限额**
+
+- 并发 20 作业、单作业 6 小时、矩阵 256 作业、缓存 10 GB；本流水线最多 5 个作业、每个 ≤60 分钟。
+- 公开仓库的标准 runner 不计费；macOS runner 排队无优先级，排队超时被取消时用 Re-run failed jobs。
+
 ---
 
 ## 5. 编码约定
