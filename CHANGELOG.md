@@ -14,6 +14,32 @@
 
 尚无未发布改动。
 
+## [V0.5.1.20261106] - 2026-11-06
+
+### Added
+
+- **Windows arm64**：新增 `SparrowPDF-windows-arm64.exe`，Windows 11 on ARM 原生运行；
+  与 x64 复用同一套步骤与校验（提权清单、调试段、体积上限、UPX）
+
+### Changed
+
+- **发布**：GitHub Release 的更新说明直接取用本文件对应版本条目，不再使用平台自动
+  生成的提交摘要
+- **发布**：手动重跑改为在 tag 上运行（`gh workflow run release.yml --ref <tag>`），
+  版本号从 ref 读取，不再手工填写；误在分支上触发会立即失败并给出用法
+- **文档**：README 补充三个产物的适用平台与 macOS 首次打开的放行方式；协作规范同步
+  arm64 与「发布说明取自 CHANGELOG」的约定
+
+### Fixed
+
+- **macOS 包**：显式固定最低系统版本 11.0，与 Info.plist 的
+  `LSMinimumSystemVersion` 对齐，避免 runner 镜像升级后产物悄悄抬高下限
+- **macOS 包**：DMG 的兜底命令原为非法组合（`UDZO` 配 `APFS`），第一条失败后第二条
+  必然也失败，等于没有兜底；改为同名重试并校验镜像完整性
+- **macOS 包**：签名后强制校验，坏签名不再以「检查全绿」的状态发布
+- **发布**：去掉 `dtolnay/rust-toolchain` 未声明的 `toolchain` 输入，消除运行时的
+  "Unexpected input(s)" 警告与编辑器报错
+
 ## [V0.5.0.20261104] - 2026-11-04
 
 ### Added
