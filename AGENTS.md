@@ -13,8 +13,11 @@
 1. 读 `Cargo.toml`（版本号、依赖、release profile）
 2. 读 `src/model.rs`（`ToolId`、`ToolGroup`、`ToolError`、`TaskState`）
 3. 读 `src/tools/mod.rs`（`Tool` trait、`ToolOptions`、`Progress`、`CancelFlag`）
-4. 读将要修改的模块，以及 `src/ui/mod.rs` 顶部的分层约束注释
+4. 读 `docs/` 里对应主题的实现说明（工具 / 渲染 / 界面 / 分层），再读将要修改的模块
 5. 若涉及界面，再读 `src/ui/theme.rs`（设计令牌与组件）
+
+本文件只写**规范**（约束、流程、质量门）；**怎么实现、为什么这么做、哪里会出问题**
+写在 `docs/`，需要时按主题查阅，不必通读。
 
 执行原则：
 
@@ -81,6 +84,7 @@ SparrowPDF/
 ├── tests/integration.rs  # 端到端集成测试（不启动 GUI，直接调 Tool）
 ├── README.md             # 面向用户的功能与安装说明
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
+├── docs/                 # 技术实现文档（分层、工具、渲染、界面），改代码前读对应主题
 └── .github/workflows/    # 发布流水线（tag 触发，产出 Windows x64 / arm64 与 macOS 通用版）
 ```
 
@@ -142,7 +146,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 
 ---
 
-## 3. 核心功能与实现逻辑
+## 3. 核心功能与契约
 
 ### 3.1 工具清单
 
@@ -190,87 +194,19 @@ pub trait Tool: Send + Sync {
 4. 落盘后**重新打开产物断言**（`validate::assert_page_count` 等）；断言失败要删除产物并返回 `ValidationFailed`。
 5. 不得在工具内部直接 `fs::write` 或 `File::create` 绕过第 3 步。
 
-### 3.4 图片 → PDF（`tools/image_embed.rs`）
+### 3.4 实现细节
 
-- **JPEG 直通**：以 `DCTDecode` 原样嵌入，不二次编码，画质与体积最优。
-- **PNG 内嵌**：解码后以 `FlateDecode` + `SMask` 写入。
-- **EXIF 方向**：`read_exif_orientation` 读到 5~8 时交换宽高，并通过 `rotate_cw_code` 合成旋转矩阵（与自动旋转复合，不叠加错误）。
-- **页面排版**：A4 尺寸 + 统一页边距，等比缩放居中。
-- **自动旋转**：图片方向与目标页面方向冲突时旋转 90° 铺满页面（替代缩小成条）。
-- **两图一页**：一个页面上开两个槽位，按 `A4 横版`（左右并排）或 `A4 竖版`（上下并排）计算槽位与缩放；每张图独立做方向判定。
+具体实现按主题写在 `docs/`，这里不再展开：
 
-### 3.5 批量转换（`tools/folder_to_pdf.rs`）
+| 要改的东西           | 先读                       |
+| -------------------- | -------------------------- |
+| 某个工具的处理逻辑   | `docs/tools.md`            |
+| 渲染、导出质量       | `docs/rendering.md`        |
+| 界面、布局、任务状态 | `docs/ui.md`               |
+| 分层、新增模块、平台 | `docs/architecture.md`     |
 
-- **数字感知排序**：文件名中的数字按数值比较（`1, 2, 10` 而非 `1, 10, 2`）；无法提取数字的按系统列举顺序稳定排在后面。
-- **输出命名**：`<文件夹名>.pdf` 写回文件夹自身；指定输出目录时重名加 `-2`、`-3` 后缀。
-- **两图一页**：默认按顺序两两配对；勾选「指定合并序号」后仅在给定序号对之间合并（如 `1-2,5-6`），其余单独成页。
-- **页面方向统一**：两图一页的 A4 方向属于**整份文档**而非单张页面。单图页（奇数尾页、被合并序号排除的图片）与合并页使用同一方向、同一外边距；`PagePolicy` 在写第一页之前确定一次，落盘后用 `validate::assert_page_orientation` 断言全书方向一致，缺一页即判失败。
-- **页码语义**：合并页以**输出 PDF 的实际页序**连续编号（预览标签即最终页码），图片编号另行在悬停中提示。
-- **容错**：单个文件夹失败不中断整批，最终以 `PartialSuccess` 汇报；空文件夹跳过；非图片文件忽略。
-
-### 3.6 中文水印（`tools/text_watermark.rs`）
-
-根因：PDF 简单字体是单字节（WinAnsi）编码，中文会被写成 `?`。实现方案：
-
-1. 用系统 TrueType 字体（`engine::ttf`，支持 `.ttc` 集合）取字形轮廓。
-2. 以 4× 超采样光栅化为灰度覆盖图，合成「纯色 tint + SMask 透明度」位图。
-3. 通过图片 XObject 叠加到页面，保留字号、颜色、透明度、旋转角与平铺/居中策略。
-4. 找不到可用中文字体时给出明确错误，不得静默输出空白水印。
-
-### 3.7 加密 / 解密
-
-基于 `lopdf` 的 AES-256：用户密码（打开）与所有者密码（权限）分离，权限位（打印/复制/修改）可组合；解密时用用户密码重写为无加密文档。
-
-### 3.8 PDF → 图片 与 页面预览（`engine/render.rs`）
-
-- 内置软件光栅器，按 DPI 缩放（默认 300，范围 36–600，附耗时提示）。
-- **算子覆盖**：路径 `m l c v y h re`，非零环绕 / 奇偶填充、描边、`B b` 系列；色彩支持灰度 / RGB / CMYK 与 `gs` 的 ca/CA 透明度；页面尺寸取 MediaBox，`/Rotate` 沿页树 Parent 链继承。未覆盖的算子（shading pattern、Type3 字体、复杂 blend mode 等）只跳过该算子，该页其余内容照常绘制，预览与导出保持一致。
-- `render_page_thumbnails` 按页批量渲染缩略图；UI 侧每帧限量渲染，避免大文档卡顿。
-- 填充遵循 PDF 语义：子路径**隐式闭合**（闭合边不得丢失），水平方向按像素累计覆盖率后只合成一次，实心区域才是设定颜色。
-- **文本取字**：字节是编码不是字符。优先按 `/ToUnicode` 反查（CID 字体按两字节码），其次 `/Encoding /Differences`（`uniXXXX`、`uXXXX`、单字符名与常用标点名），最后简单字体按 WinAnsi（含 0x80–0x9F 专用区）解释；复合字体缺映射且无内嵌程序则不画。
-- **字形来源**：优先用文档内嵌的 TrueType 程序（`/FontFile2`，经 `/FontDescriptor` 取得；CID 字体按其 `/CIDToGIDMap` 把 CID 换成 glyph id，缺省为 `/Identity`），这样子集字体的任意编码都能画对。文件未内嵌时按 `/BaseFont` 选系统黑体 / 宋体 / 等宽替换，单字缺字形时逐字回退。不得为取字去执行文档内的字体程序（只解析轮廓），也不得把内嵌程序当系统字体加载到全局缓存。
-- **表单资源**：Form XObject 若自带 `/Resources`，其内容必须用该字典解析（`resources_from`）。沿用页面资源会让表单内的文字与图片用错字体表，表现为整段文字消失。
-- **矩阵合成**：`raster::Matrix::mul` 必须与 `apply` 同一约定（列向量，`x' = a·x + c·y + e`）。两者不一致会让所有 `cm` / `/Rotate` / Form `/Matrix` 叠加后的几何整体错位（曾表现为整页空白），新增变换代码后请跑 `matrix_mul_*` 单元测试。
-- **图像解码**：支持 DCTDecode、FlateDecode、LZWDecode（`/EarlyChange` 两种码宽规则）、CCITTFaxDecode（K<0 为 G4，K=0 为 G3 一维，K>0 为 G3 二维）与 JBIG2（含 `/JBIG2Globals`）；支持 `/Predictor` 2（TIFF）与 10–15（PNG），1/2/4/8/16 位采样，`/ImageMask` 按当前填充色绘制。
-  - 无 `/Filter` 的流是原样采样，不能用 `decompressed_content`（lopdf 会因缺少 `/Filter` 报错），要先判断再取 `content`。
-  - CCITT 的 `/BlackIs1` 描述采样打包方式，不影响画面；适配器一律输出「0 = 深色」的亮度栅格。
-  - 解码失败只跳过该图像，不得按原样当像素画（会得到噪点），也不得 panic：`render_page` 的返回类型是 `Result`，一条坏图不该让整页失败。
-- **重排预览**（`preview::show_page_order`）：按 `tools::reorder::ordered_pages` 的同一映射渲染输出页序，标签为输出页码；源页缩略图按页号缓存，拖动只重排不重渲染。预览与产物的页码序列由这条共享映射保证一致。
-
-### 3.9 应用壳（`src/app.rs`）
-
-- **面板顺序即布局契约**：先 `Panel::left`（侧边栏），再 `Panel::bottom`（结果卡 + 操作条），最后 `CentralPanel`。先建底部面板时结果卡会横跨整个窗口并吃掉侧边栏高度，完成一次任务就把「加密与解密 / PDF 转图片」挤出可视区。
-- **同一时刻只允许一个任务**：`start()` 在 `self.worker.is_some()` 时直接返回；切换工具后仍在跑的任务由底部条显示「X 处理中」并提供取消，切回该工具时状态与结果仍在。
-- **卡片等宽**：`theme::card` / `tinted_card` 用 `set_min_width(ui.available_width())` 撑满内容列；按内容自适应会得到参差不齐的卡片堆。
-- **同名文件对话框**（`ui/conflict.rs`）：工具返回 `OutputExists` 后由 `poll_worker` 转成模态提问，选择「覆盖」或「另存为新文件」，可勾选「本次后续均执行此操作」写入会话策略；取消即什么都不做。回答后 `answer_conflict` 用一次性策略重跑，工具此前未写盘，无需清理半成品。
-- **会话策略可见可撤**：勾选后底部操作条显示「同名文件：覆盖 / 另存为新文件」并提供「重置」，点击即恢复「每次都询问」。策略只存在于内存，重启应用即清空，不得写进偏好文件。
-- **关于弹窗**（`ui/about.rs`）：入口固定在侧边栏底部，带当前版本号；以 `egui::Modal` 居中覆盖全窗。选模态而非第 13 个工具页，是因为「关于」属于外壳而非 PDF 操作，且模态在 760×520 最小窗口下仍可用（正文超长时只滚动正文，关闭按钮始终可见）。外部链接只经 `theme::open_url` 交给系统默认浏览器，打开失败时保留地址并提供「复制链接」，不得静默失败。
-
-|   |   |   |
-| - | - | - |
-
-|   |   |   |
-| - | - | - |
-
-- **状态机**：`Idle → Ready → Running{fraction,message} → Done{summary,outputs,note} | Failed | Cancelled`，按工具独立保存。
-- **输出路径解析**：用户指定优先；否则与源文件同目录；目录不可写时按  
-  `Documents\SparrowPDF → Documents → OneDrive\Documents\SparrowPDF → OneDrive\Documents → Desktop → Downloads → 用户目录 → TEMP`  
-  回退，并在结果区标注「已改存到…」；决策结果缓存，避免每帧探测。
-- **执行前预检**：`preflight_output` 向上寻找最近已存在祖先判断可写性，权限不足立即给出中文提示。
-- **拖放**：按当前工具接受的文件类型过滤。
-
-
-### 3.10 平台集成
-
-|   |   |   |
-| - | - | - |
-
-|  |  |  |
-| --- | --- | --- |
-- **日志**：`engine::logging::log("INFO"|"WARN"|"ERROR", msg)`，追加写入 `%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log`；`SPARROW_LOG_DIR` 可覆盖（测试与便携使用）。
-- **Windows 清单**（`build.rs`）：`requireAdministrator` + `longPathAware` + `dpiAware`；仅注入主程序（`winresource::compile_for("sparrowpdf")`），否则测试可执行文件也会被要求提权。
-- **免提权变体**：`SPARROW_AS_INVOKER=1 cargo build --release`，适合按用户安装、需要拖放正常的场景。
-- **macOS**：`app.icns` + `CFBundleIconFile`；ad-hoc 签名，分发需 Developer ID 与公证。
+读法：先看本节的 3.2 / 3.3 契约，再读对应文档；每篇末尾的「已知缺口」是既有边界，
+不要当成回归缺陷去修。
 
 ---
 

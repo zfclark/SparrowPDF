@@ -83,7 +83,7 @@ cargo build --release
 - 加密只支持 AES-256；不处理数字签名、表单填写。
 - 文件损坏或密码错误会直接报错，不会产出空白文件。
 
-渲染器支持范围、工程约定与实现细节见 [AGENTS.md](./AGENTS.md)。
+渲染器支持范围、实现细节与已知边界见 [docs/](./docs/)；协作者规范见 [AGENTS.md](./AGENTS.md)。
 
 ## License
 
