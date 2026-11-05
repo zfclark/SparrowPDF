@@ -2,101 +2,88 @@
 
 > PDF 的事，本地办完。
 
-基于 Rust 的本地 PDF 工具箱：不联网、不上传、无遥测，处理全在本机完成。
+日常处理 PDF 的小工具集：合并、拆分、旋转、删页、加水印、加密、转图片。全部在本机完成，
+不联网、不上传、无遥测，也不需要账号。
 
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue) ![rust](https://img.shields.io/badge/rust-1.95%2B-orange)
 
-## 功能（12 项）
+## 下载
 
-| 分组 | 工具         | 说明                                                            |
-| ---- | ------------ | --------------------------------------------------------------- |
-| 创建 | 图片合并 PDF | JPEG 走 DCTDecode 直通并纠正 EXIF 方向；PNG 以 FlateDecode 内嵌 |
-| 创建 | 批量转换     | 每个文件夹一个 PDF，文件名数字感知排序；可两图一页              |
-| 合并 | PDF 合并     | 拖拽排序后按序合并                                              |
-| 拆分 | PDF 拆分     | 按页码范围 / 每 N 页 / 逐页                                     |
-| 页面 | 页面旋转     | 90° 增量，多次操作按累计语义合并                                |
-| 页面 | 删除页面     | 按页码范围删除                                                  |
-| 页面 | 页面重排     | 拖拽排序，实时预览输出页序                                      |
-| 页面 | 提取页面     | 抽取选中页为新文件                                              |
-| 水印 | 文本水印     | 平铺或居中；系统 CJK 字体；透明度与旋转角                       |
-| 水印 | 图片水印     | 缩放适配、透明度、覆盖层                                        |
-| 安全 | 加密 / 解密  | AES-256，可组合打印 / 复制 / 修改权限                           |
-| 导出 | PDF 转图片   | 内置软件光栅化，PNG / JPEG，36–600 DPI（默认 300）              |
+| 你的系统                            | 下载                             | 说明                       |
+| ----------------------------------- | -------------------------------- | -------------------------- |
+| Windows 10 / 11（Intel、AMD）       | `SparrowPDF-windows-x64.exe`     | 绿色版，双击即用           |
+| Windows 11 on ARM（骁龙 X 等）      | `SparrowPDF-windows-arm64.exe`   | 同上，原生 ARM64           |
+| macOS 11+（Intel 与 Apple Silicon） | `SparrowPDF-macos-universal.dmg` | 通用二进制，一个包两种芯片 |
 
-## 界面
+Windows 版启动时会请求管理员权限，原因见下文「Windows 的提权」。
 
-- 侧边栏底部可切换**浅色 / 深色**，即时生效；选择写入 `%LOCALAPPDATA%\sparrowpdf\ui.pref`，
-  未手动选择过则跟随系统主题。
-- 「关于」入口显示完整版本号、作者与项目地址。
-
-## 保存与同名文件
-
-同名文件不覆盖：先规划本次要写的全部文件名，命中即停下询问「覆盖 / 另存为新文件（追加
-`-2`、`-3`）/ 取消」。批量任务一次汇总、一次作答，可勾选「本次后续均执行此操作」。
-
-## 构建
+macOS 包为 ad-hoc 签名、未经公证，第一次打开可能提示「无法验证开发者」或「已损坏」。确认
+来源后在终端执行一次即可：
 
 ```bash
-cargo build --release
+xattr -dr com.apple.quarantine /Applications/SparrowPDF.app
 ```
 
-最低 Rust 1.95（edition 2021）。
+## 能做什么
 
-### Windows：提权与免提权变体
+| 分组 | 工具         | 说明                                                     |
+| ---- | ------------ | -------------------------------------------------------- |
+| 创建 | 图片合并 PDF | 选多张 JPG / PNG 按顺序合成一个；竖拍照片自动摆正方向    |
+| 创建 | 批量转换     | 给多个文件夹，各自出一个 PDF；文件名按数字大小排序       |
+| 合并 | PDF 合并     | 拖拽调整顺序后合成一个                                   |
+| 拆分 | PDF 拆分     | 按页码范围、每 N 页、或一页一个文件                      |
+| 页面 | 页面旋转     | 每次 90°，可连续转，按累计角度生效                       |
+| 页面 | 删除页面     | 指定页码删除                                             |
+| 页面 | 页面重排     | 拖拽排序，实时看到输出页序                               |
+| 页面 | 提取页面     | 把选中的页单独存成新文件                                 |
+| 水印 | 文本水印     | 平铺或居中，可调字号、透明度、角度，用系统中文字体       |
+| 水印 | 图片水印     | 支持缩放、透明度与叠加位置                               |
+| 安全 | 加密 / 解密  | AES-256，可分别限制打印 / 复制 / 修改；也能去掉密码      |
+| 导出 | PDF 转图片   | 每页导出 PNG / JPEG，36–600 DPI（默认 300）              |
 
-默认 exe 内嵌 `requestedExecutionLevel = requireAdministrator`，可直接写入受保护目录
-（如 `Program Files`）；代价是每次启动弹 UAC，且资源管理器拖放到提权窗口失效。
+## 用起来要知道的几件事
 
-需要「普通权限启动、拖放正常」时：
+**同名文件不会被覆盖。** 程序先算出这次要写哪些文件，发现重名就停下来问：覆盖、另存为新文件
+（自动加 `-2`、`-3`）、还是取消。批量任务一次列全所有冲突，选一次即可，也可以勾选「本次后续
+均执行此操作」。
+
+**外观跟随系统。** 侧边栏底部可切换浅色 / 深色，选择会记住，下次启动沿用。
+
+**版本号在「关于」里。** 从侧边栏底部进入，显示完整五位版本（如 `V0.5.1.20261106`）。
+
+**输出位置优先听你的。** 不指定时写到源文件同目录；目录不可写（如 `Program Files`）会自动
+改存到 `文档\SparrowPDF`，并在结果卡片上告诉你实际路径。
+
+## Windows 的提权
+
+默认版本启动会弹 UAC，这样输出可以直接写进 `Program Files` 这类受保护目录。代价是系统禁止
+把文件从资源管理器拖进提权窗口——想保留拖放，用免提权变体：
 
 ```bash
 SPARROW_AS_INVOKER=1 cargo build --release
 ```
 
-该变体写受保护目录会失败，此时程序自动改存 `文档\SparrowPDF` 并在结果卡片提示；也可对目标
-目录一次性授权：`icacls "目标目录" /grant "%USERNAME%":(OI)(CI)M`。
+该版本写受保护目录会失败，此时同样自动改存到 `文档\SparrowPDF`。
 
-macOS 无此机制：权限由 POSIX/ACL 与 TCC 决定，`.app` 以当前用户身份运行。
+macOS 没有这套机制：权限由系统与文件夹授权决定，`.app` 以当前用户身份运行。
 
-### 发布产物
+## 自己编译
 
-| 附件                             | 适用                                   |
-| -------------------------------- | -------------------------------------- |
-| `SparrowPDF-windows-x64.exe`     | Windows 10 / 11 x64                    |
-| `SparrowPDF-windows-arm64.exe`   | Windows 11 on ARM                      |
-| `SparrowPDF-macos-universal.dmg` | macOS 11+，Intel 与 Apple Silicon 通用 |
+```bash
+cargo build --release
+```
 
-macOS 包为 ad-hoc 签名、未经公证，首次打开可能被 Gatekeeper 拦下；确认来源后执行
-`xattr -dr com.apple.quarantine /Applications/SparrowPDF.app` 放行。
+最低 Rust 1.95（edition 2021），产物是单个可执行文件。
 
-## 中文字体
+## 已知限制
 
-界面为简体中文，但不内嵌 CJK 字体（体积红线）：启动时按序探测系统字体（微软雅黑 / 等线 /
-黑体 / 宋体 / PingFang / Noto Sans CJK / DejaVu Sans 等），命中后注入 egui 作为回退字体。
+- 「PDF 转图片」使用内置渲染器，覆盖常见文档；shading、Type3 字体、复杂混合模式等暂不支持，
+  遇到这类内容会跳过对应部分，该页其余内容照常输出。排版复杂的文档建议对照专业阅读器复核。
+- 未内嵌字体的 PDF 会用系统字体替代，字形与字宽可能与专业渲染器存在差异。
+- 加密只支持 AES-256；不处理数字签名、表单填写。
+- 文件损坏或密码错误会直接报错，不会产出空白文件。
 
-## 光栅化边界
-
-「PDF 转图片」使用内置软件光栅化器（`engine/render.rs` + `raster.rs` + `ttf.rs`），不依赖外部渲染器：
-
-- 路径：`m l c v y h re`，非零环绕 / 奇偶填充、描边、`B b` 系列；
-- 色彩：灰度 / RGB / CMYK，`gs` 的 ca/CA 透明度；
-- 图像：DCTDecode、FlateDecode、LZWDecode、CCITTFaxDecode（G3 一维 / 二维、G4）、JBIG2 与
-  无滤镜原样采样；PNG / TIFF 预测器（2、10–15）、1/2/4/8/16 位采样、`/ImageMask` 模板蒙版；
-  Form XObject 递归；
-- 文本：`BT/ET` 与 `Tf/Tm/Td/TD/T*/TL/Tc/Tw/Tz/Tj/'/"/TJ`；按 `/ToUnicode` 取字，其次
-  `/Encoding /Differences`，最后按 WinAnsi；优先用文档内嵌的 TrueType 程序（`/FontFile2`、
-  `/CIDToGIDMap`）绘制原字形，未内嵌时以系统字体替换并逐字回退；
-- 页面：MediaBox 与 `/Rotate` 沿页树 Parent 链继承。
-
-未覆盖的算符会被跳过（shading pattern、Type3 字体、复杂 blend mode 等），该页其余内容照常
-绘制，缺失部分在预览与导出中同样缺失。页面本身无法解析（加密、损坏、无页面）时显式报错，
-不产出空白文件；未内嵌字体用系统字体替代，字形与字宽可能与专业渲染器存在差异。
-
-## 依赖
-
-eframe / egui 0.37（glow）、egui_dnd 0.18、rfd 0.17、lopdf 0.39、medpdf 0.9.2、
-kamadak-exif 0.6、image 0.25、allsorts 0.16、weezl 0.2、hayro-ccitt 0.4、hayro-jbig2 0.3、
-flate2 1（rust_backend）。
+渲染器支持范围、工程约定与实现细节见 [AGENTS.md](./AGENTS.md)。
 
 ## License
 

@@ -224,6 +224,7 @@ pub trait Tool: Send + Sync {
 ### 3.8 PDF → 图片 与 页面预览（`engine/render.rs`）
 
 - 内置软件光栅器，按 DPI 缩放（默认 300，范围 36–600，附耗时提示）。
+- **算子覆盖**：路径 `m l c v y h re`，非零环绕 / 奇偶填充、描边、`B b` 系列；色彩支持灰度 / RGB / CMYK 与 `gs` 的 ca/CA 透明度；页面尺寸取 MediaBox，`/Rotate` 沿页树 Parent 链继承。未覆盖的算子（shading pattern、Type3 字体、复杂 blend mode 等）只跳过该算子，该页其余内容照常绘制，预览与导出保持一致。
 - `render_page_thumbnails` 按页批量渲染缩略图；UI 侧每帧限量渲染，避免大文档卡顿。
 - 填充遵循 PDF 语义：子路径**隐式闭合**（闭合边不得丢失），水平方向按像素累计覆盖率后只合成一次，实心区域才是设定颜色。
 - **文本取字**：字节是编码不是字符。优先按 `/ToUnicode` 反查（CID 字体按两字节码），其次 `/Encoding /Differences`（`uniXXXX`、`uXXXX`、单字符名与常用标点名），最后简单字体按 WinAnsi（含 0x80–0x9F 专用区）解释；复合字体缺映射且无内嵌程序则不画。
@@ -289,6 +290,7 @@ cargo test --release --lib --test integration
 - debug 构建可能触发 `libz-sys` 的 `D8050`（与 `-Z7` 相关）——验证功能优先用 `--release`。
 - `panic = "unwind"` 是**功能依赖**：worker 依赖 `catch_unwind` 把 panic 转成可见错误，不得改回 `abort`。
 - `strip = true` + `lto = true` + `opt-level = "z"` 共同压体积；CI 有 20 MB（UPX 前）硬门禁与 12 MB 软目标。
+- 免提权变体（`SPARROW_AS_INVOKER=1`）写受保护目录会失败，程序回退到 `文档\SparrowPDF`；需要直写时对目标目录一次性授权：`icacls "目标目录" /grant "%USERNAME%":(OI)(CI)M`。
 
 
 ### 4.3 测试策略
