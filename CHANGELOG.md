@@ -18,7 +18,7 @@
 
 ### Added
 
-- **Windows arm64**：新增 `SparrowPDF-windows-arm64.exe`，Windows 11 on ARM 原生运行；
+- **Windows arm64**：新增 `SparrowPDF-windows-arm64.exe`，Windows 10 / 11 on ARM 原生运行；
   与 x64 复用同一套步骤与校验（提权清单、调试段、体积上限、UPX）
 
 ### Changed

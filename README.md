@@ -12,8 +12,10 @@
 | 你的系统                            | 下载                             | 说明                       |
 | ----------------------------------- | -------------------------------- | -------------------------- |
 | Windows 10 / 11（Intel、AMD）       | `SparrowPDF-windows-x64.exe`     | 绿色版，双击即用           |
-| Windows 11 on ARM（骁龙 X 等）      | `SparrowPDF-windows-arm64.exe`   | 同上，原生 ARM64           |
+| Windows 10 / 11 on ARM              | `SparrowPDF-windows-arm64.exe`   | 同上，原生 ARM64           |
 | macOS 11+（Intel 与 Apple Silicon） | `SparrowPDF-macos-universal.dmg` | 通用二进制，一个包两种芯片 |
+
+ARM 版适用于骁龙 8cx / X 系列等 Windows on ARM 设备，系统最低 Windows 10。
 
 Windows 版启动时会请求管理员权限，原因见下文「Windows 的提权」。
 
