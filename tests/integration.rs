@@ -322,11 +322,14 @@ fn log_lines_are_appended_to_the_log_file() {
         "log file must gain a line: {}",
         path.display()
     );
-    assert!(
-        lines.last().unwrap().contains("integration-log-probe"),
-        "last log line must contain the probe message"
-    );
-    assert!(lines.last().unwrap().contains("[TEST]"));
+    // Other tests log concurrently, so the probe is not necessarily the last
+    // line: look for it among the lines this test appended.
+    let probe = lines
+        .iter()
+        .skip(before)
+        .find(|line| line.contains("integration-log-probe"))
+        .unwrap_or_else(|| panic!("no probe line among {} new lines", lines.len() - before));
+    assert!(probe.contains("[TEST]"));
 }
 
 // ---------------------------------------------------------------- model
@@ -552,6 +555,36 @@ fn folder_batch_writes_one_pdf_per_folder_into_itself() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A greyscale scan must stay greyscale: one component instead of three is a
+/// third of the bytes for the same page, and the JPEG encoder writes it as
+/// `DeviceGray` only when the source really has no colour.
+#[test]
+fn folder_batch_keeps_greyscale_scans_grey() {
+    let dir = scratch("folder-gray");
+    let album = dir.join("scan");
+    std::fs::create_dir_all(&album).unwrap();
+    let path = album.join("1.png");
+    let img = image::GrayImage::from_fn(1200, 1700, |x, y| {
+        image::Luma([((x * 7 + y * 13) % 251) as u8])
+    });
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let req = request(ToolId::FolderToPdf, vec![album.clone()], out_dir);
+    let outcome = run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+
+    let (width, height, filter, has_smask, colorspace) = first_image_xobject(&outcome.outputs[0]);
+    assert_eq!(filter, "DCTDecode");
+    assert_eq!(colorspace, "DeviceGray", "a grey scan must not become RGB");
+    assert!(!has_smask);
+    // 1200 x 1700 is ~145 DPI on A4: below the 300 DPI budget, so it is kept.
+    assert_eq!((width, height), (1200, 1700));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Regression: one unreadable image used to abort the whole batch. The folder
 /// that fails is now reported as skipped while the others still convert.
 #[test]
@@ -620,10 +653,12 @@ fn make_scan_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
     path
 }
 
-/// `(width, height, filter, has SMask)` of the page's colour image XObject.
+/// `(width, height, filter, has SMask, colour space)` of the page's image
+/// XObject.
 ///
-/// The alpha mask is an image too, so the RGB one is selected explicitly.
-fn first_image_xobject(path: &Path) -> (i64, i64, String, bool) {
+/// A page can hold an alpha mask next to the image, so a colour image wins over
+/// a grey one, and among greys the largest stream wins (the mask is tiny).
+fn first_image_xobject(path: &Path) -> (i64, i64, String, bool, String) {
     fn num(o: &lopdf::Object) -> i64 {
         match o {
             lopdf::Object::Integer(v) => *v,
@@ -633,6 +668,7 @@ fn first_image_xobject(path: &Path) -> (i64, i64, String, bool) {
     }
 
     let doc = lopdf::Document::load(path).expect("load output pdf");
+    let mut grey: Option<(usize, i64, i64, String, bool)> = None;
     for object in doc.objects.values() {
         let Ok(stream) = object.as_stream() else {
             continue;
@@ -644,13 +680,6 @@ fn first_image_xobject(path: &Path) -> (i64, i64, String, bool) {
         if !is_image {
             continue;
         }
-        let is_rgb = matches!(
-            stream.dict.get(b"ColorSpace"),
-            Ok(lopdf::Object::Name(n)) if n.as_slice() == b"DeviceRGB"
-        );
-        if !is_rgb {
-            continue;
-        }
         let filter = match stream.dict.get(b"Filter") {
             Ok(lopdf::Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
             Ok(lopdf::Object::Array(items)) => items
@@ -660,14 +689,28 @@ fn first_image_xobject(path: &Path) -> (i64, i64, String, bool) {
                 .unwrap_or_default(),
             _ => String::new(),
         };
-        return (
+        let colorspace = match stream.dict.get(b"ColorSpace") {
+            Ok(lopdf::Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
+            _ => String::new(),
+        };
+        let entry = (
+            stream.content.len(),
             num(stream.dict.get(b"Width").unwrap()),
             num(stream.dict.get(b"Height").unwrap()),
             filter,
             stream.dict.get(b"SMask").is_ok(),
         );
+        if colorspace == "DeviceRGB" {
+            return (entry.1, entry.2, entry.3, entry.4, colorspace);
+        }
+        if colorspace == "DeviceGray" && grey.as_ref().is_none_or(|g| entry.0 > g.0) {
+            grey = Some(entry);
+        }
     }
-    panic!("no image XObject in {}", path.display());
+    match grey {
+        Some((_, w, h, filter, smask)) => (w, h, filter, smask, "DeviceGray".to_string()),
+        None => panic!("no image XObject in {}", path.display()),
+    }
 }
 
 /// Regression: a folder of high-resolution scans used to produce a PDF far
@@ -699,7 +742,8 @@ fn folder_batch_stores_oversized_scans_at_print_resolution() {
     let balanced = run_with(sparrowpdf::tools::ScanQuality::Balanced, "balanced");
     let original = run_with(sparrowpdf::tools::ScanQuality::Original, "original");
 
-    let (w, h, filter, has_smask) = first_image_xobject(&balanced);
+    let (w, h, filter, has_smask, colorspace) = first_image_xobject(&balanced);
+    assert_eq!(colorspace, "DeviceRGB");
     assert_eq!(filter, "DCTDecode", "a scan must be stored as JPEG");
     // 300 DPI over the drawn box: a touch under 2480 x 3508 because the fixture
     // is very slightly wider than A4.
@@ -707,9 +751,12 @@ fn folder_batch_stores_oversized_scans_at_print_resolution() {
         (2450..=2490).contains(&w) && (3470..=3515).contains(&h),
         "expected the 300 DPI raster, got {w}x{h}"
     );
-    assert!(!has_smask, "a fully opaque scan must not carry an alpha mask");
+    assert!(
+        !has_smask,
+        "a fully opaque scan must not carry an alpha mask"
+    );
 
-    let (raw_w, _, raw_filter, raw_smask) = first_image_xobject(&original);
+    let (raw_w, _, raw_filter, raw_smask, _) = first_image_xobject(&original);
     assert_eq!(raw_w, 2500, "原图直通 keeps the source pixels");
     // Flate, or raw when compression would not pay off: either way the source
     // raster is what gets written.

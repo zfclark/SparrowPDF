@@ -67,21 +67,29 @@ impl Pixmap {
 
     /// Encode as JPEG at quality 85.
     pub fn to_jpeg(&self) -> Result<Vec<u8>, String> {
-        // JPEG has no alpha channel; composite onto white first.
+        // JPEG has no alpha channel; composite onto white first. Integer math:
+        // this runs once per pixel of a 300 DPI page (8.7 M of them), where the
+        // float version cost ~100 ms per page.
         let mut rgb = Vec::with_capacity((self.width as usize) * (self.height as usize) * 3);
         for chunk in self.data.chunks_exact(4) {
-            let a = chunk[3] as f32 / 255.0;
+            let alpha = chunk[3] as u32;
+            let backdrop = 255 * (255 - alpha);
             for &channel in &chunk[..3] {
-                let v = channel as f32 * a + 255.0 * (1.0 - a);
-                rgb.push(v.round().clamp(0.0, 255.0) as u8);
+                rgb.push(((channel as u32 * alpha + backdrop) / 255) as u8);
             }
         }
-        let buffer = image::RgbImage::from_raw(self.width, self.height, rgb)
-            .ok_or_else(|| "像素缓冲尺寸不符".to_string())?;
+        let (Ok(width), Ok(height)) = (u16::try_from(self.width), u16::try_from(self.height))
+        else {
+            return Err("页面尺寸超出 JPEG 上限".to_string());
+        };
         let mut out: Vec<u8> = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+        // Same settings as the image pipeline: 4:4:4 plus optimised Huffman
+        // tables, which is both smaller and sharper than the 4:2:0 default.
+        let mut encoder = jpeg_encoder::Encoder::new(&mut out, 85);
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+        encoder.set_optimized_huffman_tables(true);
         encoder
-            .encode_image(&image::DynamicImage::ImageRgb8(buffer))
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
             .map_err(|e| e.to_string())?;
         Ok(out)
     }

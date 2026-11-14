@@ -38,6 +38,8 @@ weezl = "0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hayro-ccitt = "0.4"
 hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"] }
+fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["simd"] }
 
 [build-dependencies]
 # Embeds assets/app.ico into the Windows executable (taskbar / Explorer icon).
