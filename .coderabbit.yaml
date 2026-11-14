@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://docs.coderabbit.ai/schema/schema.v3.json
+# CodeRabbit 配置（V3）
+#
+# language 决定评审输出语言：总结、行内建议、修复提案都用简体中文，
+# 行内评论里附带的 "Prompt for AI Agents" 也随之一并中文。
+# 若仓库未开通 V3 预览（CodeRabbit 白名单），删掉 version 一行即回落到 V2，
+# language 在两版里的位置与取值相同，无需改动。
+version: 3
+language: "zh-CN"
