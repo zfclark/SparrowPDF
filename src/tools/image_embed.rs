@@ -381,7 +381,10 @@ fn alpha_is_opaque(image: &DynamicImage) -> bool {
         DynamicImage::ImageRgba8(buffer) => buffer.chunks_exact(4).all(|p| p[3] >= OPAQUE_ALPHA),
         DynamicImage::ImageLumaA8(buffer) => buffer.chunks_exact(2).all(|p| p[1] >= OPAQUE_ALPHA),
         // 16-bit variants are rare enough to take the converting path.
-        other => other.to_rgba8().chunks_exact(4).all(|p| p[3] >= OPAQUE_ALPHA),
+        other => other
+            .to_rgba8()
+            .chunks_exact(4)
+            .all(|p| p[3] >= OPAQUE_ALPHA),
     }
 }
 
@@ -401,7 +404,10 @@ fn jpeg_from_dynamic(
 ) -> Result<EncodedJpeg, ToolError> {
     let gray = matches!(
         image.color(),
-        image::ColorType::L8 | image::ColorType::La8 | image::ColorType::L16 | image::ColorType::La16
+        image::ColorType::L8
+            | image::ColorType::La8
+            | image::ColorType::L16
+            | image::ColorType::La16
     );
     let (tw, th) = target;
     let (raw, color) = if gray {
@@ -435,7 +441,10 @@ fn raster_object(image: DynamicImage) -> ImageObject {
         }
     } else if matches!(
         image.color(),
-        image::ColorType::L8 | image::ColorType::La8 | image::ColorType::L16 | image::ColorType::La16
+        image::ColorType::L8
+            | image::ColorType::La8
+            | image::ColorType::L16
+            | image::ColorType::La16
     ) {
         ImageObject::Raster {
             pixels: image.to_luma8().into_raw(),

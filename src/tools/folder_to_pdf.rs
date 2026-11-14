@@ -130,9 +130,10 @@ impl PagePolicy {
         let page = self.page_size.page(orientation);
         // A card template keeps its slot size on odd pages too, so one stray
         // 身份证 is not stretched over the whole sheet.
-        let fit = self
-            .slot_size
-            .unwrap_or((page.0 - self.single_margin * 2.0, page.1 - self.single_margin * 2.0));
+        let fit = self.slot_size.unwrap_or((
+            page.0 - self.single_margin * 2.0,
+            page.1 - self.single_margin * 2.0,
+        ));
         Sheet::Fixed {
             page,
             fit,
@@ -740,7 +741,14 @@ fn render_with_size_guard(
     let mut budget = policy.budget;
     let mut passes = 0u32;
     loop {
-        let bytes = render_document(job, policy.with_budget(budget), cancel, progress, index, total)?;
+        let bytes = render_document(
+            job,
+            policy.with_budget(budget),
+            cancel,
+            progress,
+            index,
+            total,
+        )?;
         if bytes.len() as u64 <= limit {
             return Ok((bytes, passes));
         }
@@ -791,12 +799,11 @@ fn render_document(
             }
             PagePlan::Two(..) => {
                 // Both slots sit on the sheet the policy fixed for this page.
-                let page = images
-                    .first()
-                    .map(|image| image.page_box)
-                    .ok_or_else(|| ToolError::Internal {
+                let page = images.first().map(|image| image.page_box).ok_or_else(|| {
+                    ToolError::Internal {
                         detail: "合并页缺少图片".to_string(),
-                    })?;
+                    }
+                })?;
                 let entries: Vec<_> = images
                     .into_iter()
                     .enumerate()
@@ -871,7 +878,11 @@ fn prepare_pages(
     if workers <= 1 {
         for (slot, job) in jobs.iter().enumerate() {
             check_cancel(cancel)?;
-            done[slot] = Some(image_embed::prepare_image(job.path, job.sheet, policy.budget)?);
+            done[slot] = Some(image_embed::prepare_image(
+                job.path,
+                job.sheet,
+                policy.budget,
+            )?);
             report(progress);
         }
     } else {
@@ -881,18 +892,20 @@ fn prepare_pages(
                 .chunks(chunk)
                 .enumerate()
                 .map(|(chunk_index, slice)| {
-                    scope.spawn(move || -> Result<Vec<(usize, image_embed::PreparedImage)>, ToolError> {
-                        let mut out = Vec::with_capacity(slice.len());
-                        for (offset, job) in slice.iter().enumerate() {
-                            check_cancel(cancel)?;
-                            out.push((
-                                chunk_index * chunk + offset,
-                                image_embed::prepare_image(job.path, job.sheet, policy.budget)?,
-                            ));
-                            report(progress);
-                        }
-                        Ok(out)
-                    })
+                    scope.spawn(
+                        move || -> Result<Vec<(usize, image_embed::PreparedImage)>, ToolError> {
+                            let mut out = Vec::with_capacity(slice.len());
+                            for (offset, job) in slice.iter().enumerate() {
+                                check_cancel(cancel)?;
+                                out.push((
+                                    chunk_index * chunk + offset,
+                                    image_embed::prepare_image(job.path, job.sheet, policy.budget)?,
+                                ));
+                                report(progress);
+                            }
+                            Ok(out)
+                        },
+                    )
                 })
                 .collect();
             for handle in handles {
