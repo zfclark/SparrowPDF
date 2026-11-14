@@ -69,13 +69,47 @@ SPARROW_AS_INVOKER=1 cargo build --release
 
 macOS 无此机制：权限由 POSIX/ACL 与 TCC 决定，`.app` 以当前用户身份运行。
 
-## 从源码构建
+## 从源码开发
+
+最低 Rust 1.95（edition 2021）。Windows 另需 MSVC 与 Windows SDK，若 `cl.exe` 报
+`C1083 无法打开 stddef.h`，说明当前终端缺 `INCLUDE` / `LIB`，改用 VS 开发者命令提示符。
 
 ```bash
-cargo build --release
+cargo run                              # 开发期运行，改完即可看效果
+cargo build --release --locked         # 本地发布构建（与 CI 一致）
+cargo check --release --all-targets    # 类型检查，含测试
+cargo test --release --lib --test integration
 ```
 
-本地配置最低 Rust 1.95（edition 2021）。
+`check` 与 `test` 一律带 `--release`：debug 构建会触发 `libz-sys` 的 `D8050`，渲染路径也慢到
+无法判断性能。需要 Windows 免提权变体时用 `SPARROW_AS_INVOKER=1 cargo build --release`，
+写受保护目录会失败并回退到「文档\SparrowPDF」，换取可拖放文件（见上文「Windows 的提权」）。
+
+工程约束、分层、测试策略与提交规范以 [AGENTS.md](./AGENTS.md) 为准；实现细节按主题在
+[docs/](./docs/) 里查。代码改动请先读该主题文档再动手。
+
+### 贡献流程
+
+只有两条分支：`dev` 开发，`main` 发布。改动直接提交到 `dev`，`main` 上的每个提交都对应一次发版。
+
+```bash
+git switch dev                          # 首次：git switch -c dev origin/dev
+
+# 改代码 → cargo check --release --all-targets → cargo test --release --lib --test integration
+
+git commit -m "fix(merge): 合并时按用户拖拽结果写入页序"
+git push origin dev
+```
+
+- 提交信息遵循 Conventional Commits，标题与正文用中文、type 与 scope 用英文：
+  `feat` / `fix` / `perf` / `refactor` / `docs` / `test` / `build` / `ci` / `chore` / `style`。
+  一次提交只做一件事，便于单条回滚。
+- 提交前质量门必须全绿：`cargo check --release --all-targets` 无警告，
+  `cargo test --release --lib --test integration` 全通过；涉及界面的改动附一次实际启动确认。
+- 用户可见的行为变化，同步在 `CHANGELOG.md` 的 `[Unreleased]` 下加一条；测试与文档改动不必。
+- 不直接提交 `main`：发版由维护者把 `dev` 合入 `main` 并打 `V主.副.修订.YYYYMMDD` tag，
+  贡献者不要改 `Cargo.toml` 里的版本号。
+- 不提交 `target/`、`.probe/` 与调试素材；不引入网络请求、遥测与自动更新。
 
 ## 已知限制
 
