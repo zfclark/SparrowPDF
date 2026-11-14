@@ -107,7 +107,9 @@ git push origin dev
 - 提交前质量门必须全绿：`cargo check --release --all-targets` 无警告，
   `cargo test --release --lib --test integration` 全通过；涉及界面的改动附一次实际启动确认。
 - 用户可见的行为变化，同步在 `CHANGELOG.md` 的 `[Unreleased]` 下加一条；测试与文档改动不必。
-- 不直接提交 `main`：发版由维护者把 `dev` 合入 `main` 并打 `V主.副.修订.YYYYMMDD` tag，
+- 没有写权限时先 fork，从 `dev` 切出改动，向本仓库的 `dev` 提 PR；有写权限就直接提交 `dev`。
+- 不直接提交 `main`：发版由维护者在 GitHub 开 `dev` → `main` 的 PR，评审通过后用
+  merge commit 合并（不用 squash），再在 `main` 上打 `V主.副.修订.YYYYMMDD` tag；
   贡献者不要改 `Cargo.toml` 里的版本号。
 - 不提交 `target/`、`.probe/` 与调试素材；不引入网络请求、遥测与自动更新。
 

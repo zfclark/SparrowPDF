@@ -466,11 +466,11 @@ dev       ●──●──●──●───●──●──●──●�
 
 规则：
 
-1. **日常开发只提交 `dev`**：禁止直接提交或推送到 `main`；`main` 只接受发版合并，保证任何时刻 `main` 上的状态都能发布。
+1. **日常开发只提交 `dev`**：禁止直接提交或推送到 `main`。`main` 开启分支保护（禁止直接 push、必须经 PR），任何时刻 `main` 上的状态都能发布。
 2. **`dev` 始终可编译**：每次提交前跑完 4.4 的质量门，`dev` 上任何一条提交都应能 `cargo build --release`，否则发版前无法用二分定位回归。
 3. **一次提交一个议题**：分支只有两条，原子性靠提交而不是分支保证，功能与格式重排不混在同一条提交里。
-4. **合并方式固定**：`dev` → `main` 用 `--no-ff`，在 `main` 上留下一次发布边界，便于按区间回溯该版本全部改动。
-5. **发布以 tag 为准**：`V主.副.修订.YYYYMMDD` 打在 `main` 上，推送后不得移动或复用；发版后把 `main` 回合 `dev`（`git switch dev && git merge --ff-only main`），避免两条线分叉。
+4. **发版走 PR**：`dev` → `main` 通过 GitHub PR 合入，评审意见与合并记录留在 PR 上；合并方式在 PR 上选 **Create a merge commit**（等价 `--no-ff`），在 `main` 上留下一次发布边界。**不要**用 Squash（`dev` 与 `main` 会分叉）或 Rebase（改写已共享历史）。
+5. **发布以 tag 为准**：PR 合入后，在**合并后的 `main` 提交**上打 `V主.副.修订.YYYYMMDD`，推送后不得移动或复用；随后把 `main` 回合 `dev`（`git switch dev && git merge --ff-only main`），避免两条线分叉。
 6. **不改写共享历史**：`main`、`dev` 均由多人共享，不 `--amend`、不 `rebase`、不 `push --force`；远程同步用 `git pull --rebase`。需要试验性改动时用本地临时分支或 `git worktree`，验证后 squash 回 `dev` 并删除。
 7. **本地先对齐再开工**：`git fetch origin` 后确认 `dev` 与 `origin/dev` 无分叉；本地 `main` 不得承载未发布的开发提交。
 
@@ -483,10 +483,13 @@ git switch dev                        # 首次：git switch -c dev origin/dev
 # …实现 + 4.4 质量门… → 按 6.3 提交，然后
 git push origin dev
 
-# 发版（push 与 tag 均需人工授权，见 7.3）
-git switch main && git merge --no-ff dev
-git push origin main
+# 发版（push / 提 PR / 合并 / 打 tag 均需人工授权，见 7.3）
+# ① 网页：Compare & pull request，base = main，head = dev；合并时选 Create a merge commit
+#    千万不要删 head 分支（dev 是常驻分支）
+# ② 合并后本地取回，并在合并提交上打 tag
+git switch main && git pull --ff-only
 git tag -a V0.6.1.20261120 -m "<该版本变更摘要>"
+git push origin main
 git push origin V0.6.1.20261120
 git switch dev && git merge --ff-only main
 ```
@@ -530,15 +533,15 @@ git switch dev && git merge --ff-only main
 
 **4）评审**
 
-- 输入：`dev` 上待发版的提交 + 测试结论。
-- 动作：检查分层约束、错误处理、落盘路径、取消与进度、UI 一致性与明暗适配、测试有效性、提交信息规范。
-- 交付物：评审意见（阻塞项 / 建议项分类）与最终结论。
-- 准出：阻塞项清零；作者非评审人；合并方式符合 6.6。
+- 输入：`dev` 上待发版的提交 + 测试结论 + GitHub PR（base `main`，head `dev`）。
+- 动作：在 PR 上检查分层约束、错误处理、落盘路径、取消与进度、UI 一致性与明暗适配、测试有效性、提交信息规范；意见以 review comment 留痕。
+- 交付物：PR review 记录（阻塞项 / 建议项分类）与批准结论。
+- 准出：阻塞项清零；作者非评审人（无第二人时由作者自审并显式记录「自审」）；合并方式为 merge commit，符合 6.6。
 
 **5）发布**
 
 - 输入：`dev` 上通过评审、准备发版的提交。
-- 动作：确认 `dev` 质量门全绿 → `git switch main && git merge --no-ff dev`（保留发布边界）→ 确认版本号（`Cargo.toml` + `Cargo.lock` 的前三段、`src/version.rs` 的日期位，三处与 tag 对齐）→ 更新 `CHANGELOG.md` → 打 annotated tag `V主.副.修订.YYYYMMDD` → 推送 `main` 与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）→ 把 `main` 回合 `dev`。
+- 动作：确认 `dev` 质量门全绿 → 在 `dev` 上改版本号与 `CHANGELOG.md` 并提交（`chore(release): 版本号 A -> B`）→ 推 `dev` → 在 GitHub 开 PR（base `main`，head `dev`）→ 评审通过后以 **Create a merge commit** 合并（不删 head 分支）→ 本地 `git switch main && git pull --ff-only`，确认版本号三处对齐（`Cargo.toml` + `Cargo.lock` 前三段、`src/version.rs` 日期位）→ 在合并后的 `main` 提交上打 annotated tag `V主.副.修订.YYYYMMDD` → 推送 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）→ 把 `main` 回合 `dev`。
 - 交付物：tag、Release 页面（含变更摘要与产物校验信息）、更新后的 CHANGELOG。
 - 准出：双平台产物可下载且可运行；`guard` 校验（tag 格式、版本一致、打包资源齐全）通过。
 - 回滚预案：产物异常时删除 Release 并标记 tag 作废，修复后升 patch 版本重新发布；不得移动既有 tag。
@@ -688,10 +691,11 @@ git switch dev && git merge --ff-only main
 cargo check --release --all-targets
 cargo test --release --lib --test integration
 
-# 分支（只有 main / dev 两条，日常在 dev，main 只由发版合并推进）
+# 分支（只有 main / dev 两条，日常在 dev，main 只经 PR 合并）
 git fetch origin
 git switch dev                                  # 首次：git switch -c dev origin/dev
 git push origin dev
+# 发版 PR：网页 Compare & pull request（base main / head dev），合并选 Create a merge commit
 
 # 发布构建（CI 同款）
 cargo build --release --locked
@@ -701,9 +705,10 @@ SPARROW_AS_INVOKER=1 cargo build --release      # Windows 免提权变体
 # 改版本前三段：Cargo.toml 的 version 与 Cargo.lock 同步（cargo check 自动写锁文件）
 # 改日期位：src/version.rs 的 DATE，改成发布当天
 cargo check --release                            # 同步 Cargo.lock 中的版本号
+git switch main && git pull --ff-only             # PR 合并完成后取回 main
 git tag -a V0.4.2.20261104 -m "<该版本变更摘要>"
-git push origin main
-git push origin V0.4.2.20261104
+git push origin V0.4.2.20261104                  # tag 必须在 main 的合并提交上
+git switch dev && git merge --ff-only main       # 回合，避免两条线分叉
 
 # 日志与偏好定位（排查用）
 %LOCALAPPDATA%\sparrowpdf\sparrowpdf.log
