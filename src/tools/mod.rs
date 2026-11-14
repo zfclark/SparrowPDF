@@ -76,6 +76,9 @@ pub enum ToolOptions {
         /// layout. Off means those pages are converted full-bleed, which is
         /// what a form preset (入团志愿书) needs for "other pages as usual".
         inset_single_pages: bool,
+        /// How hard to shrink oversized scans. Independent of the layout
+        /// preset: switching templates must not silently change print quality.
+        scan_quality: ScanQuality,
     },
     Merge,
     Split {
@@ -149,6 +152,7 @@ impl ToolOptions {
                     merge_spec: String::new(),
                     auto_rotate: true,
                     inset_single_pages: true,
+                    scan_quality: ScanQuality::Balanced,
                 };
                 options.apply_batch_template(template);
                 options
@@ -212,6 +216,59 @@ pub enum BatchPageMode {
     Single,
     /// Two images share one landscape page.
     TwoPerPage,
+}
+
+/// How much of a scan's resolution the batch tool is allowed to throw away.
+///
+/// A phone photo or a 600 DPI flatbed scan carries far more pixels than a
+/// printed sheet can resolve, and the surplus is pure file size: 13 A4 pages
+/// of 600 DPI PNGs easily make a 60 MB PDF. Each level caps the *effective*
+/// resolution once the image is drawn on its page, so the pixels that do get
+/// written are exactly the ones the printer would use.
+///
+/// The levels are also the starting points of the size guard in
+/// `folder_to_pdf`: an output above [`SCAN_SIZE_LIMIT`] is re-rendered one step
+/// tighter until it fits (see `image_embed::ScanBudget::tightened`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanQuality {
+    /// 150 DPI — smallest. Fine for reading on screen and for filing.
+    Small,
+    /// 300 DPI — the default: the common print standard for a scanned form,
+    /// and what a laser printer can actually resolve on a sheet.
+    #[default]
+    Balanced,
+    /// Keep the source pixels untouched (no re-encode, no size guard).
+    Original,
+}
+
+/// Output size above which a batch PDF is re-rendered with a tighter scan
+/// budget: 20 MiB.
+pub const SCAN_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
+
+impl ScanQuality {
+    pub const ALL: [ScanQuality; 3] = [
+        ScanQuality::Balanced,
+        ScanQuality::Small,
+        ScanQuality::Original,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScanQuality::Small => "更小体积（150 DPI）",
+            ScanQuality::Balanced => "标准（300 DPI，推荐）",
+            ScanQuality::Original => "不压缩（原图直通）",
+        }
+    }
+
+    /// Resolution / quality budget this level starts from; `None` disables
+    /// both the re-encode and the size guard.
+    pub(crate) fn budget(self) -> Option<crate::tools::image_embed::ScanBudget> {
+        match self {
+            ScanQuality::Small => Some(crate::tools::image_embed::ScanBudget::new(150.0, 78)),
+            ScanQuality::Balanced => Some(crate::tools::image_embed::ScanBudget::new(300.0, 85)),
+            ScanQuality::Original => None,
+        }
+    }
 }
 
 // ------------------------------------------------------------------ presets
@@ -479,6 +536,9 @@ impl ToolOptions {
             merge_spec,
             auto_rotate,
             inset_single_pages,
+            // Print quality is a user preference, not part of a layout: a
+            // template switch (入团志愿书 → 身份证) must not reset it.
+            scan_quality: _,
         } = self
         else {
             return;

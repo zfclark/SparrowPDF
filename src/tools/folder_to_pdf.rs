@@ -19,13 +19,10 @@ use lopdf::{dictionary, Document, Object};
 
 use crate::engine::{pdf_io, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
-use crate::tools::image_embed::{
-    self, add_image_xobject, attach_page, placement_matrix, read_exif_orientation,
-    register_xobject, rotate_cw_code, write_content_stream, ImagePageLayout, PAGE_MARGIN,
-};
+use crate::tools::image_embed::{self, add_page, ScanBudget, Sheet, PAGE_MARGIN};
 use crate::tools::{
     check_cancel, ensure_dir, BatchPageMode, CancelFlag, Orientation, PageSize, Progress, Tool,
-    ToolOptions, ToolRequest,
+    ToolOptions, ToolRequest, SCAN_SIZE_LIMIT,
 };
 
 /// Outer margin between the page edge and the two image slots, in points.
@@ -37,9 +34,9 @@ const SLOT_GAP: f32 = 18.0;
 ///
 /// Every page — single-image or two-image — is written from this one value.
 /// The mode, not the page, owns the orientation: in two-per-page mode a page
-/// that ends up with a single image (a trailing odd image, or an image the
-/// merge spec leaves alone) still uses the chosen orientation, paper size and
-/// margin, so one PDF never mixes page sizes.
+/// that ends up with a single image (a trailing odd image, or one the merge
+/// spec leaves alone) still uses the chosen orientation, paper size and margin,
+/// so one PDF never mixes page sizes.
 #[derive(Debug, Clone, Copy)]
 struct PagePolicy {
     /// Orientation of pages holding one image; `None` follows each image.
@@ -53,6 +50,9 @@ struct PagePolicy {
     /// Fixed slot size for card-size copies; `None` halves the page.
     slot_size: Option<(f32, f32)>,
     auto_rotate: bool,
+    /// Storage budget for oversized scans (see `ScanQuality`). Carried here
+    /// because the size guard re-renders a folder with a tighter budget.
+    budget: Option<ScanBudget>,
 }
 
 impl PagePolicy {
@@ -64,6 +64,7 @@ impl PagePolicy {
         slot_size: Option<(f32, f32)>,
         inset_single_pages: bool,
         auto_rotate: bool,
+        budget: Option<ScanBudget>,
     ) -> Self {
         match mode {
             BatchPageMode::Single => Self {
@@ -73,6 +74,7 @@ impl PagePolicy {
                 page_size,
                 slot_size,
                 auto_rotate,
+                budget,
             },
             // Two-per-page owns the page geometry for the whole document.
             // Presets may still ask for full-bleed single pages (入团志愿书
@@ -88,8 +90,14 @@ impl PagePolicy {
                 page_size,
                 slot_size,
                 auto_rotate,
+                budget,
             },
         }
+    }
+
+    /// The same layout with a different scan budget (size-guard passes).
+    fn with_budget(self, budget: Option<ScanBudget>) -> Self {
+        Self { budget, ..self }
     }
 
     /// The orientation every page must share, when the layout fixes one.
@@ -97,18 +105,116 @@ impl PagePolicy {
         self.single_orientation
     }
 
-    /// Layout for a page holding a single image.
-    fn single_layout(&self) -> ImagePageLayout {
-        ImagePageLayout {
-            orientation: self.single_orientation,
-            auto_rotate: self.auto_rotate,
-            margin: self.single_margin,
-            page_size: self.page_size,
-            // A card template keeps its slot size on odd pages too, so one
-            // stray 身份证 is not stretched over the whole sheet.
-            max_size: self.slot_size,
+    /// Where the images of one page are drawn.
+    ///
+    /// This is the only place that knows about margins, card slots and the
+    /// two-slot geometry; `image_embed` just fits an image into what it is
+    /// handed. Returning one [`Sheet`] per image is what lets page images be
+    /// prepared off the main thread.
+    fn sheets(&self, plan: &PagePlan) -> Vec<Sheet> {
+        match plan {
+            PagePlan::One(_) => vec![self.single_sheet()],
+            PagePlan::Two(..) => self.pair_sheets().to_vec(),
         }
     }
+
+    /// Sheet of a page holding a single image.
+    fn single_sheet(&self) -> Sheet {
+        let Some(orientation) = self.single_orientation else {
+            // Follows the image: no forced direction, so no 90° turn either.
+            return Sheet::Follow {
+                page_size: self.page_size,
+                margin: self.single_margin,
+            };
+        };
+        let page = self.page_size.page(orientation);
+        // A card template keeps its slot size on odd pages too, so one stray
+        // 身份证 is not stretched over the whole sheet.
+        let fit = self
+            .slot_size
+            .unwrap_or((page.0 - self.single_margin * 2.0, page.1 - self.single_margin * 2.0));
+        Sheet::Fixed {
+            page,
+            fit,
+            center: (page.0 / 2.0, page.1 / 2.0),
+            landscape: orientation == Orientation::Landscape,
+            auto_rotate: self.auto_rotate,
+        }
+    }
+
+    /// Sheets of a two-image page.
+    ///
+    /// Landscape pages hold the slots side by side (portrait slots); portrait
+    /// pages stack them vertically (landscape slots). `slot_size` switches to
+    /// card-size copies (身份证): both slots keep their real dimensions and the
+    /// pair is centred on the sheet, so the copy prints at 1:1 instead of being
+    /// blown up to half a page.
+    fn pair_sheets(&self) -> [Sheet; 2] {
+        let (page_w, page_h) = self.page_size.page(self.pair_orientation);
+        let (slot_w, slot_h, slots) = match self.slot_size {
+            Some((w, h)) => {
+                let slots = match self.pair_orientation {
+                    Orientation::Landscape => {
+                        let x = (page_w - (2.0 * w + SLOT_GAP)) / 2.0;
+                        let y = (page_h - h) / 2.0;
+                        [(x, y), (x + w + SLOT_GAP, y)]
+                    }
+                    Orientation::Portrait => {
+                        let x = (page_w - w) / 2.0;
+                        let y = (page_h - (2.0 * h + SLOT_GAP)) / 2.0;
+                        [(x, y), (x, y + h + SLOT_GAP)]
+                    }
+                };
+                (w, h, slots)
+            }
+            None => match self.pair_orientation {
+                Orientation::Landscape => {
+                    let (w, h) = (
+                        (page_w - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
+                        page_h - 2.0 * SLOT_MARGIN,
+                    );
+                    (
+                        w,
+                        h,
+                        [
+                            (SLOT_MARGIN, SLOT_MARGIN),
+                            (SLOT_MARGIN + w + SLOT_GAP, SLOT_MARGIN),
+                        ],
+                    )
+                }
+                Orientation::Portrait => {
+                    let (w, h) = (
+                        page_w - 2.0 * SLOT_MARGIN,
+                        (page_h - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
+                    );
+                    (
+                        w,
+                        h,
+                        [
+                            (SLOT_MARGIN, SLOT_MARGIN),
+                            (SLOT_MARGIN, SLOT_MARGIN + h + SLOT_GAP),
+                        ],
+                    )
+                }
+            },
+        };
+        let landscape = slot_w > slot_h;
+        slots.map(|(x, y)| Sheet::Fixed {
+            page: (page_w, page_h),
+            fit: (slot_w, slot_h),
+            center: (x + slot_w / 2.0, y + slot_h / 2.0),
+            landscape,
+            auto_rotate: self.auto_rotate,
+        })
+    }
+}
+
+/// One folder's conversion job: what to read, how to lay it out, where it goes.
+struct PlannedFolder<'a> {
+    folder: &'a InputFile,
+    images: Vec<PathBuf>,
+    plans: Vec<PagePlan>,
+    out_path: PathBuf,
 }
 
 pub struct FolderToPdf;
@@ -153,6 +259,7 @@ impl Tool for FolderToPdf {
             spec,
             auto_rotate,
             inset_single_pages,
+            scan_quality,
         ) = match &req.options {
             ToolOptions::FolderToPdf {
                 template,
@@ -165,6 +272,7 @@ impl Tool for FolderToPdf {
                 merge_spec,
                 auto_rotate,
                 inset_single_pages,
+                scan_quality,
             } => (
                 *template,
                 *mode,
@@ -176,6 +284,7 @@ impl Tool for FolderToPdf {
                 merge_spec.clone(),
                 *auto_rotate,
                 *inset_single_pages,
+                *scan_quality,
             ),
             // Every other tool reports a mismatched option set instead of
             // falling back to defaults: a silent fallback is precisely how a
@@ -200,16 +309,15 @@ impl Tool for FolderToPdf {
         let mut used_names: HashSet<PathBuf> = HashSet::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut total_images = 0usize;
+        // Size telemetry for the summary: how big the largest artifact ended
+        // up, and how many folders needed the 20 MB guard.
+        let mut largest = 0u64;
+        let mut compressed = 0usize;
+        let mut oversized = 0usize;
 
         // Phase 1 — plan. Every output name is known before a single page is
         // rendered, so the caller can be asked about existing files up front
         // instead of after minutes of conversion.
-        struct PlannedFolder<'a> {
-            folder: &'a crate::model::InputFile,
-            images: Vec<PathBuf>,
-            plans: Vec<PagePlan>,
-            out_path: PathBuf,
-        }
         let mut planned: Vec<PlannedFolder<'_>> = Vec::new();
         for folder in &req.inputs {
             let images = collect_images(&folder.path);
@@ -269,8 +377,6 @@ impl Tool for FolderToPdf {
                 ),
             );
 
-            let mut doc = Document::with_version("1.7");
-            let pages_id = build_document_skeleton(&mut doc);
             // Built once per folder, then reused by every page.
             let policy = PagePolicy::new(
                 mode,
@@ -280,16 +386,22 @@ impl Tool for FolderToPdf {
                 slot_size,
                 inset_single_pages,
                 auto_rotate,
+                scan_quality.budget(),
             );
-            for (page_index, plan) in job.plans.iter().enumerate() {
-                check_cancel(cancel)?;
-                render_page(&mut doc, pages_id, page_index, plan, &job.images, policy)?;
-            }
+            let (bytes, passes) = render_with_size_guard(
+                &job,
+                policy,
+                cancel,
+                progress,
+                index,
+                total,
+                SCAN_SIZE_LIMIT,
+            )?;
 
             // One unwritable / locked output must not discard the folders
             // that do succeed: record, log, continue — surfaced as
             // PartialSuccess at the end.
-            let saved = pdf_io::save_document(&mut doc, &out_path, req.conflict)
+            let saved = pdf_io::write_file_atomic(&out_path, &bytes, req.conflict)
                 .and_then(|_| validate::assert_page_count(&out_path, job.plans.len() as u32, None))
                 // A fixed-orientation layout must hold for *every* page; a
                 // mixed document means a page type lost the policy again.
@@ -309,6 +421,21 @@ impl Tool for FolderToPdf {
                 continue;
             }
 
+            crate::engine::logging::log(
+                "INFO",
+                &format!(
+                    "批量转换：{} → {:.1} MB（重压 {passes} 次）",
+                    out_path.display(),
+                    bytes.len() as f64 / (1024.0 * 1024.0)
+                ),
+            );
+            if passes > 0 {
+                compressed += 1;
+            }
+            if bytes.len() as u64 > SCAN_SIZE_LIMIT {
+                oversized += 1;
+            }
+            largest = largest.max(bytes.len() as u64);
             outputs.push(out_path);
             total_images += job.images.len();
         }
@@ -327,11 +454,20 @@ impl Tool for FolderToPdf {
 
         progress.report(1.0, "完成".to_string());
 
-        let summary = format!(
-            "已生成 {} 个 PDF（共 {total_images} 张图片，模板：{}）",
+        let mut summary = format!(
+            "已生成 {} 个 PDF（共 {total_images} 张图片，模板：{}，最大 {:.1} MB）",
             outputs.len(),
-            template.label
+            template.label,
+            largest as f64 / (1024.0 * 1024.0)
         );
+        if compressed > 0 {
+            summary.push_str(&format!("，{compressed} 个超出 20 MB 已重压"));
+        }
+        // The guard bottoms out at 96 DPI / quality 45; a scan that is still
+        // huge after that must be reported, not silently shipped.
+        if oversized > 0 {
+            summary.push_str(&format!("，{oversized} 个压缩后仍超过 20 MB"));
+        }
         if !skipped.is_empty() {
             let detail = skipped
                 .iter()
@@ -585,6 +721,190 @@ fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, T
 
 // ---------------------------------------------------------------- rendering
 
+/// Render one folder into the bytes to write, tightening the scan budget
+/// while the artifact stays above [`SCAN_SIZE_LIMIT`].
+///
+/// The document is serialised in memory, so the exact byte length is known
+/// before anything touches the disk — the file is written exactly once. A
+/// tighter pass only re-renders; it costs seconds and only runs for documents
+/// that would otherwise be uncomfortably large.
+fn render_with_size_guard(
+    job: &PlannedFolder<'_>,
+    policy: PagePolicy,
+    cancel: &CancelFlag,
+    progress: &Progress,
+    index: usize,
+    total: usize,
+    limit: u64,
+) -> Result<(Vec<u8>, u32), ToolError> {
+    let mut budget = policy.budget;
+    let mut passes = 0u32;
+    loop {
+        let bytes = render_document(job, policy.with_budget(budget), cancel)?;
+        if bytes.len() as u64 <= limit {
+            return Ok((bytes, passes));
+        }
+        // `tightened` returns `None` at the ladder floor (`不压缩` included),
+        // so an unfixable document is reported as-is instead of looping.
+        let Some(tighter) = budget.and_then(ScanBudget::tightened) else {
+            return Ok((bytes, passes));
+        };
+        budget = Some(tighter);
+        passes += 1;
+        progress.report(
+            index as f32 / total as f32,
+            format!(
+                "{} 超过 {} MB，正在压缩（第 {passes} 次）",
+                job.folder.display_name(),
+                limit / (1024 * 1024)
+            ),
+        );
+    }
+}
+
+/// Build one folder's PDF and serialise it.
+fn render_document(
+    job: &PlannedFolder<'_>,
+    policy: PagePolicy,
+    cancel: &CancelFlag,
+) -> Result<Vec<u8>, ToolError> {
+    // Images first (parallel, no PDF state), then the page objects (serial).
+    let pages = prepare_pages(job, policy, cancel)?;
+
+    let mut doc = Document::with_version("1.7");
+    let pages_id = build_document_skeleton(&mut doc);
+    for (page_index, (plan, images)) in job.plans.iter().zip(pages).enumerate() {
+        check_cancel(cancel)?;
+        match plan {
+            PagePlan::One(_) => {
+                let Some(image) = images.into_iter().next() else {
+                    return Err(ToolError::Internal {
+                        detail: "单图页缺少图片".to_string(),
+                    });
+                };
+                let page = image.page_box;
+                let entries = vec![(format!("Im{}", page_index + 1), image)];
+                add_page(&mut doc, pages_id, page, entries)?;
+            }
+            PagePlan::Two(..) => {
+                // Both slots sit on the sheet the policy fixed for this page.
+                let page = images
+                    .first()
+                    .map(|image| image.page_box)
+                    .ok_or_else(|| ToolError::Internal {
+                        detail: "合并页缺少图片".to_string(),
+                    })?;
+                let entries: Vec<_> = images
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, image)| (format!("Im{}-{}", page_index + 1, slot + 1), image))
+                    .collect();
+                add_page(&mut doc, pages_id, page, entries)?;
+            }
+        }
+    }
+    pdf_io::document_bytes(&mut doc)
+}
+
+/// How many images to prepare at once.
+///
+/// Decoding a 600 DPI RGBA page peaks around 200 MB, so the pool stays small
+/// even on a 16-core machine: past four workers the batch is memory bound and
+/// the extra threads only raise the peak.
+const MAX_PREPARE_WORKERS: usize = 4;
+
+fn worker_count(items: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    cores.min(MAX_PREPARE_WORKERS).min(items).max(1)
+}
+
+/// Prepare every image of a folder, several at a time, then regroup by page.
+///
+/// Preparation (decode → downsample → JPEG encode) is the whole cost of a scan
+/// batch and shares no state, which is why it is spread over a few threads.
+/// The results keep their page/slot order, so assembly stays a plain loop.
+fn prepare_pages(
+    job: &PlannedFolder<'_>,
+    policy: PagePolicy,
+    cancel: &CancelFlag,
+) -> Result<Vec<Vec<image_embed::PreparedImage>>, ToolError> {
+    struct Job<'a> {
+        path: &'a Path,
+        sheet: Sheet,
+    }
+
+    let mut jobs: Vec<Job<'_>> = Vec::with_capacity(job.plans.len());
+    for plan in &job.plans {
+        let images: &[usize] = match plan {
+            PagePlan::One(index) => std::slice::from_ref(index),
+            PagePlan::Two(left, right) => &[*left, *right],
+        };
+        for (image, sheet) in images.iter().zip(policy.sheets(plan)) {
+            jobs.push(Job {
+                path: &job.images[*image],
+                sheet,
+            });
+        }
+    }
+
+    let mut done: Vec<Option<image_embed::PreparedImage>> = jobs.iter().map(|_| None).collect();
+    let workers = worker_count(jobs.len());
+    if workers <= 1 {
+        for (slot, job) in jobs.iter().enumerate() {
+            check_cancel(cancel)?;
+            done[slot] = Some(image_embed::prepare_image(job.path, job.sheet, policy.budget)?);
+        }
+    } else {
+        let chunk = jobs.len().div_ceil(workers);
+        std::thread::scope(|scope| -> Result<(), ToolError> {
+            let handles: Vec<_> = jobs
+                .chunks(chunk)
+                .enumerate()
+                .map(|(chunk_index, slice)| {
+                    scope.spawn(move || -> Result<Vec<(usize, image_embed::PreparedImage)>, ToolError> {
+                        let mut out = Vec::with_capacity(slice.len());
+                        for (offset, job) in slice.iter().enumerate() {
+                            check_cancel(cancel)?;
+                            out.push((
+                                chunk_index * chunk + offset,
+                                image_embed::prepare_image(job.path, job.sheet, policy.budget)?,
+                            ));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let part = handle.join().map_err(|_| ToolError::Internal {
+                    detail: "图片准备工作线程异常退出".to_string(),
+                })??;
+                for (slot, prepared) in part {
+                    done[slot] = Some(prepared);
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    let mut done = done.into_iter();
+    let mut pages: Vec<Vec<image_embed::PreparedImage>> = Vec::with_capacity(job.plans.len());
+    for plan in &job.plans {
+        let count = match plan {
+            PagePlan::One(_) => 1,
+            PagePlan::Two(..) => 2,
+        };
+        let mut images = Vec::with_capacity(count);
+        for _ in 0..count {
+            let image = done.next().flatten().ok_or_else(|| ToolError::Internal {
+                detail: "图片准备结果缺失".to_string(),
+            })?;
+            images.push(image);
+        }
+        pages.push(images);
+    }
+    Ok(pages)
+}
+
 fn build_document_skeleton(doc: &mut Document) -> lopdf::ObjectId {
     let pages_id = doc.new_object_id();
     doc.objects.insert(
@@ -601,174 +921,6 @@ fn build_document_skeleton(doc: &mut Document) -> lopdf::ObjectId {
     });
     doc.trailer.set("Root", catalog_id);
     pages_id
-}
-
-fn render_page(
-    doc: &mut Document,
-    pages_id: lopdf::ObjectId,
-    page_index: usize,
-    plan: &PagePlan,
-    images: &[PathBuf],
-    policy: PagePolicy,
-) -> Result<(), ToolError> {
-    match plan {
-        PagePlan::One(idx) => {
-            image_embed::add_image_page(
-                doc,
-                pages_id,
-                &images[*idx],
-                policy.single_layout(),
-                page_index,
-            )?;
-        }
-        PagePlan::Two(left, right) => {
-            add_two_image_page(
-                doc,
-                pages_id,
-                page_index,
-                (&images[*left], &images[*right]),
-                policy.pair_orientation,
-                policy.page_size,
-                policy.slot_size,
-                policy.auto_rotate,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// One page with two image slots.
-///
-/// Landscape pages hold the slots side by side (portrait slots); portrait
-/// pages stack them vertically (landscape slots). With `auto_rotate`, an
-/// image whose orientation conflicts with its slot is turned 90° to fill it.
-///
-/// `slot_size` switches to card-size copies (身份证): both slots keep their
-/// real dimensions and the pair is centred on the sheet, so the copy prints at
-/// 1:1 instead of being blown up to half a page.
-fn add_two_image_page(
-    doc: &mut Document,
-    pages_id: lopdf::ObjectId,
-    page_index: usize,
-    (left, right): (&Path, &Path),
-    pair_orientation: Orientation,
-    page_size: PageSize,
-    slot_size: Option<(f32, f32)>,
-    auto_rotate: bool,
-) -> Result<(), ToolError> {
-    let (page_w, page_h) = page_size.page(pair_orientation);
-    let (slot_w, slot_h, slots) = match slot_size {
-        Some((w, h)) => {
-            let slots = match pair_orientation {
-                Orientation::Landscape => {
-                    let x = (page_w - (2.0 * w + SLOT_GAP)) / 2.0;
-                    let y = (page_h - h) / 2.0;
-                    [(x, y), (x + w + SLOT_GAP, y)]
-                }
-                Orientation::Portrait => {
-                    let x = (page_w - w) / 2.0;
-                    let y = (page_h - (2.0 * h + SLOT_GAP)) / 2.0;
-                    [(x, y), (x, y + h + SLOT_GAP)]
-                }
-            };
-            (w, h, slots)
-        }
-        None => match pair_orientation {
-            Orientation::Landscape => {
-                let (w, h) = (
-                    (page_w - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
-                    page_h - 2.0 * SLOT_MARGIN,
-                );
-                (
-                    w,
-                    h,
-                    [
-                        (SLOT_MARGIN, SLOT_MARGIN),
-                        (SLOT_MARGIN + w + SLOT_GAP, SLOT_MARGIN),
-                    ],
-                )
-            }
-            Orientation::Portrait => {
-                let (w, h) = (
-                    page_w - 2.0 * SLOT_MARGIN,
-                    (page_h - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
-                );
-                (
-                    w,
-                    h,
-                    [
-                        (SLOT_MARGIN, SLOT_MARGIN),
-                        (SLOT_MARGIN, SLOT_MARGIN + h + SLOT_GAP),
-                    ],
-                )
-            }
-        },
-    };
-    let slot_is_landscape = slot_w > slot_h;
-
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "MediaBox" => vec![0.into(), 0.into(), page_w.into(), page_h.into()],
-        "Resources" => dictionary! {},
-    });
-    attach_page(doc, pages_id, page_id)?;
-
-    let mut draws: Vec<(String, [f32; 6])> = Vec::new();
-    for (slot, path) in [(0usize, left), (1usize, right)] {
-        let image = medpdf_image::load_image(path).map_err(|e| ToolError::UnsupportedFormat {
-            path: Some(path.to_path_buf()),
-            detail: e.to_string(),
-        })?;
-        let is_jpeg = matches!(image, medpdf_image::ImageData::Jpeg { .. });
-        let orientation = if is_jpeg {
-            read_exif_orientation(path)
-        } else {
-            1
-        };
-
-        let (px_w, px_h) = (image.pixel_width() as f32, image.pixel_height() as f32);
-        if px_w <= 0.0 || px_h <= 0.0 {
-            return Err(ToolError::UnsupportedFormat {
-                path: Some(path.to_path_buf()),
-                detail: "图片尺寸为 0".to_string(),
-            });
-        }
-        let (eff_w, eff_h) = if matches!(orientation, 5..=8) {
-            (px_h, px_w)
-        } else {
-            (px_w, px_h)
-        };
-
-        // The image is turned when its orientation conflicts with the slot.
-        let image_is_landscape = eff_w > eff_h;
-        let rotate = auto_rotate && image_is_landscape != slot_is_landscape;
-        let (fit_w, fit_h) = if rotate {
-            (eff_h, eff_w)
-        } else {
-            (eff_w, eff_h)
-        };
-        let scale = (slot_w / fit_w).min(slot_h / fit_h);
-        let draw_w = fit_w * scale;
-        let draw_h = fit_h * scale;
-
-        let (slot_x, slot_y) = slots[slot];
-        let x0 = slot_x + (slot_w - draw_w) / 2.0;
-        let y0 = slot_y + (slot_h - draw_h) / 2.0;
-
-        let code = if rotate {
-            rotate_cw_code(orientation)
-        } else {
-            orientation
-        };
-        let matrix = placement_matrix(code, x0, y0, draw_w, draw_h);
-
-        let name = format!("Im{}-{}", page_index + 1, slot + 1);
-        let xobj_id = add_image_xobject(doc, image)?;
-        register_xobject(doc, page_id, &name, xobj_id)?;
-        draws.push((name, matrix));
-    }
-
-    write_content_stream(doc, page_id, &draws)
 }
 
 // ------------------------------------------------------------------ output
@@ -796,4 +948,92 @@ fn output_path(
         serial += 1;
     }
     candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::InputFile;
+    use crate::tools::Progress;
+
+    /// A4 portrait, one image per page — the layout a scan folder uses.
+    fn scan_policy() -> PagePolicy {
+        PagePolicy::new(
+            BatchPageMode::Single,
+            Some(Orientation::Portrait),
+            Orientation::Portrait,
+            PageSize::A4,
+            None,
+            false,
+            true,
+            Some(ScanBudget::new(200.0, 85)),
+        )
+    }
+
+    /// A noisy raster at ~290 DPI: downsampling is the only way to shrink it,
+    /// which is exactly what the size guard must do.
+    fn noisy_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
+        let path = dir.join(name);
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let v = ((x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 11) as u8;
+            image::Rgb([v, v.wrapping_add(37), v.wrapping_mul(3)])
+        });
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .expect("write png fixture");
+        path
+    }
+
+    #[test]
+    fn size_guard_tightens_until_the_document_fits() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp")
+            .join(format!("sparrowpdf-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image_path = noisy_png(&dir, "1.png", 2400, 3400);
+
+        let input = InputFile::new(dir.clone());
+        let job = PlannedFolder {
+            folder: &input,
+            images: vec![image_path],
+            plans: vec![PagePlan::One(0)],
+            out_path: dir.join("out.pdf"),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let progress = Progress::new(tx);
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Generous limit: one pass, no tightening.
+        let (loose, passes) =
+            render_with_size_guard(&job, scan_policy(), &cancel, &progress, 0, 1, u64::MAX)
+                .expect("render");
+        assert_eq!(passes, 0, "a document under the limit is written once");
+
+        // An unreachable limit must still terminate, and every pass must make
+        // the artifact smaller than the previous one.
+        let (tight, passes) =
+            render_with_size_guard(&job, scan_policy(), &cancel, &progress, 0, 1, 1)
+                .expect("render");
+        assert!(
+            passes > 0,
+            "the guard must tighten when the limit is missed"
+        );
+        assert!(
+            tight.len() < loose.len(),
+            "tightening must shrink the document: {} vs {}",
+            tight.len(),
+            loose.len()
+        );
+
+        // Nothing to tighten (原图直通): report the document as-is instead of
+        // looping or failing.
+        let passthrough = scan_policy().with_budget(None);
+        let (raw, passes) =
+            render_with_size_guard(&job, passthrough, &cancel, &progress, 0, 1, 1).expect("render");
+        assert_eq!(passes, 0, "不压缩 must not attempt a re-render");
+        assert!(raw.len() > tight.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

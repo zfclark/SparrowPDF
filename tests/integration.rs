@@ -552,6 +552,139 @@ fn folder_batch_writes_one_pdf_per_folder_into_itself() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A scan-like fixture: RGBA (how phone scanning apps export a page), noisy
+/// enough that a lossless store cannot compress it.
+fn make_scan_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
+    let path = dir.join(name);
+    // Per-pixel hash noise: no repeating pattern for Flate to exploit, which
+    // is what a dithered scan looks like to a lossless codec.
+    fn noise(x: u32, y: u32, salt: u32) -> u8 {
+        let mut h = x
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add(y.wrapping_mul(0x85EB_CA77))
+            .wrapping_add(salt.wrapping_mul(0xC2B2_AE3D));
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2545_F491);
+        h ^= h >> 13;
+        (h & 0xFF) as u8
+    }
+
+    let img = image::RgbaImage::from_fn(w, h, |x, y| {
+        image::Rgba([noise(x, y, 1), noise(x, y, 7), noise(x, y, 19), 255])
+    });
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .expect("write png fixture");
+    path
+}
+
+/// `(width, height, filter, has SMask)` of the page's colour image XObject.
+///
+/// The alpha mask is an image too, so the RGB one is selected explicitly.
+fn first_image_xobject(path: &Path) -> (i64, i64, String, bool) {
+    fn num(o: &lopdf::Object) -> i64 {
+        match o {
+            lopdf::Object::Integer(v) => *v,
+            lopdf::Object::Real(v) => *v as i64,
+            other => panic!("not a number: {other:?}"),
+        }
+    }
+
+    let doc = lopdf::Document::load(path).expect("load output pdf");
+    for object in doc.objects.values() {
+        let Ok(stream) = object.as_stream() else {
+            continue;
+        };
+        let is_image = matches!(
+            stream.dict.get(b"Subtype"),
+            Ok(lopdf::Object::Name(n)) if n.as_slice() == b"Image"
+        );
+        if !is_image {
+            continue;
+        }
+        let is_rgb = matches!(
+            stream.dict.get(b"ColorSpace"),
+            Ok(lopdf::Object::Name(n)) if n.as_slice() == b"DeviceRGB"
+        );
+        if !is_rgb {
+            continue;
+        }
+        let filter = match stream.dict.get(b"Filter") {
+            Ok(lopdf::Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
+            Ok(lopdf::Object::Array(items)) => items
+                .first()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        return (
+            num(stream.dict.get(b"Width").unwrap()),
+            num(stream.dict.get(b"Height").unwrap()),
+            filter,
+            stream.dict.get(b"SMask").is_ok(),
+        );
+    }
+    panic!("no image XObject in {}", path.display());
+}
+
+/// Regression: a folder of high-resolution scans used to produce a PDF far
+/// larger than the scans themselves — every PNG page was stored as raw pixels
+/// plus a full-page alpha mask. The default budget stores the page at 200 DPI
+/// as JPEG instead, and drops an alpha channel that is fully opaque.
+#[test]
+fn folder_batch_stores_oversized_scans_at_print_resolution() {
+    let dir = scratch("scan-size");
+    let album = dir.join("scan");
+    std::fs::create_dir_all(&album).unwrap();
+    // 2500 x 3540 on A4 is ~302 DPI: just above the 300 DPI budget, so the
+    // default run has to downsample while 原图直通 keeps every pixel.
+    make_scan_png(&album, "1.png", 2500, 3540);
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let run_with = |quality: sparrowpdf::tools::ScanQuality, subdir: &str| -> PathBuf {
+        let target = out_dir.join(subdir);
+        std::fs::create_dir_all(&target).unwrap();
+        let mut req = request(ToolId::FolderToPdf, vec![album.clone()], target.clone());
+        if let ToolOptions::FolderToPdf { scan_quality, .. } = &mut req.options {
+            *scan_quality = quality;
+        }
+        let outcome = run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+        outcome.outputs[0].clone()
+    };
+
+    let balanced = run_with(sparrowpdf::tools::ScanQuality::Balanced, "balanced");
+    let original = run_with(sparrowpdf::tools::ScanQuality::Original, "original");
+
+    let (w, h, filter, has_smask) = first_image_xobject(&balanced);
+    assert_eq!(filter, "DCTDecode", "a scan must be stored as JPEG");
+    // 300 DPI over the drawn box: a touch under 2480 x 3508 because the fixture
+    // is very slightly wider than A4.
+    assert!(
+        (2450..=2490).contains(&w) && (3470..=3515).contains(&h),
+        "expected the 300 DPI raster, got {w}x{h}"
+    );
+    assert!(!has_smask, "a fully opaque scan must not carry an alpha mask");
+
+    let (raw_w, _, raw_filter, raw_smask) = first_image_xobject(&original);
+    assert_eq!(raw_w, 2500, "原图直通 keeps the source pixels");
+    // Flate, or raw when compression would not pay off: either way the source
+    // raster is what gets written.
+    assert_ne!(raw_filter, "DCTDecode");
+    assert!(raw_smask, "原图直通 keeps the alpha channel");
+
+    let balanced_size = std::fs::metadata(&balanced).unwrap().len();
+    let original_size = std::fs::metadata(&original).unwrap().len();
+    // A noisy fixture is the worst case for both codecs; a real scan differs
+    // by an order of magnitude.
+    assert!(
+        balanced_size * 2 < original_size,
+        "the default budget must be far smaller: {balanced_size} vs {original_size}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn folder_batch_two_per_page_merges_specified_pairs() {
     let dir = scratch("folder-pair");
