@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use lopdf::{dictionary, Document, Object};
 
-use crate::engine::{pdf_io, validate};
+use crate::engine::{pdf_io, pool, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::image_embed::{self, add_page, ScanBudget, Sheet, PAGE_MARGIN};
 use crate::tools::{
@@ -389,7 +389,11 @@ impl Tool for FolderToPdf {
                 auto_rotate,
                 scan_quality.budget(),
             );
-            let (bytes, passes) = render_with_size_guard(
+            // A folder that fails to render (a corrupt image, a decoder bug)
+            // must not discard the folders that do succeed: record, log and
+            // continue, exactly like a failed write. Only a cancellation from
+            // the user stops the whole run.
+            let (bytes, passes) = match render_with_size_guard(
                 &job,
                 policy,
                 cancel,
@@ -397,7 +401,18 @@ impl Tool for FolderToPdf {
                 index,
                 total,
                 SCAN_SIZE_LIMIT,
-            )?;
+            ) {
+                Ok(rendered) => rendered,
+                Err(ToolError::Cancelled) => return Err(ToolError::Cancelled),
+                Err(err) => {
+                    crate::engine::logging::log(
+                        "ERROR",
+                        &format!("生成失败：{}（{err}）", out_path.display()),
+                    );
+                    skipped.push((job.folder.display_name(), format!("处理失败：{err}")));
+                    continue;
+                }
+            };
 
             // One unwritable / locked output must not discard the folders
             // that do succeed: record, log, continue — surfaced as
@@ -816,125 +831,102 @@ fn render_document(
     pdf_io::document_bytes(&mut doc)
 }
 
-/// How many images to prepare at once.
-///
-/// Decoding a 600 DPI RGBA page peaks around 200 MB, so the pool stays small
-/// even on a 16-core machine: past four workers the batch is memory bound and
-/// the extra threads only raise the peak.
-const MAX_PREPARE_WORKERS: usize = 4;
+/// Peak memory one worker needs for a 600 DPI A4 page: the decoded RGBA buffer
+/// (~140 MB), the RGB copy the resampler builds (~105 MB) and the output
+/// raster (~35 MB), with room to spare. The pool turns this into a worker
+/// count for the machine it runs on.
+const PREPARE_WORKER_BYTES: u64 = 400 * 1024 * 1024;
 
-fn worker_count(items: usize) -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    cores.min(MAX_PREPARE_WORKERS).min(items).max(1)
+/// One image waiting to be prepared: where it belongs on the page, where to
+/// read it, and how it is laid out.
+struct PrepareJob<'a> {
+    page: usize,
+    slot: usize,
+    path: &'a Path,
+    sheet: Sheet,
 }
 
-/// Prepare every image of a folder, several at a time, then regroup by page.
+/// Prepare every image of a folder concurrently, then regroup by page.
 ///
-/// Preparation (decode → downsample → JPEG encode) is the whole cost of a scan
-/// batch and shares no state, which is why it is spread over a few threads.
-/// The results keep their page/slot order, so assembly stays a plain loop.
+/// Only `prepare_image` (decode → downsample → JPEG encode) runs in parallel:
+/// it touches no `Document` and shares nothing but the job list. PDF objects,
+/// conflict checks and the file write stay on the calling thread, because they
+/// mutate the document and must keep page order.
+///
+/// The pool reports each finished image on this thread, so progress stays
+/// monotonic and each result lands in its slot immediately; prepared payloads
+/// in flight are bounded by the pool's queue, never by the page count.
 fn prepare_pages(
     job: &PlannedFolder<'_>,
     policy: PagePolicy,
     cancel: &CancelFlag,
     progress: &Progress,
-    index: usize,
-    total: usize,
+    folder_index: usize,
+    folders: usize,
 ) -> Result<Vec<Vec<image_embed::PreparedImage>>, ToolError> {
-    struct Job<'a> {
-        path: &'a Path,
-        sheet: Sheet,
-    }
-
-    let mut jobs: Vec<Job<'_>> = Vec::with_capacity(job.plans.len());
-    for plan in &job.plans {
+    let mut jobs: Vec<PrepareJob<'_>> = Vec::with_capacity(job.plans.len());
+    for (page, plan) in job.plans.iter().enumerate() {
         let images: &[usize] = match plan {
             PagePlan::One(index) => std::slice::from_ref(index),
             PagePlan::Two(left, right) => &[*left, *right],
         };
-        for (image, sheet) in images.iter().zip(policy.sheets(plan)) {
-            jobs.push(Job {
+        for (slot, (image, sheet)) in images.iter().zip(policy.sheets(plan)).enumerate() {
+            jobs.push(PrepareJob {
+                page,
+                slot,
                 path: &job.images[*image],
                 sheet,
             });
         }
     }
-
-    let mut done: Vec<Option<image_embed::PreparedImage>> = jobs.iter().map(|_| None).collect();
-    // One report per finished image, so a long folder keeps the bar moving
-    // even though the images themselves are prepared on worker threads.
-    let prepared_count = std::sync::atomic::AtomicUsize::new(0);
-    let folder_name = job.folder.display_name();
-    let report = |progress: &Progress| {
-        let finished = prepared_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let fraction = (index as f32 + finished as f32 / jobs.len() as f32) / total as f32;
-        progress.report(
-            fraction,
-            format!("{folder_name}：压缩 {finished}/{} 张", jobs.len()),
-        );
-    };
-
-    let workers = worker_count(jobs.len());
-    if workers <= 1 {
-        for (slot, job) in jobs.iter().enumerate() {
-            check_cancel(cancel)?;
-            done[slot] = Some(image_embed::prepare_image(
-                job.path,
-                job.sheet,
-                policy.budget,
-            )?);
-            report(progress);
-        }
-    } else {
-        let chunk = jobs.len().div_ceil(workers);
-        std::thread::scope(|scope| -> Result<(), ToolError> {
-            let handles: Vec<_> = jobs
-                .chunks(chunk)
-                .enumerate()
-                .map(|(chunk_index, slice)| {
-                    scope.spawn(
-                        move || -> Result<Vec<(usize, image_embed::PreparedImage)>, ToolError> {
-                            let mut out = Vec::with_capacity(slice.len());
-                            for (offset, job) in slice.iter().enumerate() {
-                                check_cancel(cancel)?;
-                                out.push((
-                                    chunk_index * chunk + offset,
-                                    image_embed::prepare_image(job.path, job.sheet, policy.budget)?,
-                                ));
-                                report(progress);
-                            }
-                            Ok(out)
-                        },
-                    )
-                })
-                .collect();
-            for handle in handles {
-                let part = handle.join().map_err(|_| ToolError::Internal {
-                    detail: "图片准备工作线程异常退出".to_string(),
-                })??;
-                for (slot, prepared) in part {
-                    done[slot] = Some(prepared);
-                }
-            }
-            Ok(())
-        })?;
+    if jobs.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let mut done = done.into_iter();
-    let mut pages: Vec<Vec<image_embed::PreparedImage>> = Vec::with_capacity(job.plans.len());
-    for plan in &job.plans {
-        let count = match plan {
-            PagePlan::One(_) => 1,
-            PagePlan::Two(..) => 2,
-        };
-        let mut images = Vec::with_capacity(count);
-        for _ in 0..count {
-            let image = done.next().flatten().ok_or_else(|| ToolError::Internal {
-                detail: "图片准备结果缺失".to_string(),
-            })?;
-            images.push(image);
-        }
-        pages.push(images);
+    let total_images = jobs.len();
+    let workers = pool::worker_count(total_images, PREPARE_WORKER_BYTES);
+    let folder_name = job.folder.display_name();
+    let mut prepared: Vec<Option<image_embed::PreparedImage>> = jobs.iter().map(|_| None).collect();
+    let mut finished = 0usize;
+
+    pool::run(
+        total_images,
+        workers,
+        cancel,
+        pool::OnError::Stop,
+        |index: usize| {
+            image_embed::prepare_image(jobs[index].path, jobs[index].sheet, policy.budget)
+        },
+        |index, result| match result {
+            Ok(image) => {
+                prepared[index] = Some(image);
+                finished += 1;
+                let fraction =
+                    (folder_index as f32 + finished as f32 / total_images as f32) / folders as f32;
+                progress.report(
+                    fraction,
+                    format!("{folder_name}：压缩 {finished}/{total_images} 张"),
+                );
+                Ok(())
+            }
+            // Report it to the pool: the run stops and this error becomes the
+            // folder's failure reason.
+            Err(err) => Err(err),
+        },
+    )?;
+
+    // Jobs are pushed page by page, slot by slot, so appending in job order
+    // keeps each page's draw order.
+    let mut pages: Vec<Vec<image_embed::PreparedImage>> =
+        job.plans.iter().map(|_| Vec::new()).collect();
+    for (index, prepare_job) in jobs.iter().enumerate() {
+        let image = prepared[index].take().ok_or_else(|| ToolError::Internal {
+            detail: "图片准备结果缺失".to_string(),
+        })?;
+        // Appending in job order must land on the job's own slot; a mismatch
+        // would silently swap the two images of a merged page.
+        debug_assert_eq!(pages[prepare_job.page].len(), prepare_job.slot);
+        pages[prepare_job.page].push(image);
     }
     Ok(pages)
 }

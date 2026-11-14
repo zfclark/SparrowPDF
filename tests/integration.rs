@@ -552,6 +552,49 @@ fn folder_batch_writes_one_pdf_per_folder_into_itself() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression: one unreadable image used to abort the whole batch. The folder
+/// that fails is now reported as skipped while the others still convert.
+#[test]
+fn folder_batch_skips_only_the_broken_folder() {
+    let dir = scratch("folder-broken");
+    let good = dir.join("good");
+    let broken = dir.join("broken");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::create_dir_all(&broken).unwrap();
+    make_image(&good, "1.jpg", 40, 60);
+    make_image(&good, "2.jpg", 40, 60);
+    make_image(&broken, "1.jpg", 40, 60);
+    // A file that claims to be a PNG but holds nothing decodable.
+    std::fs::write(broken.join("2.png"), b"\x89PNG\r\n\x1a\nnot really").unwrap();
+
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let req = request(
+        ToolId::FolderToPdf,
+        vec![good.clone(), broken.clone()],
+        out_dir.clone(),
+    );
+
+    let err = run(ToolId::FolderToPdf, &req).expect_err("one folder failed");
+    match err {
+        ToolError::PartialSuccess {
+            succeeded,
+            failed,
+            detail,
+            outputs,
+        } => {
+            assert_eq!(succeeded, 1);
+            assert_eq!(failed, 1);
+            assert_eq!(outputs.len(), 1, "the healthy folder still produced a PDF");
+            assert!(outputs[0].ends_with("good.pdf"), "{:?}", outputs[0]);
+            assert!(detail.contains("broken"), "{detail}");
+        }
+        other => panic!("expected PartialSuccess, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A scan-like fixture: RGBA (how phone scanning apps export a page), noisy
 /// enough that a lossless store cannot compress it.
 fn make_scan_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {

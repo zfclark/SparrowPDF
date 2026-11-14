@@ -75,7 +75,7 @@ pub fn spawn(id: ToolId, request: ToolRequest) -> WorkerHandle {
 }
 
 /// Best-effort panic payload extraction for logging.
-fn panic_detail(panic: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_detail(panic: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = panic.downcast_ref::<String>() {
