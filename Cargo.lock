@@ -3132,6 +3132,7 @@ dependencies = [
  "medpdf-image",
  "rfd",
  "weezl 0.2.1",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

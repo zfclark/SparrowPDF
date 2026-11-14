@@ -43,6 +43,15 @@ hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"] }
 # Embeds assets/app.ico into the Windows executable (taskbar / Explorer icon).
 winresource = "0.1"
 
+# Registry reads behind the About dialog (OS edition, CPU model). The crate is
+# already in the tree through winresource; only the registry feature is turned
+# on, so this adds nothing to the binary beyond the API calls.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
+
 [profile.release]
 # Unwinding is required so the worker thread can catch tool panics and turn
 # them into visible, logged errors instead of crashing the whole app.

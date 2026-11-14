@@ -7,6 +7,7 @@ pub mod logging;
 pub mod pdf_io;
 pub mod raster;
 pub mod render;
+pub mod sysinfo;
 pub mod ttf;
 pub mod validate;
 pub mod worker;

@@ -21,7 +21,6 @@ pub const APP_NAME_EN: &str = "SparrowPDF";
 pub const TAGLINE: &str = "PDF 的事，本地办完。";
 pub const AUTHOR: &str = "ZFClark（霖海）";
 pub const PROJECT_URL: &str = "https://github.com/zfclark/SparrowPDF";
-pub const LICENSE: &str = "MIT";
 pub const COPYRIGHT_YEAR: &str = "2026";
 
 /// Dialog state, owned by the app shell so the dialog survives repaints.
@@ -44,7 +43,11 @@ impl AboutState {
 }
 
 /// Draw the dialog for this frame and update `state.open` when it is dismissed.
-pub fn show(ctx: &egui::Context, state: &mut AboutState, icon: Option<&egui::TextureHandle>) {
+pub fn show(
+    ctx: &egui::Context,
+    state: &mut AboutState,
+    icon: Option<&egui::TextureHandle>,
+) {
     let screen = ctx.content_rect();
     // Fit the window instead of assuming a size: at the 760x520 minimum the
     // dialog must keep a visible backdrop on both sides, and on a large display
@@ -158,37 +161,78 @@ fn info_row_sized(ui: &mut Ui, label: &str, value: &str, small: bool) {
     });
 }
 
-/// 基本信息：身份 + 排查问题需要的环境信息。
+/// 基本信息：身份 + 排查问题需要的本机信息。
 ///
-/// A bug report is only actionable when the platform, the renderer's scale and
-/// the log location are known, and those are exactly the facts a user cannot
-/// read off the UI. Kept to four short rows so the dialog stays a glance.
+/// A bug report is only actionable when the platform, the CPU model, the
+/// renderer's scale and the log location are known, and those are exactly the
+/// facts a user cannot read off the UI. One row per fact, each a readable line
+/// rather than a bare token.
 fn basic_information(ui: &mut Ui, ctx: &egui::Context) {
     caption(ui, "基本信息");
     info_row(ui, "软件名称", &format!("{APP_NAME}（{APP_NAME_EN}）"));
     info_row(ui, "版本号", crate::version::display());
-    info_row(ui, "运行平台", &platform_label());
-    info_row(ui, "许可证", LICENSE);
+    info_row(ui, "系统", &system_label());
+
+    let cpu = crate::engine::sysinfo::cpu_model().unwrap_or("无法读取型号");
+    info_row(ui, "处理器", cpu);
+
     info_row(ui, "界面渲染", &renderer_label(ctx));
+
     let log_path = crate::engine::logging::log_path();
-    info_row_sized(ui, "日志文件", &log_path.display().to_string(), true);
+    info_row_sized(ui, "日志文件", &log_label(&log_path), true);
+    // The path is long and rarely worth reading: a button that opens the
+    // folder is what actually helps when someone has to send the log.
+    if theme::small_button(ui, "打开日志所在文件夹").clicked() {
+        match log_path.parent() {
+            Some(dir) => {
+                if let Err(err) = theme::open_path(dir) {
+                    crate::engine::logging::log("ERROR", &format!("打开日志目录失败：{err}"));
+                }
+            }
+            None => crate::engine::logging::log("ERROR", "日志路径没有所在目录"),
+        }
+    }
 }
 
-/// `Windows · x86_64` — the pair that decides which build a report is about.
-fn platform_label() -> String {
-    let os = match std::env::consts::OS {
-        "windows" => "Windows",
-        "macos" => "macOS",
-        other => other,
-    };
-    format!("{os} · {}", std::env::consts::ARCH)
+/// OS edition and build plus the executable's architecture. The edition and
+/// build decide which platform bugs apply; the architecture decides which
+/// download a report is about.
+fn system_label() -> String {
+    let os = crate::engine::sysinfo::os_version();
+    let family = crate::engine::sysinfo::os_family();
+    let os = os.unwrap_or(family);
+    format!("{os} · {} 构建", std::env::consts::ARCH)
 }
 
 /// Backend plus the current DPI scale: a wrong scale is the usual cause of
 /// blurry text and clipped layouts.
 fn renderer_label(ctx: &egui::Context) -> String {
-    let scale = (ctx.pixels_per_point() * 100.0).round() as i32;
-    format!("egui · Glow · 缩放 {scale}%")
+    let scale = ctx.pixels_per_point();
+    let dpi = (scale * 96.0).round() as i32;
+    format!("egui · Glow 后端，缩放 {:.0}%（{dpi} DPI）", scale * 100.0)
+}
+
+/// Log path with its current size: an oversized log is itself a symptom, and
+/// "尚未生成" tells support the app never reached the logging code.
+fn log_label(path: &std::path::Path) -> String {
+    let size = std::fs::metadata(path).ok().map(|meta| meta.len());
+    match size {
+        Some(bytes) => format!("{}（当前 {}）", path.display(), human_size(bytes)),
+        None => format!("{}（尚未生成）", path.display()),
+    }
+}
+
+/// Bytes as `12 KB` / `1.4 MB`, the granularity a log size is read at.
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value < KB {
+        format!("{bytes} B")
+    } else if value < KB * KB {
+        format!("{:.0} KB", value / KB)
+    } else {
+        format!("{:.1} MB", value / (KB * KB))
+    }
 }
 
 /// 作者信息。
