@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 
 use sparrowpdf::engine::pdf_io;
 use sparrowpdf::model::{ConflictPolicy, InputFile, PageRangeMode, ToolError, ToolId, ToolOutcome};
-use sparrowpdf::tools::{tool_for, CancelFlag, Progress, ToolOptions, ToolRequest};
+use sparrowpdf::tools::{
+    batch_template_by_key, default_batch_template, tool_for, CancelFlag, Progress, ToolOptions,
+    ToolRequest, BATCH_TEMPLATES,
+};
 
 // ---------------------------------------------------------------- fixtures
 
@@ -563,12 +566,15 @@ fn folder_batch_two_per_page_merges_specified_pairs() {
     let mut req = request(ToolId::FolderToPdf, vec![album], out_dir.clone());
     if let ToolOptions::FolderToPdf {
         mode,
+        pair_orientation,
         use_merge_spec,
         merge_spec,
         ..
     } = &mut req.options
     {
         *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+        // Two-per-page pages are landscape A4 regardless of the 标准 preset.
+        *pair_orientation = sparrowpdf::tools::Orientation::Landscape;
         // Images 2+3 share page 1; 1, 4, 5 stay single -> 4 pages.
         *use_merge_spec = true;
         *merge_spec = "2-3".to_string();
@@ -605,18 +611,30 @@ fn preview_page_numbers_renumber_by_output_page() {
     // Spec "2-3" with 5 images: pages [1], [2+3], [4], [5] — inline order,
     // continuous page numbers, merged images share one label.
     assert_eq!(
-        preview_page_numbers(5, true, true, "2-3"),
+        preview_page_numbers(5, true, true, "2-3", true),
         vec![1, 2, 2, 3, 4]
+    );
+    // Advisory spec (a preset's own): images beyond the folder are skipped, so
+    // a two-image folder previews as two pages — exactly what the run writes.
+    assert_eq!(
+        preview_page_numbers(2, true, true, "2-3", false),
+        vec![1, 2]
     );
     // Unchecked: sequential pairs over everything.
     assert_eq!(
-        preview_page_numbers(5, true, false, "9-9"),
+        preview_page_numbers(5, true, false, "9-9", true),
         vec![1, 1, 2, 2, 3]
     );
     // Single mode: every image its own page, spec ignored.
-    assert_eq!(preview_page_numbers(3, false, true, "1-2"), vec![1, 2, 3]);
+    assert_eq!(
+        preview_page_numbers(3, false, true, "1-2", true),
+        vec![1, 2, 3]
+    );
     // Invalid spec: the preview falls back to sequential pairing.
-    assert_eq!(preview_page_numbers(4, true, true, "9"), vec![1, 1, 2, 2]);
+    assert_eq!(
+        preview_page_numbers(4, true, true, "9", true),
+        vec![1, 1, 2, 2]
+    );
 }
 
 #[test]
@@ -899,6 +917,259 @@ fn folder_batch_pair_landscape_keeps_single_pages_inset() {
         "single-image page must keep the outer margin, got y0={f}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ batch presets
+
+/// Every `cm` matrix of a page, in draw order.
+fn draw_matrices(path: &Path, page_num: u32) -> Vec<[f64; 6]> {
+    let content = page_content(path, page_num);
+    let mut matrices = Vec::new();
+    let mut operands: Vec<f64> = Vec::new();
+    for token in content.split_whitespace() {
+        if token == "cm" {
+            let n = operands.len();
+            assert!(n >= 6, "cm without six operands on page {page_num}");
+            matrices.push([
+                operands[n - 6],
+                operands[n - 5],
+                operands[n - 4],
+                operands[n - 3],
+                operands[n - 2],
+                operands[n - 1],
+            ]);
+            operands.clear();
+        } else if let Ok(value) = token.parse::<f64>() {
+            operands.push(value);
+        } else {
+            operands.clear();
+        }
+    }
+    matrices
+}
+
+/// A4 portrait check shared by the preset tests.
+fn assert_a4_portrait(boxes: &[[f64; 4]]) {
+    for (index, b) in boxes.iter().enumerate() {
+        let (w, h) = (b[2] - b[0], b[3] - b[1]);
+        assert!(
+            (w - 595.28).abs() < 0.5 && (h - 841.89).abs() < 0.5,
+            "page {} must be A4 portrait, got {w}x{h}",
+            index + 1
+        );
+    }
+}
+
+/// The 入团志愿书 preset is the reason the preset layer exists: A4 portrait,
+/// images 2+3 printed together on one sheet (each turned 90° into its half),
+/// every other page converted as usual.
+#[test]
+fn youth_league_template_merges_pages_two_and_three_rotated() {
+    let dir = scratch("youth-league");
+    let album = dir.join("入团志愿书");
+    std::fs::create_dir_all(&album).unwrap();
+    // Portrait pages, roughly A4 shaped, like a scanned form.
+    for name in ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg"] {
+        make_image(&album, name, 124, 175);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    req.options.apply_batch_template(
+        batch_template_by_key("youth-league-form").expect("preset exists"),
+    );
+
+    let outcome = run(ToolId::FolderToPdf, &req).expect("youth league batch succeeds");
+    let pdf = &outcome.outputs[0];
+
+    // Pages: [1], [2+3], [4], [5].
+    assert_eq!(pdf_io::page_count_of(pdf, None).unwrap(), 4);
+    assert_a4_portrait(&page_media_boxes(pdf));
+
+    // Page 1 keeps the usual one-image conversion: upright, full-bleed.
+    assert_eq!(page_content(pdf, 1).matches(" Do").count(), 1);
+    let [a, b, _c, d, e, f] = first_matrix(pdf, 1);
+    assert!(a > 100.0 && d > 100.0, "page 1 stays upright");
+    assert!(b.abs() < 0.01, "page 1 is not rotated");
+    assert!(
+        e < 2.0 && f < 2.0,
+        "page 1 is full-bleed, got origin {e},{f}"
+    );
+
+    // Page 2 holds both halves, each rotated 90° clockwise into its slot.
+    let matrices = draw_matrices(pdf, 2);
+    assert_eq!(matrices.len(), 2, "both halves are drawn");
+    for matrix in &matrices {
+        assert!(
+            matrix[0].abs() < 0.01 && matrix[3].abs() < 0.01,
+            "merged page images are rotated: {matrix:?}"
+        );
+        assert!(
+            matrix[1] < -100.0 && matrix[2] > 100.0,
+            "rotation is 90° clockwise: {matrix:?}"
+        );
+    }
+    // The two halves stack vertically: one draw starts in each half.
+    let mut ys = matrices.iter().map(|m| m[5]).collect::<Vec<_>>();
+    ys.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert!(
+        ys[0] < 420.0 && ys[1] > 420.0,
+        "one image per half of the portrait page, got {ys:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A preset's own merge spec is advisory: a folder with fewer images must
+/// still convert instead of failing the whole batch.
+#[test]
+fn youth_league_template_skips_merge_when_folder_is_short() {
+    let dir = scratch("youth-league-short");
+    let album = dir.join("short");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["1.jpg", "2.jpg"] {
+        make_image(&album, name, 124, 175);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    req.options.apply_batch_template(
+        batch_template_by_key("youth-league-form").expect("preset exists"),
+    );
+
+    let outcome = run(ToolId::FolderToPdf, &req).expect("short folder still converts");
+    let pdf = &outcome.outputs[0];
+    assert_eq!(pdf_io::page_count_of(pdf, None).unwrap(), 2);
+    assert_a4_portrait(&page_media_boxes(pdf));
+    assert_eq!(page_content(pdf, 1).matches(" Do").count(), 1);
+    assert_eq!(page_content(pdf, 2).matches(" Do").count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Presets own the paper size, not just the orientation.
+#[test]
+fn batch_template_applies_paper_size() {
+    let dir = scratch("template-a5");
+    let album = dir.join("booklet");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["1.jpg", "2.jpg"] {
+        make_image(&album, name, 60, 85);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    req.options
+        .apply_batch_template(batch_template_by_key("a5-booklet").expect("preset exists"));
+
+    let outcome = run(ToolId::FolderToPdf, &req).expect("A5 batch succeeds");
+    let boxes = page_media_boxes(&outcome.outputs[0]);
+    assert_eq!(boxes.len(), 2);
+    for (index, b) in boxes.iter().enumerate() {
+        let (w, h) = (b[2] - b[0], b[3] - b[1]);
+        assert!(
+            (w - 419.53).abs() < 0.5 && (h - 595.28).abs() < 0.5,
+            "page {} must be A5 portrait, got {w}x{h}",
+            index + 1
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The 身份证 template prints the two sides at real size: two card-sized slots
+/// stacked on an A4 portrait sheet, no rotation (a scan is already upright).
+#[test]
+fn id_card_template_prints_both_sides_at_real_size() {
+    let dir = scratch("id-card");
+    let album = dir.join("身份证");
+    std::fs::create_dir_all(&album).unwrap();
+    // 85.6 × 54 mm is 1.585:1, the same ratio a card scan has.
+    for name in ["1.jpg", "2.jpg"] {
+        make_image(&album, name, 856, 540);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    req.options
+        .apply_batch_template(batch_template_by_key("id-card").expect("template exists"));
+
+    let outcome = run(ToolId::FolderToPdf, &req).expect("id card batch succeeds");
+    let pdf = &outcome.outputs[0];
+    assert_eq!(pdf_io::page_count_of(pdf, None).unwrap(), 1);
+    assert_a4_portrait(&page_media_boxes(pdf));
+
+    let matrices = draw_matrices(pdf, 1);
+    assert_eq!(matrices.len(), 2, "front and back on one sheet");
+    for matrix in &matrices {
+        assert!(
+            matrix[1].abs() < 0.01 && matrix[2].abs() < 0.01,
+            "cards stay upright: {matrix:?}"
+        );
+        // 85.6 × 54 mm = 242.65 × 153.07 pt.
+        assert!(
+            (matrix[0] - 242.65).abs() < 1.5 && (matrix[3] - 153.07).abs() < 1.5,
+            "card size is 1:1, got {}x{}",
+            matrix[0],
+            matrix[3]
+        );
+    }
+    // Centred pair, stacked: same x, one above the other.
+    assert!((matrices[0][4] - matrices[1][4]).abs() < 0.5, "aligned column");
+    assert!(
+        matrices[1][5] - matrices[0][5] > 150.0,
+        "front above back, got {:?}",
+        matrices
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The preset table is the whole contract for adding a template: this test
+/// keeps every row presentable and internally consistent.
+#[test]
+fn batch_template_table_is_complete_and_unique() {
+    let mut keys = std::collections::HashSet::new();
+    for template in BATCH_TEMPLATES {
+        assert!(!template.key.is_empty(), "every template needs a key");
+        assert!(keys.insert(template.key), "duplicate key {}", template.key);
+        assert!(
+            !template.label.trim().is_empty(),
+            "{} has no label",
+            template.key
+        );
+        assert!(
+            !template.format.trim().is_empty(),
+            "{} has no format requirement",
+            template.key
+        );
+        // A fixed merge spec only makes sense on a two-per-page layout, and a
+        // template that pairs images must not own a slot size meant for cards.
+        if template.preset.merge_spec.is_some() {
+            assert!(
+                template.preset.two_per_page,
+                "{} fixes a merge spec but lays out one image per page",
+                template.key
+            );
+        }
+        // Card-size slots must fit on the sheet they are centred on.
+        if let Some((w, h)) = template.preset.slot_size {
+            let (page_w, page_h) = template
+                .preset
+                .page_size
+                .page(template.preset.pair_orientation);
+            assert!(
+                w < page_w && h * 2.0 < page_h,
+                "{}: card slots do not fit the page",
+                template.key
+            );
+        }
+    }
+    assert_eq!(default_batch_template().key, "standard");
+    assert_eq!(
+        sparrowpdf::tools::PageSize::A5.page(sparrowpdf::tools::Orientation::Landscape),
+        (595.28, 419.53)
+    );
 }
 
 /// The reorder preview labels pages by their position in the composed order,
@@ -1880,6 +2151,100 @@ fn merge_reports_existing_target_without_writing() {
 
 /// PDF→图片 writes through `write_file` rather than `save_document`, and its
 /// outputs are planned from a directory: both have to honour the policy.
+/// The batch API: every page of every input lands in the output folder, named
+/// after its own document.
+#[test]
+fn pdf_to_image_batch_exports_every_page_of_every_input() {
+    let dir = scratch("pdf2img-batch");
+    let first = make_pdf(&dir, "a.pdf", 2, 0);
+    let second = make_pdf(&dir, "b.pdf", 3, 0);
+    let out_dir = dir.join("images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::PdfToImage, vec![first, second], out_dir.clone());
+    if let ToolOptions::PdfToImage { dpi, .. } = &mut req.options {
+        *dpi = 72;
+    }
+    let outcome = run(ToolId::PdfToImage, &req).expect("batch export succeeds");
+    assert_eq!(outcome.outputs.len(), 5);
+
+    for page in 1..=2 {
+        assert!(
+            out_dir.join(format!("a_p{page:03}.png")).is_file(),
+            "a page {page}"
+        );
+    }
+    for page in 1..=3 {
+        assert!(
+            out_dir.join(format!("b_p{page:03}.png")).is_file(),
+            "b page {page}"
+        );
+    }
+    for output in &outcome.outputs {
+        let bytes = std::fs::read(output).unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{} is a PNG", output.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two folders may hold a PDF of the same name; the second set of pages must
+/// not overwrite the first.
+#[test]
+fn pdf_to_image_batch_keeps_same_named_inputs_apart() {
+    let dir = scratch("pdf2img-names");
+    let left = dir.join("left");
+    let right = dir.join("right");
+    std::fs::create_dir_all(&left).unwrap();
+    std::fs::create_dir_all(&right).unwrap();
+    let a = make_pdf(&left, "same.pdf", 1, 0);
+    let b = make_pdf(&right, "same.pdf", 1, 0);
+    let out_dir = dir.join("images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::PdfToImage, vec![a, b], out_dir.clone());
+    if let ToolOptions::PdfToImage { dpi, .. } = &mut req.options {
+        *dpi = 72;
+    }
+    let outcome = run(ToolId::PdfToImage, &req).expect("same names still export");
+    assert_eq!(outcome.outputs.len(), 2);
+    assert!(out_dir.join("same_p001.png").is_file());
+    assert!(out_dir.join("same_p001-2.png").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One unreadable PDF must not discard the pages the others produced.
+#[test]
+fn pdf_to_image_batch_reports_partial_success() {
+    let dir = scratch("pdf2img-partial");
+    let good = make_pdf(&dir, "good.pdf", 2, 0);
+    let bad = dir.join("broken.pdf");
+    std::fs::write(&bad, b"not a pdf").unwrap();
+    let out_dir = dir.join("images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::PdfToImage, vec![good, bad], out_dir);
+    if let ToolOptions::PdfToImage { dpi, .. } = &mut req.options {
+        *dpi = 72;
+    }
+    match run(ToolId::PdfToImage, &req) {
+        Err(ToolError::PartialSuccess {
+            succeeded,
+            failed,
+            outputs,
+            ..
+        }) => {
+            assert_eq!(succeeded, 2, "both pages of the good file");
+            assert_eq!(failed, 1, "the broken PDF is reported");
+            assert_eq!(outputs.len(), 2);
+            for output in &outputs {
+                assert!(output.is_file());
+            }
+        }
+        other => panic!("expected PartialSuccess, got {:?}", other.is_ok()),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn pdf_to_image_reports_existing_page_files() {
     let dir = scratch("conflict-images");

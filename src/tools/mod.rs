@@ -47,6 +47,11 @@ pub enum ToolOptions {
     },
     /// Batch conversion: one PDF per input folder.
     FolderToPdf {
+        /// Layout preset the current settings came from. Kept for the panel's
+        /// description and for the tool's lenient handling of the preset's own
+        /// merge spec; every effective value lives in the fields below, so a
+        /// preset is only ever applied by copying its values in.
+        template: &'static BatchTemplate,
         /// How images are laid out on pages.
         mode: BatchPageMode,
         /// Page orientation for one-image-per-page mode.
@@ -54,6 +59,10 @@ pub enum ToolOptions {
         /// Page orientation for two-per-page mode: landscape pages hold the
         /// two slots side by side, portrait pages stack them vertically.
         pair_orientation: Orientation,
+        /// Paper size of every page in the document.
+        page_size: PageSize,
+        /// Fixed slot size for card-size copies; `None` halves the page.
+        slot_size: Option<(f32, f32)>,
         /// Whether the two-per-page merge follows the user's explicit
         /// `merge_spec` instead of pairing every image sequentially.
         use_merge_spec: bool,
@@ -63,6 +72,10 @@ pub enum ToolOptions {
         merge_spec: String,
         /// Rotate an image 90° when its orientation conflicts with its slot.
         auto_rotate: bool,
+        /// Keep the slot margin on single-image pages of a two-per-page
+        /// layout. Off means those pages are converted full-bleed, which is
+        /// what a form preset (入团志愿书) needs for "other pages as usual".
+        inset_single_pages: bool,
     },
     Merge,
     Split {
@@ -121,14 +134,25 @@ impl ToolOptions {
                 force_orientation: None,
                 auto_rotate: true,
             },
-            ToolId::FolderToPdf => ToolOptions::FolderToPdf {
-                mode: BatchPageMode::Single,
-                force_orientation: None,
-                pair_orientation: Orientation::Landscape,
-                use_merge_spec: false,
-                merge_spec: String::new(),
-                auto_rotate: true,
-            },
+            ToolId::FolderToPdf => {
+                // The default layout is the table's first entry: presets and
+                // defaults can never drift apart.
+                let template = default_batch_template();
+                let mut options = ToolOptions::FolderToPdf {
+                    template,
+                    mode: BatchPageMode::Single,
+                    force_orientation: None,
+                    pair_orientation: Orientation::Landscape,
+                    page_size: PageSize::A4,
+                    slot_size: None,
+                    use_merge_spec: false,
+                    merge_spec: String::new(),
+                    auto_rotate: true,
+                    inset_single_pages: true,
+                };
+                options.apply_batch_template(template);
+                options
+            }
             ToolId::Merge => ToolOptions::Merge,
             ToolId::Split => ToolOptions::Split {
                 mode: PageRangeMode::Explicit,
@@ -188,6 +212,293 @@ pub enum BatchPageMode {
     Single,
     /// Two images share one landscape page.
     TwoPerPage,
+}
+
+// ------------------------------------------------------------------ presets
+//
+// Presets are pure data. Adding a template means appending one entry to
+// [`BATCH_TEMPLATES`] — no match arm, no new function, no UI change: the panel
+// renders whatever the table contains and the tool reads whatever the applied
+// values are.
+
+/// Paper size of the pages produced by the image → PDF tools.
+///
+/// Dimensions are PDF points (1 pt = 1/72 inch), portrait orientation. 标准
+/// exposes all four; the named templates pick one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSize {
+    A4,
+    A5,
+    B5,
+    Letter,
+}
+
+impl PageSize {
+    pub const ALL: [PageSize; 4] = [PageSize::A4, PageSize::A5, PageSize::B5, PageSize::Letter];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PageSize::A4 => "A4（210 × 297 mm）",
+            PageSize::A5 => "A5（148 × 210 mm）",
+            PageSize::B5 => "B5（176 × 250 mm）",
+            PageSize::Letter => "Letter（8.5 × 11 in）",
+        }
+    }
+
+    /// Portrait width / height, in points.
+    pub fn dimensions(self) -> (f32, f32) {
+        match self {
+            PageSize::A4 => (595.28, 841.89),
+            PageSize::A5 => (419.53, 595.28),
+            PageSize::B5 => (498.90, 708.66),
+            PageSize::Letter => (612.0, 792.0),
+        }
+    }
+
+    /// Width / height of one page of this size in `orientation`.
+    pub fn page(self, orientation: Orientation) -> (f32, f32) {
+        let (w, h) = self.dimensions();
+        match orientation {
+            Orientation::Portrait => (w, h),
+            Orientation::Landscape => (h, w),
+        }
+    }
+}
+
+/// Every layout value one preset owns.
+///
+/// [`ToolOptions::apply_batch_template`] copies these fields verbatim, so this
+/// struct is the complete contract between a template and the tool — a new
+/// preset cannot forget to set a knob that the layout reads. Named templates
+/// fix all of them; only 标准 (and the card direction) expose any of them in
+/// the panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchPreset {
+    /// Paper size of every page.
+    pub page_size: PageSize,
+    /// Page orientation of single-image pages; `None` follows each image.
+    pub orientation: Option<Orientation>,
+    /// Direction of a two-per-page layout, and of its single-image pages.
+    pub pair_orientation: Orientation,
+    /// Two images share one page.
+    pub two_per_page: bool,
+    /// Merge only the listed images (1-based, e.g. `2-3`); `None` pairs every
+    /// image sequentially when `two_per_page` is set.
+    pub merge_spec: Option<&'static str>,
+    /// Fixed slot size in points (card-size copies such as 身份证). `None`
+    /// gives each image half of the page.
+    pub slot_size: Option<(f32, f32)>,
+    /// Rotate an image 90° when its orientation conflicts with its page/slot.
+    pub auto_rotate: bool,
+    /// Keep the slot margin on single-image pages of a two-per-page layout.
+    pub inset_single_pages: bool,
+}
+
+/// Which parameters the user may still change for a template.
+///
+/// A named template fixes the sheet and the arrangement, because a changed
+/// paper size or direction is what makes a copy come out wrong. 标准 is the
+/// free-form preset and exposes everything; a card copy only leaves direction
+/// and rotation open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BatchAdjust {
+    pub page_size: bool,
+    pub page_layout: bool,
+    /// Page direction (also flips a two-per-page layout).
+    pub page_orientation: bool,
+    /// Rotate images whose orientation does not match their slot.
+    pub auto_rotate: bool,
+    /// Expose the merge switch (标准's pairing, 入团志愿书's fixed pair).
+    pub merge: bool,
+}
+
+impl BatchAdjust {
+    /// Direction and rotation stay with the user (card copies, A5 booklet).
+    pub const ORIENTATION: Self = Self {
+        page_size: false,
+        page_layout: false,
+        page_orientation: true,
+        auto_rotate: true,
+        merge: false,
+    };
+    /// 入团志愿书: the merge switch is the only thing to change.
+    pub const MERGE: Self = Self {
+        page_size: false,
+        page_layout: false,
+        page_orientation: false,
+        auto_rotate: false,
+        merge: true,
+    };
+    /// 标准: no preset at all, every knob is the user's.
+    pub const FULL: Self = Self {
+        page_size: true,
+        page_layout: true,
+        page_orientation: true,
+        auto_rotate: true,
+        merge: true,
+    };
+}
+
+/// One batch template: what it is called, what the output must look like, and
+/// the values it sets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchTemplate {
+    /// Stable identifier, independent of the display label.
+    pub key: &'static str,
+    pub label: &'static str,
+    /// Format requirement shown under the dropdown: paper, images per page,
+    /// arrangement. Two sentences at most.
+    pub format: &'static str,
+    /// Which knobs stay adjustable in the panel.
+    pub adjust: BatchAdjust,
+    pub preset: BatchPreset,
+}
+
+impl BatchTemplate {
+    /// Whether the preset's own merge spec is the one currently in use.
+    ///
+    /// A template's spec is advisory: a folder with fewer images keeps those
+    /// pages separate instead of failing the whole batch. A spec the user
+    /// typed is strict — a typo must not silently change the layout.
+    pub fn owns_merge_spec(&self, spec: &str) -> bool {
+        self.preset.merge_spec == Some(spec.trim())
+    }
+}
+
+/// 二代身份证尺寸 85.6 × 54 mm，换算成点。
+const ID_CARD_W: f32 = 242.65;
+const ID_CARD_H: f32 = 153.07;
+
+/// The single source of templates.
+///
+/// Append a row to add one: the panel lists it, applies it and shows its
+/// format text without further code. Keep `key` stable — it identifies the
+/// preset across builds if templates are ever persisted to the preferences
+/// file.
+pub static BATCH_TEMPLATES: &[BatchTemplate] = &[
+    BatchTemplate {
+        key: "standard",
+        label: "标准",
+        format: "不套用预设：A4、每页一张，页面方向随图片。纸张、方向、每页张数与合并均在下方调整。",
+        adjust: BatchAdjust::FULL,
+        preset: BatchPreset {
+            page_size: PageSize::A4,
+            orientation: None,
+            pair_orientation: Orientation::Landscape,
+            two_per_page: false,
+            merge_spec: None,
+            slot_size: None,
+            auto_rotate: true,
+            inset_single_pages: true,
+        },
+    },
+    BatchTemplate {
+        key: "id-card",
+        label: "身份证",
+        format: "A4 每页两张，单张按 85.6 × 54 mm 原尺寸居中，不缩放；竖版上下排列，横版左右排列。扫描件按正面、反面命名为 1、2。",
+        adjust: BatchAdjust::ORIENTATION,
+        preset: BatchPreset {
+            page_size: PageSize::A4,
+            orientation: Some(Orientation::Portrait),
+            pair_orientation: Orientation::Portrait,
+            two_per_page: true,
+            merge_spec: None,
+            slot_size: Some((ID_CARD_W, ID_CARD_H)),
+            // A card scan is already the right way up; turning it would put
+            // the portrait photo sideways.
+            auto_rotate: false,
+            inset_single_pages: true,
+        },
+    },
+    BatchTemplate {
+        key: "youth-league-form",
+        label: "入团志愿书",
+        format: "A4 竖版。第 2、3 页合印一页，各旋转 90°、上下各占半页；其余页面单张成页。图片按 1–5 命名，不足 3 张时不合并。",
+        adjust: BatchAdjust::MERGE,
+        preset: BatchPreset {
+            page_size: PageSize::A4,
+            orientation: Some(Orientation::Portrait),
+            pair_orientation: Orientation::Portrait,
+            two_per_page: true,
+            merge_spec: Some("2-3"),
+            slot_size: None,
+            auto_rotate: true,
+            inset_single_pages: false,
+        },
+    },
+    BatchTemplate {
+        key: "a5-booklet",
+        label: "A5 小册子",
+        format: "A5 每页一张。A4 纸对折后两页并排，适合装订成册；页面方向可在下方调整。",
+        adjust: BatchAdjust::ORIENTATION,
+        preset: BatchPreset {
+            page_size: PageSize::A5,
+            orientation: Some(Orientation::Portrait),
+            pair_orientation: Orientation::Landscape,
+            two_per_page: false,
+            merge_spec: None,
+            slot_size: None,
+            auto_rotate: true,
+            inset_single_pages: true,
+        },
+    },
+];
+
+
+/// The preset used for a fresh session (the table's first row).
+pub fn default_batch_template() -> &'static BatchTemplate {
+    &BATCH_TEMPLATES[0]
+}
+
+/// Look a preset up by its stable key.
+///
+/// The panel talks to templates through the table, so this is only exercised
+/// by tests today; it is the entry point for persisting the choice later.
+#[allow(
+    dead_code,
+    reason = "key lookup for preset persistence; exercised by integration tests"
+)]
+pub fn batch_template_by_key(key: &str) -> Option<&'static BatchTemplate> {
+    BATCH_TEMPLATES.iter().find(|template| template.key == key)
+}
+
+impl ToolOptions {
+    /// Copy `template`'s preset into a folder-batch option set.
+    ///
+    /// Every value a preset owns is overwritten so the panel and the tool can
+    /// never disagree; options of other tools are untouched.
+    pub fn apply_batch_template(&mut self, template: &'static BatchTemplate) {
+        let ToolOptions::FolderToPdf {
+            template: current,
+            mode,
+            force_orientation,
+            pair_orientation,
+            page_size,
+            slot_size,
+            use_merge_spec,
+            merge_spec,
+            auto_rotate,
+            inset_single_pages,
+        } = self
+        else {
+            return;
+        };
+        let preset = &template.preset;
+        *current = template;
+        *mode = if preset.two_per_page {
+            BatchPageMode::TwoPerPage
+        } else {
+            BatchPageMode::Single
+        };
+        *force_orientation = preset.orientation;
+        *pair_orientation = preset.pair_orientation;
+        *page_size = preset.page_size;
+        *slot_size = preset.slot_size;
+        *use_merge_spec = preset.merge_spec.is_some();
+        *merge_spec = preset.merge_spec.unwrap_or_default().to_string();
+        *auto_rotate = preset.auto_rotate;
+        *inset_single_pages = preset.inset_single_pages;
+    }
 }
 
 /// Everything one execution needs. `output` is a file for single-output tools

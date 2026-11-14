@@ -55,8 +55,12 @@ pub struct PageNumbering {
     pub two_per_page: bool,
     /// Merge only the images listed in `merge_spec`.
     pub use_merge_spec: bool,
-    /// The spec text, e.g. `1-2,5-6`.
+    /// The spec text, e.g. `2-3`.
     pub merge_spec: String,
+    /// Whether out-of-range indices make the spec unusable. A preset's own
+    /// spec is advisory (a short folder keeps those pages separate), so the
+    /// preview must use the same rule the run does or the labels lie.
+    pub strict_merge_spec: bool,
 }
 
 /// One thumbnail: what to render, and how it is labeled.
@@ -242,6 +246,7 @@ pub fn show_folders(
                         n.two_per_page,
                         n.use_merge_spec,
                         &n.merge_spec,
+                        n.strict_merge_spec,
                     ),
                     None => (1..=images.len()).collect(),
                 };

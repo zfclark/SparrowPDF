@@ -14,11 +14,7 @@ use lopdf::{dictionary, Document, Object, ObjectId};
 use medpdf_image::{load_image, ImageData};
 
 use crate::model::ToolError;
-use crate::tools::Orientation;
-
-/// A4 in PDF points (1 pt = 1/72 inch).
-pub(crate) const A4_WIDTH: f32 = 595.28;
-pub(crate) const A4_HEIGHT: f32 = 841.89;
+use crate::tools::{Orientation, PageSize};
 
 /// Margin around each image, in points.
 pub(crate) const PAGE_MARGIN: f32 = 0.0;
@@ -38,9 +34,14 @@ pub(crate) struct ImagePageLayout {
     pub auto_rotate: bool,
     /// Uniform margin around the image box, in points.
     pub margin: f32,
+    /// Paper size of every page in the document.
+    pub page_size: PageSize,
+    /// Cap the drawn image at this size (points) and centre it on the page.
+    /// Used by card-size templates so a single 身份证 is not blown up to A4.
+    pub max_size: Option<(f32, f32)>,
 }
 
-/// Add one A4 page holding `path`, returning whether the source was a JPEG.
+/// Add one page holding `path`, returning whether the source was a JPEG.
 ///
 /// With `layout.orientation` set, the page takes that orientation; with
 /// `layout.auto_rotate`, an image whose own orientation conflicts with it is
@@ -57,6 +58,8 @@ pub(crate) fn add_image_page(
         orientation: force,
         auto_rotate,
         margin,
+        page_size,
+        max_size,
     } = layout;
     let image = load_image(path).map_err(|e| ToolError::UnsupportedFormat {
         path: Some(path.to_path_buf()),
@@ -103,15 +106,18 @@ pub(crate) fn add_image_page(
         (eff_w, eff_h)
     };
 
-    let (page_w, page_h) = if landscape_page {
-        (A4_HEIGHT, A4_WIDTH)
+    let (page_w, page_h) = page_size.page(if landscape_page {
+        Orientation::Landscape
     } else {
-        (A4_WIDTH, A4_HEIGHT)
-    };
+        Orientation::Portrait
+    });
 
-    // Fit the image into the page box, preserving aspect ratio.
-    let box_w = page_w - margin * 2.0;
-    let box_h = page_h - margin * 2.0;
+    // Fit the image into the page box, preserving aspect ratio. `max_size`
+    // caps it (card copies print at real size); the image stays centred.
+    let (box_w, box_h) = match max_size {
+        Some((w, h)) => (w, h),
+        None => (page_w - margin * 2.0, page_h - margin * 2.0),
+    };
     let scale = (box_w / fit_w).min(box_h / fit_h);
     let draw_w = fit_w * scale;
     let draw_h = fit_h * scale;

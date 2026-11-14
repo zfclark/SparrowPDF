@@ -11,7 +11,9 @@ use lopdf::Document;
 use crate::engine::{pdf_io, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::image_embed;
-use crate::tools::{check_cancel, CancelFlag, Progress, Tool, ToolOptions, ToolRequest};
+use crate::tools::{
+    check_cancel, CancelFlag, PageSize, Progress, Tool, ToolOptions, ToolRequest,
+};
 
 pub struct ImageToPdf;
 
@@ -79,6 +81,8 @@ impl Tool for ImageToPdf {
             orientation: force,
             auto_rotate,
             margin: image_embed::PAGE_MARGIN,
+            page_size: PageSize::A4,
+            max_size: None,
         };
 
         let out = pdf_io::resolve_output(&req.output, req.conflict)?;

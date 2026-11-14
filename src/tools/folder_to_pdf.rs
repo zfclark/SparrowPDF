@@ -3,11 +3,12 @@
 //! * Images inside each folder are ordered by the number in their file name
 //!   (`1.png`, `2.png`, …, `10.png` sorts numerically); names without any
 //!   number keep the system listing order after the numbered ones.
-//! * Page layout: one image per page, or two images sharing one A4 page
-//!   (`BatchPageMode::TwoPerPage`, landscape = side by side, portrait =
-//!   stacked), optionally with an explicit merge spec such as `1-2,5-6`.
-//!   The chosen layout applies to *every* page of a document, including the
-//!   pages that end up with a single image.
+//! * Page layout comes from a preset (`BATCH_TEMPLATES`): paper size, page
+//!   orientation and one-or-two images per page. One image per page, or two
+//!   images sharing one page (`BatchPageMode::TwoPerPage`, landscape = side by
+//!   side, portrait = stacked), optionally with an explicit merge spec such as
+//!   `2-3`. The chosen layout applies to *every* page of a document, including
+//!   the pages that end up with a single image.
 //! * Each folder becomes `<folder name>.pdf`, written into the folder itself
 //!   by default or into the user-chosen output directory.
 
@@ -20,12 +21,11 @@ use crate::engine::{pdf_io, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::image_embed::{
     self, add_image_xobject, attach_page, placement_matrix, read_exif_orientation,
-    register_xobject, rotate_cw_code, write_content_stream, ImagePageLayout, A4_HEIGHT, A4_WIDTH,
-    PAGE_MARGIN,
+    register_xobject, rotate_cw_code, write_content_stream, ImagePageLayout, PAGE_MARGIN,
 };
 use crate::tools::{
-    check_cancel, ensure_dir, BatchPageMode, CancelFlag, Orientation, Progress, Tool, ToolOptions,
-    ToolRequest,
+    check_cancel, ensure_dir, BatchPageMode, CancelFlag, Orientation, PageSize, Progress, Tool,
+    ToolOptions, ToolRequest,
 };
 
 /// Outer margin between the page edge and the two image slots, in points.
@@ -38,8 +38,8 @@ const SLOT_GAP: f32 = 18.0;
 /// Every page — single-image or two-image — is written from this one value.
 /// The mode, not the page, owns the orientation: in two-per-page mode a page
 /// that ends up with a single image (a trailing odd image, or an image the
-/// merge spec leaves alone) still uses the chosen A4 orientation and the same
-/// outer margin, so one PDF never mixes page sizes.
+/// merge spec leaves alone) still uses the chosen orientation, paper size and
+/// margin, so one PDF never mixes page sizes.
 #[derive(Debug, Clone, Copy)]
 struct PagePolicy {
     /// Orientation of pages holding one image; `None` follows each image.
@@ -48,6 +48,10 @@ struct PagePolicy {
     pair_orientation: Orientation,
     /// Margin of a single-image page, in points.
     single_margin: f32,
+    /// Paper size of every page.
+    page_size: PageSize,
+    /// Fixed slot size for card-size copies; `None` halves the page.
+    slot_size: Option<(f32, f32)>,
     auto_rotate: bool,
 }
 
@@ -56,6 +60,9 @@ impl PagePolicy {
         mode: BatchPageMode,
         force: Option<Orientation>,
         pair_orientation: Orientation,
+        page_size: PageSize,
+        slot_size: Option<(f32, f32)>,
+        inset_single_pages: bool,
         auto_rotate: bool,
     ) -> Self {
         match mode {
@@ -63,13 +70,23 @@ impl PagePolicy {
                 single_orientation: force,
                 pair_orientation,
                 single_margin: PAGE_MARGIN,
+                page_size,
+                slot_size,
                 auto_rotate,
             },
             // Two-per-page owns the page geometry for the whole document.
+            // Presets may still ask for full-bleed single pages (入团志愿书
+            // keeps its other pages "as usual").
             BatchPageMode::TwoPerPage => Self {
                 single_orientation: Some(pair_orientation),
                 pair_orientation,
-                single_margin: SLOT_MARGIN,
+                single_margin: if inset_single_pages {
+                    SLOT_MARGIN
+                } else {
+                    PAGE_MARGIN
+                },
+                page_size,
+                slot_size,
                 auto_rotate,
             },
         }
@@ -86,6 +103,10 @@ impl PagePolicy {
             orientation: self.single_orientation,
             auto_rotate: self.auto_rotate,
             margin: self.single_margin,
+            page_size: self.page_size,
+            // A card template keeps its slot size on odd pages too, so one
+            // stray 身份证 is not stretched over the whole sheet.
+            max_size: self.slot_size,
         }
     }
 }
@@ -121,22 +142,40 @@ impl Tool for FolderToPdf {
         progress: &Progress,
         cancel: &CancelFlag,
     ) -> Result<ToolOutcome, ToolError> {
-        let (mode, force, pair_orientation, use_merge_spec, spec, auto_rotate) = match &req.options
-        {
+        let (
+            template,
+            mode,
+            force,
+            pair_orientation,
+            page_size,
+            slot_size,
+            use_merge_spec,
+            spec,
+            auto_rotate,
+            inset_single_pages,
+        ) = match &req.options {
             ToolOptions::FolderToPdf {
+                template,
                 mode,
                 force_orientation,
                 pair_orientation,
+                page_size,
+                slot_size,
                 use_merge_spec,
                 merge_spec,
                 auto_rotate,
+                inset_single_pages,
             } => (
+                *template,
                 *mode,
                 *force_orientation,
                 *pair_orientation,
+                *page_size,
+                *slot_size,
                 *use_merge_spec,
                 merge_spec.clone(),
                 *auto_rotate,
+                *inset_single_pages,
             ),
             // Every other tool reports a mismatched option set instead of
             // falling back to defaults: a silent fallback is precisely how a
@@ -190,12 +229,16 @@ impl Tool for FolderToPdf {
                         // empty spec is a mistake, not a default.
                         if spec.trim().is_empty() {
                             return Err(ToolError::InvalidPageRange {
-                                detail: "已勾选「指定合并序号」但未输入序号：请填写（如 1-2,5-6），或取消勾选以按顺序合并".to_string(),
+                                detail: "已勾选合并序号但未输入序号：请填写（如 2-3），或取消勾选以按顺序合并".to_string(),
                             });
                         }
-                        parse_merge_spec(&spec, images.len())?
+                        // A preset's own spec is advisory (a folder with fewer
+                        // images keeps those pages separate); a spec the user
+                        // typed stays strict.
+                        let strict = !template.owns_merge_spec(&spec);
+                        parse_merge_spec(&spec, images.len(), strict)?
                     } else {
-                        // Unchecked: original behaviour — pair everything.
+                        // Unchecked: pair everything sequentially.
                         sequential_pairs(images.len())
                     }
                 }
@@ -229,7 +272,15 @@ impl Tool for FolderToPdf {
             let mut doc = Document::with_version("1.7");
             let pages_id = build_document_skeleton(&mut doc);
             // Built once per folder, then reused by every page.
-            let policy = PagePolicy::new(mode, force, pair_orientation, auto_rotate);
+            let policy = PagePolicy::new(
+                mode,
+                force,
+                pair_orientation,
+                page_size,
+                slot_size,
+                inset_single_pages,
+                auto_rotate,
+            );
             for (page_index, plan) in job.plans.iter().enumerate() {
                 check_cancel(cancel)?;
                 render_page(&mut doc, pages_id, page_index, plan, &job.images, policy)?;
@@ -277,12 +328,9 @@ impl Tool for FolderToPdf {
         progress.report(1.0, "完成".to_string());
 
         let summary = format!(
-            "已生成 {} 个 PDF（共 {total_images} 张图片，{} 模式）",
+            "已生成 {} 个 PDF（共 {total_images} 张图片，模板：{}）",
             outputs.len(),
-            match mode {
-                BatchPageMode::Single => "每页一张",
-                BatchPageMode::TwoPerPage => "两图一页",
-            }
+            template.label
         );
         if !skipped.is_empty() {
             let detail = skipped
@@ -400,19 +448,22 @@ fn sequential_pairs(count: usize) -> Vec<PagePlan> {
 
 /// Output page number (1-based) of each image, for the thumbnail preview.
 ///
-/// Lenient on purpose: an invalid merge spec falls back to sequential
+/// Lenient on purpose: an unusable merge spec falls back to sequential
 /// pairing so the preview keeps working while the user types — the run
-/// itself reports the exact error.
+/// itself reports the exact error. `strict` must mirror the run's rule for
+/// the spec at hand: a preset's own spec is advisory (out-of-range indices
+/// are skipped), a spec the user typed is not.
 pub fn preview_page_numbers(
     count: usize,
     two_per_page: bool,
     use_merge_spec: bool,
     merge_spec: &str,
+    strict: bool,
 ) -> Vec<usize> {
     let plans = if !two_per_page {
         single_page_plans(count)
     } else if use_merge_spec && !merge_spec.trim().is_empty() {
-        parse_merge_spec(merge_spec, count).unwrap_or_else(|_| sequential_pairs(count))
+        parse_merge_spec(merge_spec, count, strict).unwrap_or_else(|_| sequential_pairs(count))
     } else {
         sequential_pairs(count)
     };
@@ -429,7 +480,7 @@ pub fn preview_page_numbers(
     numbers
 }
 
-/// Parse the merge spec (`1-2,5-6`) into page plans.
+/// Parse the merge spec (`2-3`, `1-2,5-6`) into page plans.
 ///
 /// * `A-B` puts images A and B on one page (order-agnostic, 1-based).
 /// * `N` keeps image N alone.
@@ -437,7 +488,12 @@ pub fn preview_page_numbers(
 /// * Plans are ordered by the earliest image they contain, so output pages
 ///   follow the original image sequence (spec `2-3` yields pages
 ///   [1], [2+3], [4], …) instead of jumping to the spec pairs first.
-fn parse_merge_spec(spec: &str, count: usize) -> Result<Vec<PagePlan>, ToolError> {
+///
+/// With `strict == false` an index beyond `count` is skipped instead of
+/// rejected: preset specs (入团志愿书's `2-3`) must still convert a folder
+/// that holds fewer images. A malformed token is always an error — that is a
+/// typing mistake, not a smaller folder.
+fn parse_merge_spec(spec: &str, count: usize, strict: bool) -> Result<Vec<PagePlan>, ToolError> {
     let mut plans: Vec<PagePlan> = Vec::new();
     let mut used = vec![false; count];
 
@@ -457,8 +513,12 @@ fn parse_merge_spec(spec: &str, count: usize) -> Result<Vec<PagePlan>, ToolError
             continue;
         }
         if let Some((a, b)) = part.split_once(['-', '~', '+']) {
-            let x = parse_index(a, count)?;
-            let y = parse_index(b, count)?;
+            let Some(x) = parse_index(a, count, strict)? else {
+                continue;
+            };
+            let Some(y) = parse_index(b, count, strict)? else {
+                continue;
+            };
             if x == y {
                 mark_single(x, &mut used)?;
                 plans.push(PagePlan::One(x));
@@ -479,7 +539,9 @@ fn parse_merge_spec(spec: &str, count: usize) -> Result<Vec<PagePlan>, ToolError
                 plans.push(PagePlan::Two(lo, hi));
             }
         } else {
-            let x = parse_index(part, count)?;
+            let Some(x) = parse_index(part, count, strict)? else {
+                continue;
+            };
             mark_single(x, &mut used)?;
             plans.push(PagePlan::One(x));
         }
@@ -498,7 +560,9 @@ fn parse_merge_spec(spec: &str, count: usize) -> Result<Vec<PagePlan>, ToolError
     Ok(plans)
 }
 
-fn parse_index(raw: &str, count: usize) -> Result<usize, ToolError> {
+/// 1-based image number → 0-based index. `Ok(None)` means "beyond `count`"
+/// while `strict` is off.
+fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, ToolError> {
     let trimmed = raw.trim();
     let n: usize = trimmed.parse().map_err(|_| ToolError::InvalidPageRange {
         detail: format!("「{trimmed}」不是合法的图片序号"),
@@ -509,11 +573,14 @@ fn parse_index(raw: &str, count: usize) -> Result<usize, ToolError> {
         });
     }
     if n > count {
-        return Err(ToolError::InvalidPageRange {
-            detail: format!("合并序号 {n} 超出图片数量 {count}"),
-        });
+        if strict {
+            return Err(ToolError::InvalidPageRange {
+                detail: format!("合并序号 {n} 超出图片数量 {count}"),
+            });
+        }
+        return Ok(None);
     }
-    Ok(n - 1)
+    Ok(Some(n - 1))
 }
 
 // ---------------------------------------------------------------- rendering
@@ -561,6 +628,8 @@ fn render_page(
                 page_index,
                 (&images[*left], &images[*right]),
                 policy.pair_orientation,
+                policy.page_size,
+                policy.slot_size,
                 policy.auto_rotate,
             )?;
         }
@@ -568,32 +637,72 @@ fn render_page(
     Ok(())
 }
 
-/// One A4 page with two image slots.
+/// One page with two image slots.
 ///
 /// Landscape pages hold the slots side by side (portrait slots); portrait
 /// pages stack them vertically (landscape slots). With `auto_rotate`, an
 /// image whose orientation conflicts with its slot is turned 90° to fill it.
+///
+/// `slot_size` switches to card-size copies (身份证): both slots keep their
+/// real dimensions and the pair is centred on the sheet, so the copy prints at
+/// 1:1 instead of being blown up to half a page.
 fn add_two_image_page(
     doc: &mut Document,
     pages_id: lopdf::ObjectId,
     page_index: usize,
     (left, right): (&Path, &Path),
     pair_orientation: Orientation,
+    page_size: PageSize,
+    slot_size: Option<(f32, f32)>,
     auto_rotate: bool,
 ) -> Result<(), ToolError> {
-    let (page_w, page_h) = match pair_orientation {
-        Orientation::Landscape => (A4_HEIGHT, A4_WIDTH),
-        Orientation::Portrait => (A4_WIDTH, A4_HEIGHT),
-    };
-    let (slot_w, slot_h) = match pair_orientation {
-        Orientation::Landscape => (
-            (page_w - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
-            page_h - 2.0 * SLOT_MARGIN,
-        ),
-        Orientation::Portrait => (
-            page_w - 2.0 * SLOT_MARGIN,
-            (page_h - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
-        ),
+    let (page_w, page_h) = page_size.page(pair_orientation);
+    let (slot_w, slot_h, slots) = match slot_size {
+        Some((w, h)) => {
+            let slots = match pair_orientation {
+                Orientation::Landscape => {
+                    let x = (page_w - (2.0 * w + SLOT_GAP)) / 2.0;
+                    let y = (page_h - h) / 2.0;
+                    [(x, y), (x + w + SLOT_GAP, y)]
+                }
+                Orientation::Portrait => {
+                    let x = (page_w - w) / 2.0;
+                    let y = (page_h - (2.0 * h + SLOT_GAP)) / 2.0;
+                    [(x, y), (x, y + h + SLOT_GAP)]
+                }
+            };
+            (w, h, slots)
+        }
+        None => match pair_orientation {
+            Orientation::Landscape => {
+                let (w, h) = (
+                    (page_w - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
+                    page_h - 2.0 * SLOT_MARGIN,
+                );
+                (
+                    w,
+                    h,
+                    [
+                        (SLOT_MARGIN, SLOT_MARGIN),
+                        (SLOT_MARGIN + w + SLOT_GAP, SLOT_MARGIN),
+                    ],
+                )
+            }
+            Orientation::Portrait => {
+                let (w, h) = (
+                    page_w - 2.0 * SLOT_MARGIN,
+                    (page_h - 2.0 * SLOT_MARGIN - SLOT_GAP) / 2.0,
+                );
+                (
+                    w,
+                    h,
+                    [
+                        (SLOT_MARGIN, SLOT_MARGIN),
+                        (SLOT_MARGIN, SLOT_MARGIN + h + SLOT_GAP),
+                    ],
+                )
+            }
+        },
     };
     let slot_is_landscape = slot_w > slot_h;
 
@@ -605,7 +714,7 @@ fn add_two_image_page(
     attach_page(doc, pages_id, page_id)?;
 
     let mut draws: Vec<(String, [f32; 6])> = Vec::new();
-    for (slot, path) in [(0, left), (1, right)] {
+    for (slot, path) in [(0usize, left), (1usize, right)] {
         let image = medpdf_image::load_image(path).map_err(|e| ToolError::UnsupportedFormat {
             path: Some(path.to_path_buf()),
             detail: e.to_string(),
@@ -642,12 +751,7 @@ fn add_two_image_page(
         let draw_w = fit_w * scale;
         let draw_h = fit_h * scale;
 
-        let (slot_x, slot_y) = match pair_orientation {
-            Orientation::Landscape => {
-                (SLOT_MARGIN + slot as f32 * (slot_w + SLOT_GAP), SLOT_MARGIN)
-            }
-            Orientation::Portrait => (SLOT_MARGIN, SLOT_MARGIN + slot as f32 * (slot_h + SLOT_GAP)),
-        };
+        let (slot_x, slot_y) = slots[slot];
         let x0 = slot_x + (slot_w - draw_w) / 2.0;
         let y0 = slot_y + (slot_h - draw_h) / 2.0;
 
