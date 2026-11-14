@@ -61,12 +61,14 @@
 | `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入 |
 | `kamadak-exif` 0.6 | JPEG 的 EXIF 方向读取 |
 | `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
+| `fast_image_resize` 6.1（std） | 图片重采样（AVX2 / NEON 运行时派发，Lanczos-3） |
+| `jpeg-encoder` 0.7（simd） | JPEG 编码（4:4:4、优化霍夫曼表；熵编码源自 IJG） |
 | `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
 | `weezl` 0.2 | LZW 解码（图像 `/LZWDecode`） |
 | `hayro-ccitt` 0.4 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`） |
 | `hayro-jbig2` 0.3（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段 |
 | `flate2` 1（rust_backend） | zlib 解压（图像 `/FlateDecode` 与预测器流水线） |
-| `windows-sys` 0.61（registry 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号；同版本已在依赖树中（`winresource` 带入），只开注册表 API |
+| `windows-sys` 0.61（registry / system-information 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号，线程池读取物理内存；同版本已在依赖树中（`winresource` 带入），只开这两组 API |
 | `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |
 
 ---
@@ -218,14 +220,17 @@ pub trait Tool: Send + Sync {
 以下六条是改这条流水线时必须保持的行为：
 
 1. **按绘制尺寸算分辨率**：有效 DPI = 源像素 ÷ **绘制后**的页面尺寸，不是纸张尺寸
-   （等比缩放留白时用纸张会高估所需像素）。超出预算才重采样（Catmull-Rom）并重编码；
-   不超预算的 JPEG 保持原字节直通，不做二次编码。
+   （等比缩放留白时用纸张会高估所需像素）。超出预算才重采样（`fast_image_resize` 的
+   Lanczos-3）并重编码；不超预算的 JPEG 保持原字节直通，不做二次编码。
 2. **档位与默认值**：批量转换的「体积优化」为 `ScanQuality`——`标准 = 300 DPI / 质量 85`
    （默认）、`更小体积 = 150 DPI / 质量 78`、`不压缩 = 保留源像素`。该选项是用户偏好，
    不随模板切换重置（`apply_batch_template` 不得改动它）。
 3. **不透明 PNG 存 JPEG**：alpha 全 ≥ 250 视为不透明并丢弃 `/SMask`；有真实透明时仍走
    `/FlateDecode` + `/SMask`。任何位图流都必须显式 `Stream::compress()` 后再落盘——
    lopdf 的保存路径不会自动压缩，漏掉这一步一页 600 DPI 扫描就是约 100 MB 裸像素。
+   JPEG 一律 4:4:4 + 优化霍夫曼表（`jpeg-encoder`）：在扫描件上比 4:2:0 默认档更小也更
+   保真。**不要**把 `set_optimized_huffman_tables` 与 4:2:0 组合——该 crate 的非交织
+   路径会写出损坏的码流（实测 PSNR 2.4 dB），需要次采样时先确认版本已修复。
 4. **20 MB 上限**：批量转换单份 PDF 超过 `SCAN_SIZE_LIMIT`（20 MiB）时，按
    `ScanBudget::tightened`（DPI × 0.82、质量 −6，下限 96 DPI / 45）收紧后整份重渲染；
    文档先在内存里序列化量出精确体积，**只落盘一次**。到下限仍超出必须在结果摘要里
@@ -258,9 +263,10 @@ CPU 密集的逐项工作统一走 `engine::pool`，两个工具共用一套调�
    字体字形缓存因此是 `Mutex` 而不是 `RefCell`——不要为了省锁把它改回去，那会让
    整个 `FontSet` 无法跨线程共享，退化成每线程解析一套字体。
 
-体积与时序基线（16 核 / 16 GB，13 页 600 DPI 扫描件）：批量转换 300 DPI 约 7 MB / 9 秒，
-PDF 转图片 300 DPI 12 页约 2.5 秒；同一批在不压缩档约 16 MB。出现数量级偏离时先查
-3.5 的第 3 条与第 5 条。
+体积与时序基线（16 核 / 16 GB，13 页 600 DPI 扫描件）：批量转换 300 DPI 约 6 MB / 2 秒，
+对照的第三方排版产物为 5.2 MB（其分辨率 1876–3296 px/页，本工具统一 2479 px/页，每像素
+字节数持平）；PDF 转图片 300 DPI 12 页约 2.5 秒；同一批在不压缩档约 16 MB。出现数量级
+偏离时先查 3.5 的第 3 条与第 5 条。
 
 ---
 

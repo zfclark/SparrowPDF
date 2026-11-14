@@ -9,15 +9,17 @@
 
 ## 下载
 
-| 你的系统 | 下载 | 说明 |
-| --- | --- | --- |
-| Windows 10 / 11（Intel、AMD） | `SparrowPDF-windows-x64.exe` | 免安装，解压即用 |
-| Windows 10 / 11 on ARM | `SparrowPDF-windows-arm64.exe` | 原生 ARM64 构建 |
+| 你的系统                            | 下载                             | 说明                   |
+| ----------------------------------- | -------------------------------- | ---------------------- |
+| Windows 10 / 11（x64）              | `SparrowPDF-windows-x64.exe`     | 免安装，打开即用       |
+| Windows 10 / 11 on ARM              | `SparrowPDF-windows-arm64.exe`   | 原生 ARM64 构建        |
 | macOS 11+（Intel 与 Apple Silicon） | `SparrowPDF-macos-universal.dmg` | 通用二进制，双架构共用 |
 
 ARM 版适用于骁龙 8cx / X 系列等 Windows on ARM 设备，系统要求 Windows 10 及以上。
 
-Windows 版默认请求管理员权限，原因见「Windows 的提权」。
+下载位置位于 [Release](https://github.com/zfclark/SparrowPDF/releases/latest) 页，按照对应系统版本下载。
+
+Windows 版默认请求管理员权限，原因见「[Windows 的提权](#windows-的提权)」。
 
 macOS 包为 ad-hoc 签名、未经公证，首次打开可能提示「无法验证开发者」或「已损坏」。确认来源后，
 在终端执行一次解除隔离：
@@ -28,20 +30,20 @@ xattr -dr com.apple.quarantine /Applications/SparrowPDF.app
 
 ## 能做什么
 
-| 分组 | 工具 | 说明 |
-| --- | --- | --- |
-| 创建 | 图片合并 PDF | 选择多张 JPG / PNG 按顺序合成单个 PDF；竖拍照片自动校正方向 |
-| 创建 | 批量转换 | 指定多个文件夹，各生成一个 PDF；按材料选模板（标准、身份证、入团志愿书、A5 小册子），文件名按数值排序 |
-| 合并 | PDF 合并 | 拖拽调整顺序后合成单个 PDF |
-| 拆分 | PDF 拆分 | 按页码范围、每 N 页、或一页一个文件 |
-| 页面 | 页面旋转 | 每次旋转 90°，可连续操作，按累计角度生效 |
-| 页面 | 删除页面 | 指定页码删除 |
-| 页面 | 页面重排 | 拖拽排序，实时预览输出页序 |
-| 页面 | 提取页面 | 选中的页单独存为新文件 |
-| 水印 | 文本水印 | 平铺或居中，可调字号、透明度、角度，使用系统中文字体 |
-| 水印 | 图片水印 | 支持缩放、透明度与叠加位置 |
-| 安全 | 加密 / 解密 | AES-256，可分别限制打印 / 复制 / 修改；亦可移除密码 |
-| 导出 | PDF 转图片 | 一次可转多个 PDF，每页导出 PNG / JPEG，36–600 DPI（默认 300） |
+| 分组 | 工具         | 说明                                                                                                  |
+| ---- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| 创建 | 图片合并 PDF | 选择多张 JPG / PNG 按顺序合成单个 PDF；竖拍照片自动校正方向                                           |
+| 创建 | 批量转换     | 指定多个文件夹，各生成一个 PDF；按材料选模板（标准、身份证、入团志愿书、A5 小册子），文件名按数值排序 |
+| 合并 | PDF 合并     | 拖拽调整顺序后合成单个 PDF                                                                            |
+| 拆分 | PDF 拆分     | 按页码范围、每 N 页、或一页一个文件                                                                   |
+| 页面 | 页面旋转     | 每次旋转 90°，可连续操作，按累计角度生效                                                              |
+| 页面 | 删除页面     | 指定页码删除                                                                                          |
+| 页面 | 页面重排     | 拖拽排序，实时预览输出页序                                                                            |
+| 页面 | 提取页面     | 选中的页单独存为新文件                                                                                |
+| 水印 | 文本水印     | 平铺或居中，可调字号、透明度、角度，使用系统中文字体                                                  |
+| 水印 | 图片水印     | 支持缩放、透明度与叠加位置                                                                            |
+| 安全 | 加密 / 解密  | AES-256，可分别限制打印 / 复制 / 修改；亦可移除密码                                                   |
+| 导出 | PDF 转图片   | 一次可转多个 PDF，每页导出 PNG / JPEG，36–600 DPI（默认 300）                                         |
 
 ## 使用要点
 
@@ -50,8 +52,6 @@ xattr -dr com.apple.quarantine /Applications/SparrowPDF.app
 此操作」。
 
 **外观跟随系统。** 侧边栏底部可切换浅色 / 深色，选择会持久化，下次启动沿用。
-
-**版本号见「关于」。** 从侧边栏底部进入，显示完整五位版本（如 `V0.6.0.20261114`）。
 
 **输出位置优先采用用户指定路径。** 未指定时写入源文件同目录；目录不可写（如 `Program Files`）
 时自动改存至 `文档\SparrowPDF`，并在结果卡片中标注实际路径。
@@ -75,7 +75,7 @@ macOS 无此机制：权限由 POSIX/ACL 与 TCC 决定，`.app` 以当前用户
 cargo build --release
 ```
 
-最低 Rust 1.95（edition 2021），产物为单个可执行文件。
+本地配置最低 Rust 1.95（edition 2021）。
 
 ## 已知限制
 
@@ -90,3 +90,8 @@ cargo build --release
 ## License
 
 本项目使用 [MIT](./LICENSE) 许可证授权。
+
+第三方组件：JPEG 编码使用 [`jpeg-encoder`](https://github.com/vstroebel/jpeg-encoder)
+（MIT / Apache-2.0），其熵编码实现部分源自 Independent JPEG Group 的工作
+（IJG 许可证）；图像缩放使用 [`fast_image_resize`](https://github.com/cykooz/fast_image_resize)
+（MIT / Apache-2.0）。
