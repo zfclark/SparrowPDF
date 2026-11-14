@@ -157,7 +157,7 @@ fn about_row(ui: &mut Ui) -> bool {
     response.clicked()
 }
 
-/// App badge: icon plus wordmark and tagline, on one row.
+/// App badge: icon plus wordmark, on one row.
 fn app_header(ui: &mut Ui, icon: Option<&egui::TextureHandle>) {
     ui.add_space(theme::GAP_S);
     ui.horizontal(|ui| {
@@ -169,14 +169,11 @@ fn app_header(ui: &mut Ui, icon: Option<&egui::TextureHandle>) {
             );
             ui.add_space(theme::GAP_S);
         }
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new("轻雀 PDF")
-                    .strong()
-                    .text_style(egui::TextStyle::Heading),
-            );
-            ui.label(egui::RichText::new("PDF 的事，本地办完。").small().weak());
-        });
+        ui.label(
+            egui::RichText::new("轻雀 PDF")
+                .strong()
+                .text_style(egui::TextStyle::Heading),
+        );
     });
 }
 
