@@ -66,6 +66,7 @@
 | `hayro-ccitt` 0.4 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`） |
 | `hayro-jbig2` 0.3（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段 |
 | `flate2` 1（rust_backend） | zlib 解压（图像 `/FlateDecode` 与预测器流水线） |
+| `windows-sys` 0.61（registry 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号；同版本已在依赖树中（`winresource` 带入），只开注册表 API |
 | `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |
 
 ---
@@ -118,6 +119,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    │    ├── render.rs   PDF 页面软件光栅化（缩略图与 PDF 转图片）
    │    ├── raster.rs   像素缓冲与绘制原语
    │    ├── ttf.rs      TrueType/OpenType 解析（支持 .ttc 集合）
+   │    ├── sysinfo.rs  本机信息（系统版本、CPU 型号），只读且按会话缓存
    │    └── logging.rs  追加式文件日志（%LOCALAPPDATA%\sparrowpdf\sparrowpdf.log）
    │
    ├── model.rs   领域模型（无 IO、无第三方 PDF 类型）：ToolId / ToolGroup / ToolError / TaskState
@@ -163,7 +165,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 | 页面编辑 | 文本水印 | 1 个 PDF | 叠加文字水印的 PDF |
 | 页面编辑 | 图片水印 | 1 个 PDF + 1 图 | 叠加图片水印的 PDF |
 | 安全 | 加密 / 解密 | 1 个 PDF | AES-256 加密或移除密码 |
-| 转换 | PDF 转图片 | 1 个 PDF | 每页 PNG/JPEG |
+| 转换 | PDF 转图片 | 1 个或多个 PDF | 每页 PNG/JPEG |
 
 ### 3.2 统一契约
 

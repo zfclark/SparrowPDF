@@ -11,7 +11,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    │    ├── theme.rs     设计令牌 + 组件（卡片、按钮、输入框、状态色、结果区、外链打开）
    │    ├── sidebar.rs   工具导航 + 外观切换 + 关于入口
    │    ├── status.rs    底部操作条（主按钮、进度、结果区）
-   │    ├── about.rs     关于弹窗（版本、作者、项目地址）
+   │    ├── about.rs     关于弹窗（版本、系统与 CPU、作者、项目地址）
    │    ├── conflict.rs  同名文件模态提问
    │    ├── preview.rs   缩略图预览（图片与 PDF 页面，逐帧限流渲染）
    │    ├── prefs.rs     外观偏好持久化（%LOCALAPPDATA%\sparrowpdf\ui.pref）
@@ -29,6 +29,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    │    ├── render.rs   PDF 页面软件光栅化（缩略图与 PDF 转图片）
    │    ├── raster.rs   像素缓冲与绘制原语
    │    ├── ttf.rs      TrueType/OpenType 解析（支持 .ttc 集合）
+   │    ├── sysinfo.rs  本机信息（系统版本、CPU 型号），只读且缓存
    │    └── logging.rs  追加式文件日志
    │
    ├── model.rs   领域模型（无 IO、无第三方 PDF 类型）：ToolId / ToolGroup / ToolError / TaskState
@@ -39,7 +40,8 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 演化出两套页面语义。
 
 - `ui/` → `model`、`tools`（选项类型、trait 签名，以及预览所需的纯函数：
-  `collect_images`、`preview_page_numbers`、`ordered_pages`）、`engine::logging`
+  `collect_images`、`preview_page_numbers`、`ordered_pages`）、`engine::logging`、
+  `engine::sysinfo`（关于弹窗的本机信息）
 - `tools/` → `engine`、`model`、`lopdf` / `medpdf` / `image`
 - `engine/` → `model`（错误类型）与各自领域库
 - `model.rs` → 仅标准库
