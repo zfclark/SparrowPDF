@@ -140,7 +140,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 | --- | --- | --- |
 | `src/model.rs` | 工具注册表与错误模型；新增工具必须在此登记 | 高：影响全部面板与测试 |
 | `src/tools/mod.rs` | `Tool` 契约、选项枚举、进度/取消通道、工厂函数 | 高 |
-| `src/engine/pdf_io.rs` | 唯一的落盘入口（原子写）、密码打开、可写性探测 | 高：写坏即数据丢失 |
+| `src/engine/pdf_io.rs` | 唯一的落盘入口（`save_document` / `write_file_atomic` 原子写，`write_file` 直写）、密码打开、可写性探测 | 高：写坏即数据丢失 |
 | `src/engine/worker.rs` | 线程生命周期、panic 捕获、取消传播 | 中 |
 | `src/app.rs` | 输出路径解析与回退、任务编排、结果状态机 | 中高 |
 | `src/ui/theme.rs` | 全部视觉令牌与通用控件 | 中：改动影响所有面板 |
@@ -192,7 +192,7 @@ pub trait Tool: Send + Sync {
 
 1. 解析参数 → 尽早失败（`validate`）。
 2. 逐项处理，每步 `check_cancel` + `progress.report`。
-3. **统一经 `pdf_io::save_document`（或 `write_file`）落盘，并把 `req.conflict` 一并传入**：两者在写之前会再复核一次目标是否存在（`ConflictPolicy::Report` 时直接返回 `OutputExists`），先写同目录临时文件再 `rename`，避免半成品；权限错误由 `write_error_detail` 映射为中文提示。规划与落盘之间可能隔几分钟的渲染，这次复核是防静默覆盖的第二道闸。
+3. **统一经 `pdf_io` 的落盘入口写入，并把 `req.conflict` 一并传入**：`save_document`（文档）与 `write_file_atomic`（已序列化字节）先写同目录临时文件再 `rename`，`write_file` 直接写——常规产出优先用前两个，只有调用方明确接受非原子写时才用 `write_file`（如逐页导出的小文件）。三者都会在写之前再复核一次目标是否存在（`ConflictPolicy::Report` 时直接返回 `OutputExists`）；权限错误由 `write_error_detail` 映射为中文提示。规划与落盘之间可能隔几分钟的渲染，这次复核是防静默覆盖的第二道闸。
 4. 落盘后**重新打开产物断言**（`validate::assert_page_count` 等）；断言失败要删除产物并返回 `ValidationFailed`。
 5. 不得在工具内部直接 `fs::write` 或 `File::create` 绕过第 3 步。
 
@@ -209,6 +209,34 @@ pub trait Tool: Send + Sync {
 
 读法：先读本节 3.2 / 3.3 的契约，再读对应文档；各篇末尾的「已知缺口」为既有边界，
 不应作为回归缺陷处理。
+
+### 3.5 图片与扫描件的分辨率与体积契约
+
+图片类工具（图片合并为 PDF、批量转换）共用 `tools/image_embed.rs` 的一条流水线。
+以下六条是改这条流水线时必须保持的行为：
+
+1. **按绘制尺寸算分辨率**：有效 DPI = 源像素 ÷ **绘制后**的页面尺寸，不是纸张尺寸
+   （等比缩放留白时用纸张会高估所需像素）。超出预算才重采样（Catmull-Rom）并重编码；
+   不超预算的 JPEG 保持原字节直通，不做二次编码。
+2. **档位与默认值**：批量转换的「体积优化」为 `ScanQuality`——`标准 = 300 DPI / 质量 85`
+   （默认）、`更小体积 = 150 DPI / 质量 78`、`不压缩 = 保留源像素`。该选项是用户偏好，
+   不随模板切换重置（`apply_batch_template` 不得改动它）。
+3. **不透明 PNG 存 JPEG**：alpha 全 ≥ 250 视为不透明并丢弃 `/SMask`；有真实透明时仍走
+   `/FlateDecode` + `/SMask`。任何位图流都必须显式 `Stream::compress()` 后再落盘——
+   lopdf 的保存路径不会自动压缩，漏掉这一步一页 600 DPI 扫描就是约 100 MB 裸像素。
+4. **20 MB 上限**：批量转换单份 PDF 超过 `SCAN_SIZE_LIMIT`（20 MiB）时，按
+   `ScanBudget::tightened`（DPI × 0.82、质量 −6，下限 96 DPI / 45）收紧后整份重渲染；
+   文档先在内存里序列化量出精确体积，**只落盘一次**。到下限仍超出必须在结果摘要里
+   如实写明「压缩后仍超过 20 MB」。
+5. **方向只进矩阵**：EXIF 方向与槽位自动旋转都只体现在绘制矩阵上，像素不做物理旋转；
+   目标像素数按显示方向计算，再按「EXIF 与旋转异或」映射回源方向——漏掉映射会把合并页
+   （旋转 90° 进半页槽位）的图片按错误长宽比重采样，出现横向拉变形。
+6. **准备与组装分离**：`prepare_image`（解码 → 重采样 → 编码）不得接触 `Document`，
+   `add_page` 只写 PDF 对象。批量转换据此按 `MAX_PREPARE_WORKERS`（4）并行准备图片、
+   串行组装；新增图片处理逻辑必须留在这条边界内，否则并行与进度都会失效。
+
+体积与时序基线（13 页 600 DPI 扫描件，`标准` 档）：约 7 MB / 14 秒；同一批在
+`不压缩` 档约 16 MB。出现数量级偏离时先查第 3 条与第 5 条。
 
 ---
 
@@ -234,7 +262,7 @@ cargo test --release --lib --test integration
 
 | 层级 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 集成测试 | `tests/integration.rs`（44 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字 |
+| 集成测试 | `tests/integration.rs`（53 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯 |
 | 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
 
 规则：
