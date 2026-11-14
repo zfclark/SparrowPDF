@@ -8,6 +8,7 @@
 //! Supported: simple glyphs (quadratic contours) and composite glyphs.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// A flattened outline: closed contours of `(x, y)` in font units.
 pub type Contours = Vec<Vec<(f32, f32)>>;
@@ -21,7 +22,13 @@ pub struct TrueTypeFont {
     cmap: BTreeMap<u32, u16>,
     advances: Vec<u16>,
     /// Cache of glyph outlines, keyed by glyph id.
-    cache: std::cell::RefCell<BTreeMap<u16, Contours>>,
+    ///
+    /// Behind a `Mutex`, not a `RefCell`: the rasterizer runs one page per
+    /// worker thread, and a `FontSet` is shared between them (the alternative
+    /// would be one parsed font collection per worker, tens of megabytes
+    /// each). The lock is held for a map lookup only — glyph outlines are
+    /// built outside it — so contention stays in the nanosecond range.
+    cache: Mutex<BTreeMap<u16, Contours>>,
 }
 
 impl TrueTypeFont {
@@ -130,7 +137,7 @@ impl TrueTypeFont {
             glyf,
             cmap,
             advances,
-            cache: std::cell::RefCell::new(BTreeMap::new()),
+            cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -153,12 +160,19 @@ impl TrueTypeFont {
 
     /// Outline for `gid` in font units (y axis points up, origin at baseline).
     pub fn outline(&self, gid: u16) -> Contours {
-        if let Some(hit) = self.cache.borrow().get(&gid) {
+        // A poisoned cache only means one outline build panicked; the map is
+        // still consistent, so keep using it rather than failing the page.
+        let cache = || {
+            self.cache
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        };
+        if let Some(hit) = cache().get(&gid) {
             return hit.clone();
         }
         let mut contours = Vec::new();
         self.build_glyph(gid, &mut contours, 0);
-        self.cache.borrow_mut().insert(gid, contours.clone());
+        cache().insert(gid, contours.clone());
         contours
     }
 

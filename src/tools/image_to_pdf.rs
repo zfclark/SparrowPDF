@@ -12,7 +12,7 @@ use crate::engine::{pdf_io, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::image_embed;
 use crate::tools::{
-    check_cancel, CancelFlag, PageSize, Progress, Tool, ToolOptions, ToolRequest,
+    check_cancel, CancelFlag, Orientation, PageSize, Progress, Tool, ToolOptions, ToolRequest,
 };
 
 pub struct ImageToPdf;
@@ -77,12 +77,27 @@ impl Tool for ImageToPdf {
         };
         // One layout for the whole document: every image page is written with
         // the same orientation policy and margin.
-        let layout = image_embed::ImagePageLayout {
-            orientation: force,
-            auto_rotate,
-            margin: image_embed::PAGE_MARGIN,
-            page_size: PageSize::A4,
-            max_size: None,
+        //
+        // No scan budget here on purpose: this tool promises JPEG passthrough
+        // (`validate::assert_jpeg_soi_bytes` proves it), so the source bytes go
+        // in untouched. Size control is a batch-conversion setting.
+        let sheet = match force {
+            Some(orientation) => {
+                let page = PageSize::A4.page(orientation);
+                let margin = image_embed::PAGE_MARGIN;
+                image_embed::Sheet::Fixed {
+                    page,
+                    fit: (page.0 - margin * 2.0, page.1 - margin * 2.0),
+                    center: (page.0 / 2.0, page.1 / 2.0),
+                    landscape: orientation == Orientation::Landscape,
+                    auto_rotate,
+                }
+            }
+            // No forced direction: each page takes its image's own orientation.
+            None => image_embed::Sheet::Follow {
+                page_size: PageSize::A4,
+                margin: image_embed::PAGE_MARGIN,
+            },
         };
 
         let out = pdf_io::resolve_output(&req.output, req.conflict)?;
@@ -101,11 +116,14 @@ impl Tool for ImageToPdf {
                 format!("处理图片 {}/{}：{}", index + 1, total, input.display_name()),
             );
 
-            match image_embed::add_image_page(&mut doc, pages_id, &input.path, layout, index) {
-                Ok(is_jpeg) => {
-                    if is_jpeg {
+            match image_embed::prepare_image(&input.path, sheet, None) {
+                Ok(prepared) => {
+                    if prepared.jpeg_passthrough {
                         jpeg_count += 1;
                     }
+                    let page = prepared.page_box;
+                    let entries = vec![(format!("Im{}", index + 1), prepared)];
+                    image_embed::add_page(&mut doc, pages_id, page, entries)?;
                 }
                 Err(err) => {
                     // One bad image must not abort the batch; record and continue.

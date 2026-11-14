@@ -5,19 +5,21 @@
 面向日常 PDF 处理的桌面工具集：合并、拆分、旋转、删页、加水印、加密、转图片。全部在本机完成，
 无网络请求、无遥测、无需账号。
 
-![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue) ![rust](https://img.shields.io/badge/rust-1.95%2B-orange)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue) ![rust](https://img.shields.io/badge/rust-1.95%2B-orange) ![PR 检查](https://github.com/zfclark/SparrowPDF/actions/workflows/ci.yml/badge.svg)
 
 ## 下载
 
-| 你的系统 | 下载 | 说明 |
-| --- | --- | --- |
-| Windows 10 / 11（Intel、AMD） | `SparrowPDF-windows-x64.exe` | 免安装，解压即用 |
-| Windows 10 / 11 on ARM | `SparrowPDF-windows-arm64.exe` | 原生 ARM64 构建 |
+| 你的系统                            | 下载                             | 说明                   |
+| ----------------------------------- | -------------------------------- | ---------------------- |
+| Windows 10 / 11（x64）              | `SparrowPDF-windows-x64.exe`     | 免安装，打开即用       |
+| Windows 10 / 11 on ARM              | `SparrowPDF-windows-arm64.exe`   | 原生 ARM64 构建        |
 | macOS 11+（Intel 与 Apple Silicon） | `SparrowPDF-macos-universal.dmg` | 通用二进制，双架构共用 |
 
 ARM 版适用于骁龙 8cx / X 系列等 Windows on ARM 设备，系统要求 Windows 10 及以上。
 
-Windows 版默认请求管理员权限，原因见「Windows 的提权」。
+下载位置位于 [Release](https://github.com/zfclark/SparrowPDF/releases/latest) 页，按照对应系统版本下载。
+
+Windows 版默认请求管理员权限，原因见「[Windows 的提权](#windows-的提权)」。
 
 macOS 包为 ad-hoc 签名、未经公证，首次打开可能提示「无法验证开发者」或「已损坏」。确认来源后，
 在终端执行一次解除隔离：
@@ -28,20 +30,20 @@ xattr -dr com.apple.quarantine /Applications/SparrowPDF.app
 
 ## 能做什么
 
-| 分组 | 工具 | 说明 |
-| --- | --- | --- |
-| 创建 | 图片合并 PDF | 选择多张 JPG / PNG 按顺序合成单个 PDF；竖拍照片自动校正方向 |
-| 创建 | 批量转换 | 指定多个文件夹，各生成一个 PDF；按材料选模板（标准、身份证、入团志愿书、A5 小册子），文件名按数值排序 |
-| 合并 | PDF 合并 | 拖拽调整顺序后合成单个 PDF |
-| 拆分 | PDF 拆分 | 按页码范围、每 N 页、或一页一个文件 |
-| 页面 | 页面旋转 | 每次旋转 90°，可连续操作，按累计角度生效 |
-| 页面 | 删除页面 | 指定页码删除 |
-| 页面 | 页面重排 | 拖拽排序，实时预览输出页序 |
-| 页面 | 提取页面 | 选中的页单独存为新文件 |
-| 水印 | 文本水印 | 平铺或居中，可调字号、透明度、角度，使用系统中文字体 |
-| 水印 | 图片水印 | 支持缩放、透明度与叠加位置 |
-| 安全 | 加密 / 解密 | AES-256，可分别限制打印 / 复制 / 修改；亦可移除密码 |
-| 导出 | PDF 转图片 | 一次可转多个 PDF，每页导出 PNG / JPEG，36–600 DPI（默认 300） |
+| 分组 | 工具         | 说明                                                                                                  |
+| ---- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| 创建 | 图片合并 PDF | 选择多张 JPG / PNG 按顺序合成单个 PDF；竖拍照片自动校正方向                                           |
+| 创建 | 批量转换     | 指定多个文件夹，各生成一个 PDF；按材料选模板（标准、身份证、入团志愿书、A5 小册子），文件名按数值排序 |
+| 合并 | PDF 合并     | 拖拽调整顺序后合成单个 PDF                                                                            |
+| 拆分 | PDF 拆分     | 按页码范围、每 N 页、或一页一个文件                                                                   |
+| 页面 | 页面旋转     | 每次旋转 90°，可连续操作，按累计角度生效                                                              |
+| 页面 | 删除页面     | 指定页码删除                                                                                          |
+| 页面 | 页面重排     | 拖拽排序，实时预览输出页序                                                                            |
+| 页面 | 提取页面     | 选中的页单独存为新文件                                                                                |
+| 水印 | 文本水印     | 平铺或居中，可调字号、透明度、角度，使用系统中文字体                                                  |
+| 水印 | 图片水印     | 支持缩放、透明度与叠加位置                                                                            |
+| 安全 | 加密 / 解密  | AES-256，可分别限制打印 / 复制 / 修改；亦可移除密码                                                   |
+| 导出 | PDF 转图片   | 一次可转多个 PDF，每页导出 PNG / JPEG，36–600 DPI（默认 300）                                         |
 
 ## 使用要点
 
@@ -50,8 +52,6 @@ xattr -dr com.apple.quarantine /Applications/SparrowPDF.app
 此操作」。
 
 **外观跟随系统。** 侧边栏底部可切换浅色 / 深色，选择会持久化，下次启动沿用。
-
-**版本号见「关于」。** 从侧边栏底部进入，显示完整五位版本（如 `V0.6.0.20261114`）。
 
 **输出位置优先采用用户指定路径。** 未指定时写入源文件同目录；目录不可写（如 `Program Files`）
 时自动改存至 `文档\SparrowPDF`，并在结果卡片中标注实际路径。
@@ -69,13 +69,50 @@ SPARROW_AS_INVOKER=1 cargo build --release
 
 macOS 无此机制：权限由 POSIX/ACL 与 TCC 决定，`.app` 以当前用户身份运行。
 
-## 从源码构建
+## 从源码开发
+
+最低 Rust 1.95（edition 2021）。Windows 另需 MSVC 与 Windows SDK，若 `cl.exe` 报
+`C1083 无法打开 stddef.h`，说明当前终端缺 `INCLUDE` / `LIB`，改用 VS 开发者命令提示符。
 
 ```bash
-cargo build --release
+cargo run                              # 开发期运行，改完即可看效果
+cargo build --release --locked         # 本地发布构建（与 CI 一致）
+cargo check --release --all-targets    # 类型检查，含测试
+cargo test --release --lib --test integration
 ```
 
-最低 Rust 1.95（edition 2021），产物为单个可执行文件。
+`check` 与 `test` 一律带 `--release`：debug 构建会触发 `libz-sys` 的 `D8050`，渲染路径也慢到
+无法判断性能。需要 Windows 免提权变体时用 `SPARROW_AS_INVOKER=1 cargo build --release`，
+写受保护目录会失败并回退到「文档\SparrowPDF」，换取可拖放文件（见上文「Windows 的提权」）。
+
+工程约束、分层、测试策略与提交规范以 [AGENTS.md](./AGENTS.md) 为准；实现细节按主题在
+[docs/](./docs/) 里查。代码改动请先读该主题文档再动手。
+
+### 贡献流程
+
+只有两条分支：`dev` 开发，`main` 发布。改动直接提交到 `dev`，`main` 上的每个提交都对应一次发版。
+
+```bash
+git switch dev                          # 首次：git switch -c dev origin/dev
+
+# 改代码 → cargo check --release --all-targets → cargo test --release --lib --test integration
+
+git commit -m "fix(merge): 合并时按用户拖拽结果写入页序"
+git push origin dev
+```
+
+- 提交信息遵循 Conventional Commits，标题与正文用中文、type 与 scope 用英文：
+  `feat` / `fix` / `perf` / `refactor` / `docs` / `test` / `build` / `ci` / `chore` / `style`。
+  一次提交只做一件事，便于单条回滚。
+- 提交前质量门必须全绿：`cargo check --release --all-targets` 无警告，
+  `cargo test --release --lib --test integration` 全通过；涉及界面的改动附一次实际启动确认。
+  同一组检查会在 PR 上自动跑（状态检查「质量门（Windows）」），红了不能合并。
+- 用户可见的行为变化，同步在 `CHANGELOG.md` 的 `[Unreleased]` 下加一条；测试与文档改动不必。
+- 没有写权限时先 fork，从 `dev` 切出改动，向本仓库的 `dev` 提 PR；有写权限就直接提交 `dev`。
+- 不直接提交 `main`：发版由维护者在 GitHub 开 `dev` → `main` 的 PR，评审通过后用
+  merge commit 合并（不用 squash），再在 `main` 上打 `V主.副.修订.YYYYMMDD` tag；
+  贡献者不要改 `Cargo.toml` 里的版本号。
+- 不提交 `target/`、`.probe/` 与调试素材；不引入网络请求、遥测与自动更新。
 
 ## 已知限制
 
@@ -90,3 +127,8 @@ cargo build --release
 ## License
 
 本项目使用 [MIT](./LICENSE) 许可证授权。
+
+第三方组件：JPEG 编码使用 [`jpeg-encoder`](https://github.com/vstroebel/jpeg-encoder)
+（MIT / Apache-2.0），其熵编码实现部分源自 Independent JPEG Group 的工作
+（IJG 许可证）；图像缩放使用 [`fast_image_resize`](https://github.com/cykooz/fast_image_resize)
+（MIT / Apache-2.0）。

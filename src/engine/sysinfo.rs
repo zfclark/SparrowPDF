@@ -20,6 +20,17 @@ pub fn os_version() -> Option<&'static str> {
     CACHE.get_or_init(probe_os_version).as_deref()
 }
 
+/// Total physical memory in bytes.
+///
+/// Used to size the image-preparation pool: decoding a 600 DPI page peaks
+/// around 200 MB, so the number of workers has to follow the machine rather
+/// than the core count alone. Cached like the other probes; `None` means "not
+/// detectable on this platform", and callers fall back to a conservative cap.
+pub fn total_memory_bytes() -> Option<u64> {
+    static CACHE: OnceLock<Option<u64>> = OnceLock::new();
+    *CACHE.get_or_init(probe_total_memory)
+}
+
 /// Plain OS family, used when [`os_version`] cannot be read.
 pub fn os_family() -> &'static str {
     match std::env::consts::OS {
@@ -132,6 +143,27 @@ fn reg_string(subkey: &str, value: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn probe_total_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `MEMORYSTATUSEX` is a plain C struct whose only prerequisite is
+    // `dwLength`; the call writes into it and touches nothing else.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut status) == 0 {
+            return None;
+        }
+        Some(status.ullTotalPhys)
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn probe_total_memory() -> Option<u64> {
+    None
+}
+
 // -------------------------------------------------------------------- macOS
 
 #[cfg(target_os = "macos")]
@@ -153,6 +185,26 @@ fn probe_os_version() -> Option<String> {
         (false, true) => format!("{product} {version}"),
         _ => product,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn probe_total_memory() -> Option<u64> {
+    command_line("/usr/sbin/sysctl", &["-n", "hw.memsize"])?
+        .parse()
+        .ok()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn probe_total_memory() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kilobytes: u64 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kilobytes * 1024)
 }
 
 #[cfg(target_os = "macos")]

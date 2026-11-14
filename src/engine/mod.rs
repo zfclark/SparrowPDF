@@ -5,6 +5,7 @@
 
 pub mod logging;
 pub mod pdf_io;
+pub mod pool;
 pub mod raster;
 pub mod render;
 pub mod sysinfo;

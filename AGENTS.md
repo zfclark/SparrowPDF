@@ -22,6 +22,7 @@
 执行原则：
 
 - **先读后写**：不得在未读源码的情况下凭猜测改接口。
+- **分支默认 `dev`**：所有改动提交到 `dev`；`main` 只由发版合并推进（见 6.6），未经用户明确要求不得改动 `main`。
 - **最小改动**：一次任务只解决一个议题，不夹带格式重排、无关重命名。
 - **验证前置**：改完必须跑第 4.4 节的质量门，输出真实结果，不臆测「应该能过」。
 - **不做外部动作**：`git push`、`git tag` 推送、创建 Release、修改仓库设置等一律需人工明确授权。
@@ -61,12 +62,14 @@
 | `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入 |
 | `kamadak-exif` 0.6 | JPEG 的 EXIF 方向读取 |
 | `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
+| `fast_image_resize` 6.1（std） | 图片重采样（AVX2 / NEON 运行时派发，Lanczos-3） |
+| `jpeg-encoder` 0.7（simd） | JPEG 编码（4:4:4、优化霍夫曼表；熵编码源自 IJG） |
 | `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
 | `weezl` 0.2 | LZW 解码（图像 `/LZWDecode`） |
 | `hayro-ccitt` 0.4 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`） |
 | `hayro-jbig2` 0.3（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段 |
 | `flate2` 1（rust_backend） | zlib 解压（图像 `/FlateDecode` 与预测器流水线） |
-| `windows-sys` 0.61（registry 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号；同版本已在依赖树中（`winresource` 带入），只开注册表 API |
+| `windows-sys` 0.61（registry / system-information 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号，线程池读取物理内存；同版本已在依赖树中（`winresource` 带入），只开这两组 API |
 | `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |
 
 ---
@@ -83,10 +86,12 @@ SparrowPDF/
 ├── assets/               # 图标素材（icns / ico / png），不参与运行时解码逻辑
 ├── src/                  # 全部 Rust 源码（见 2.2）
 ├── tests/integration.rs  # 端到端集成测试（不启动 GUI，直接调 Tool）
-├── README.md             # 面向用户的功能与安装说明
+├── README.md             # 面向用户的功能、下载与开发/贡献说明
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
 ├── docs/                 # 技术实现文档（分层、工具、渲染、界面），改代码前读对应主题
-└── .github/workflows/    # 发布流水线（tag 触发，产出 Windows x64 / arm64 与 macOS 通用版）
+└── .github/
+     ├── workflows/         # release.yml：tag 触发，产出双平台产物；ci.yml：PR 检查（4.6）
+     └── pull_request_template.md  # PR 模板，开 PR 时自动填充
 ```
 
 本地开发期目录（**不入库**，已在 `.gitignore` 中）：`target/`、`.probe/`（截图与调试素材）、`.workbuddy/`（本机代理工作数据）。
@@ -114,6 +119,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    │
    ├── engine/    基础设施层：不含业务语义
    │    ├── pdf_io.rs   打开/保存/原子写/可写性探测/错误文案
+   │    ├── pool.rs     有界线程池：任务队列、取消传播、panic 隔离
    │    ├── worker.rs   后台线程 + catch_unwind + 取消
    │    ├── validate.rs 产物断言（页数、非空文本等）
    │    ├── render.rs   PDF 页面软件光栅化（缩略图与 PDF 转图片）
@@ -140,8 +146,9 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 | --- | --- | --- |
 | `src/model.rs` | 工具注册表与错误模型；新增工具必须在此登记 | 高：影响全部面板与测试 |
 | `src/tools/mod.rs` | `Tool` 契约、选项枚举、进度/取消通道、工厂函数 | 高 |
-| `src/engine/pdf_io.rs` | 唯一的落盘入口（原子写）、密码打开、可写性探测 | 高：写坏即数据丢失 |
+| `src/engine/pdf_io.rs` | 唯一的落盘入口（`save_document` / `write_file_atomic` 原子写，`write_file` 直写）、密码打开、可写性探测 | 高：写坏即数据丢失 |
 | `src/engine/worker.rs` | 线程生命周期、panic 捕获、取消传播 | 中 |
+| `src/engine/pool.rs` | 逐项并发调度（任务队列、失败策略、panic 隔离、结果回传） | 中高：并发缺陷难复现 |
 | `src/app.rs` | 输出路径解析与回退、任务编排、结果状态机 | 中高 |
 | `src/ui/theme.rs` | 全部视觉令牌与通用控件 | 中：改动影响所有面板 |
 | `build.rs` | Windows 清单与图标；提权策略 | 中：可令程序无法启动 |
@@ -192,7 +199,7 @@ pub trait Tool: Send + Sync {
 
 1. 解析参数 → 尽早失败（`validate`）。
 2. 逐项处理，每步 `check_cancel` + `progress.report`。
-3. **统一经 `pdf_io::save_document`（或 `write_file`）落盘，并把 `req.conflict` 一并传入**：两者在写之前会再复核一次目标是否存在（`ConflictPolicy::Report` 时直接返回 `OutputExists`），先写同目录临时文件再 `rename`，避免半成品；权限错误由 `write_error_detail` 映射为中文提示。规划与落盘之间可能隔几分钟的渲染，这次复核是防静默覆盖的第二道闸。
+3. **统一经 `pdf_io` 的落盘入口写入，并把 `req.conflict` 一并传入**：`save_document`（文档）与 `write_file_atomic`（已序列化字节）先写同目录临时文件再 `rename`，`write_file` 直接写——常规产出优先用前两个，只有调用方明确接受非原子写时才用 `write_file`（如逐页导出的小文件）。三者都会在写之前再复核一次目标是否存在（`ConflictPolicy::Report` 时直接返回 `OutputExists`）；权限错误由 `write_error_detail` 映射为中文提示。规划与落盘之间可能隔几分钟的渲染，这次复核是防静默覆盖的第二道闸。
 4. 落盘后**重新打开产物断言**（`validate::assert_page_count` 等）；断言失败要删除产物并返回 `ValidationFailed`。
 5. 不得在工具内部直接 `fs::write` 或 `File::create` 绕过第 3 步。
 
@@ -209,6 +216,60 @@ pub trait Tool: Send + Sync {
 
 读法：先读本节 3.2 / 3.3 的契约，再读对应文档；各篇末尾的「已知缺口」为既有边界，
 不应作为回归缺陷处理。
+
+### 3.5 图片与扫描件的分辨率与体积契约
+
+图片类工具（图片合并为 PDF、批量转换）共用 `tools/image_embed.rs` 的一条流水线。
+以下六条是改这条流水线时必须保持的行为：
+
+1. **按绘制尺寸算分辨率**：有效 DPI = 源像素 ÷ **绘制后**的页面尺寸，不是纸张尺寸
+   （等比缩放留白时用纸张会高估所需像素）。超出预算才重采样（`fast_image_resize` 的
+   Lanczos-3）并重编码；不超预算的 JPEG 保持原字节直通，不做二次编码。
+2. **档位与默认值**：批量转换的「体积优化」为 `ScanQuality`——`标准 = 300 DPI / 质量 85`
+   （默认）、`更小体积 = 150 DPI / 质量 78`、`不压缩 = 保留源像素`。该选项是用户偏好，
+   不随模板切换重置（`apply_batch_template` 不得改动它）。
+3. **不透明 PNG 存 JPEG**：alpha 全 ≥ 250 视为不透明并丢弃 `/SMask`；有真实透明时仍走
+   `/FlateDecode` + `/SMask`。任何位图流都必须显式 `Stream::compress()` 后再落盘——
+   lopdf 的保存路径不会自动压缩，漏掉这一步一页 600 DPI 扫描就是约 100 MB 裸像素。
+   JPEG 一律 4:4:4 + 优化霍夫曼表（`jpeg-encoder`）：在扫描件上比 4:2:0 默认档更小也更
+   保真。**不要**把 `set_optimized_huffman_tables` 与 4:2:0 组合——该 crate 的非交织
+   路径会写出损坏的码流（实测 PSNR 2.4 dB），需要次采样时先确认版本已修复。
+4. **20 MB 上限**：批量转换单份 PDF 超过 `SCAN_SIZE_LIMIT`（20 MiB）时，按
+   `ScanBudget::tightened`（DPI × 0.82、质量 −6，下限 96 DPI / 45）收紧后整份重渲染；
+   文档先在内存里序列化量出精确体积，**只落盘一次**。到下限仍超出必须在结果摘要里
+   如实写明「压缩后仍超过 20 MB」。
+5. **方向只进矩阵**：EXIF 方向与槽位自动旋转都只体现在绘制矩阵上，像素不做物理旋转；
+   目标像素数按显示方向计算，再按「EXIF 与旋转异或」映射回源方向——漏掉映射会把合并页
+   （旋转 90° 进半页槽位）的图片按错误长宽比重采样，出现横向拉变形。
+6. **准备与组装分离**：`prepare_image`（解码 → 重采样 → 编码）不得接触 `Document`，
+   `add_page` 只写 PDF 对象。批量转换据此并行准备图片、串行组装；新增图片处理逻辑必须
+   留在这条边界内，否则并行、进度与失败隔离都会失效（并发规则见 3.6）。
+
+### 3.6 并发执行的任务边界
+
+CPU 密集的逐项工作统一走 `engine::pool`，两个工具共用一套调度与失败规则：
+
+1. **进池子的只有纯计算**：批量转换的图片准备（`prepare_image`）、PDF 转图片的页面
+   栅格化。二者都不修改 `Document`、不写盘，因此可以乱序完成。
+2. **留在调用线程的一律串行**：文档对象增删、`resolve_outputs` 冲突解析、体积守卫的
+   序列化与落盘、结果汇总。它们要么依赖页序，要么共享可变状态，并发化只会换来竞态。
+3. **线程数按机器算**（`pool::worker_count`）：取「核数 − 1」「物理内存 / 3 ÷ 单任务
+   峰值」「`MAX_WORKERS` = 8」三者的最小值；内存读不到时取上限而不是猜低值。单任务峰值
+   由调用方声明（图片准备 400 MB，页面栅格化 192 MB），不要凭感觉改。
+4. **失败策略显式声明**：`OnError::Stop`（一张扫描件坏了，整份 PDF 没有意义，整夹跳过）
+   与 `OnError::Continue`（某一页渲染失败，其余照常导出）。默认应选 `Stop`。
+5. **异常兜底在池内**：每个任务包在 `catch_unwind` 里，panic 变成该任务的
+   `ToolError::Internal` 并带上是第几项；线程 `join` 的失败也要转成错误，不允许静默少项。
+6. **资源上限固定**：结果通过容量为 `workers` 的 `sync_channel` 交回，完成项不会随页数
+   堆积；每个任务的结果被消费后立即释放（解码缓冲随作用域结束回收）。
+7. **共享只读数据必须 `Sync`**：页面栅格化把 `&Document` 与 `&FontSet` 直接分给线程，
+   字体字形缓存因此是 `Mutex` 而不是 `RefCell`——不要为了省锁把它改回去，那会让
+   整个 `FontSet` 无法跨线程共享，退化成每线程解析一套字体。
+
+体积与时序基线（16 核 / 16 GB，13 页 600 DPI 扫描件）：批量转换 300 DPI 约 6 MB / 2 秒，
+对照的第三方排版产物为 5.2 MB（其分辨率 1876–3296 px/页，本工具统一 2479 px/页，每像素
+字节数持平）；PDF 转图片 300 DPI 12 页约 2.5 秒；同一批在不压缩档约 16 MB。出现数量级
+偏离时先查 3.5 的第 3 条与第 5 条。
 
 ---
 
@@ -234,7 +295,7 @@ cargo test --release --lib --test integration
 
 | 层级 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 集成测试 | `tests/integration.rs`（44 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字 |
+| 集成测试 | `tests/integration.rs`（54 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹 |
 | 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
 
 规则：
@@ -250,6 +311,7 @@ cargo test --release --lib --test integration
 3. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
 4. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
 5. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
+6. PR 上「质量门（Windows）」状态检查必须通过才可合并（4.6）；本地绿而 CI 红时按 CI 日志修，不得绕过检查合并。
 
 ### 4.5 发布流水线（`.github/workflows/release.yml`）
 
@@ -294,6 +356,39 @@ cargo test --release --lib --test integration
 
 - 并发 20 作业、单作业 6 小时、矩阵 256 作业、缓存 10 GB；本流水线最多 5 个作业、每个 ≤60 分钟。
 - 公开仓库的标准 runner 不计费；macOS runner 排队无优先级，排队超时被取消时用 Re-run failed jobs。
+
+### 4.6 PR 检查与合并前置（`.github/workflows/ci.yml`）
+
+**触发与范围**
+
+- `pull_request` 指向 `main` 或 `dev` 时运行；同一 PR 的新提交会取消上一次运行（`concurrency`
+  按 PR 号分组），不排队等过期结果。另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+- 只做检查，不构建产物、不发 Release；产物由 `release.yml` 在 tag 上构建。
+
+**作业与步骤**
+
+- 单作业「质量门（Windows）」，内容即 4.4 的第 1、2 条：`cargo check --release --all-targets --locked`
+  与 `cargo test --release --lib --test integration --locked -- --test-threads=1`。
+- 测试串行的原因：多数用例共用目标临时目录与同一个日志文件，并发跑会偶发抢写（见 4.3），
+  串行只多花几秒。
+- 缓存键 `runner.os + pr-cargo-release + hash(Cargo.lock)`，与发布流水线的键分开，互不覆盖。
+
+**合并前置（状态审核，仓库设置里一次性开启）**
+
+- `Settings → Rules`（经典界面为 `Branches`）为 `main` 开启 **Require status checks to pass
+  before merging**，勾选「质量门（Windows）」；同时开启 **Require a pull request before merging**
+  与 **Block force pushes**，防止绕过。
+- **作业名就是检查名**：`ci.yml` 里 `name: 质量门（Windows）` 一改，分支保护中的旧检查名不再匹配，
+  PR 会一直等一个不会再出现的检查、永远无法合并——改名必须同步改设置。
+- 检查未通过时不得用管理员权限强行合并；确因基础设施故障（runner 宕机、配额）时，用 Re-run
+  failed jobs 重跑，仍失败则先修问题。
+
+**已知边界**
+
+- 不设 `cargo fmt --check` 门禁：仓库尚未全量 rustfmt 干净（当前 12 个文件、46 处），开启会立刻
+  全红；等一次性 `style` 提交整理干净后再作为独立检查加入，先加先红没有意义。
+- 只跑 Windows：产品主战场是 Windows，macOS 由发布流水线在真实产物上验证。若要覆盖 macOS，新增
+  `os` 矩阵后检查名会变成两个，分支保护需一并勾选。
 
 ---
 
@@ -391,24 +486,49 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 
 ### 6.6 分支管理策略
 
-采用 **主干开发 + 短生命周期分支**：
+**只有两条长期分支**：`dev` 开发、`main` 发布。不设 `feat/*`、`fix/*`、`release/*` 等临
+时分支——功能、缺陷、文档、构建改动一律直接提交到 `dev`。
 
-| 分支 | 命名 | 来源 | 合并去向 | 存活期 |
-| --- | --- | --- | --- | --- |
-| 主干 | `main` | — | — | 常驻，始终可发布 |
-| 功能 | `feat/<scope>-<简述>` | `main` | `main`（squash） | ≤ 3 天 |
-| 缺陷 | `fix/<scope>-<简述>` | `main` | `main`（squash） | ≤ 1 天 |
-| 维护 | `ci/<简述>`、`docs/<简述>`、`build/<简述>` | `main` | `main`（squash） | ≤ 1 天 |
-| 发布 | `release/<主.副.修订>` | `main` | `main` + `V主.副.修订.YYYYMMDD` tag | 发布窗口内 |
-| 紧急修复 | `hotfix/<主.副.修订>` | 线上 tag | `main` + 新 tag | ≤ 1 天 |
+```
+main  ──●────────────────●────────────●──▶  只放已发布版本，每个 ● 带 tag
+         \              /            /
+dev       ●──●──●──●───●──●──●──●───●────▶  日常开发，始终可编译
+```
+
+| 分支 | 角色 | 推进方式 |
+| --- | --- | --- |
+| `main` | 发布线：只保存可发布/已发布状态，承载版本 tag | 仅由 `dev` 发版合并推进 |
+| `dev` | 开发线：日常改动的唯一落点，始终可编译 | 直接提交，随进度推送 |
 
 规则：
 
-1. `main` 受保护：禁止直接推送，必须经评审合并；历史保持线性（squash 或 rebase-and-merge，不产生无意义 merge commit）。
-2. 分支名全小写、用连字符分隔，不含中文与空格。
-3. 发布以 **tag 为准**：`V主.副.修订.YYYYMMDD`（如 `V0.4.2.20261104`）打在 `main` 上，tag 一旦推送不得移动或复用。
-4. 禁止对 `main` 强制推送；`hotfix` 必须同时回合 `main`，避免双线分叉。
-5. 远程同步用 `git pull --rebase`，本地分支可随意整理，已共享的分支不改写。
+1. **日常开发只提交 `dev`**：禁止直接提交或推送到 `main`。`main` 开启分支保护（禁止直接 push、必须经 PR、状态检查「质量门（Windows）」通过才可合并，见 4.6），任何时刻 `main` 上的状态都能发布。
+2. **`dev` 始终可编译**：每次提交前跑完 4.4 的质量门，`dev` 上任何一条提交都应能 `cargo build --release`，否则发版前无法用二分定位回归。
+3. **一次提交一个议题**：分支只有两条，原子性靠提交而不是分支保证，功能与格式重排不混在同一条提交里。
+4. **发版走 PR**：`dev` → `main` 通过 GitHub PR 合入，评审意见与合并记录留在 PR 上；检查未绿时合并按钮不可用，评审结论与检查结果共同构成准入。合并方式在 PR 上选 **Create a merge commit**（等价 `--no-ff`），在 `main` 上留下一次发布边界。**不要**用 Squash（`dev` 与 `main` 会分叉）或 Rebase（改写已共享历史）。
+5. **发布以 tag 为准**：PR 合入后，在**合并后的 `main` 提交**上打 `V主.副.修订.YYYYMMDD`，推送后不得移动或复用；随后把 `main` 回合 `dev`（`git switch dev && git merge --ff-only main`），避免两条线分叉。
+6. **不改写共享历史**：`main`、`dev` 均由多人共享，不 `--amend`、不 `rebase`、不 `push --force`；远程同步用 `git pull --rebase`。需要试验性改动时用本地临时分支或 `git worktree`，验证后 squash 回 `dev` 并删除。
+7. **本地先对齐再开工**：`git fetch origin` 后确认 `dev` 与 `origin/dev` 无分叉；本地 `main` 不得承载未发布的开发提交。
+
+常用操作：
+
+```bash
+git fetch origin
+git switch dev                        # 首次：git switch -c dev origin/dev
+
+# …实现 + 4.4 质量门… → 按 6.3 提交，然后
+git push origin dev
+
+# 发版（push / 提 PR / 合并 / 打 tag 均需人工授权，见 7.3）
+# ① 网页：Compare & pull request，base = main，head = dev；合并时选 Create a merge commit
+#    千万不要删 head 分支（dev 是常驻分支）
+# ② 合并后本地取回，并在合并提交上打 tag
+git switch main && git pull --ff-only
+git tag -a V0.6.1.20261120 -m "<该版本变更摘要>"
+git push origin main
+git push origin V0.6.1.20261120
+git switch dev && git merge --ff-only main
+```
 
 ---
 
@@ -419,7 +539,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 | 阶段 | 准入条件 | 负责人 | 准出交付物 |
 | --- | --- | --- | --- |
 | 1 需求 | 问题可复现或价值明确 | 需求提出方 | 需求卡（含验收标准） |
-| 2 开发 | 需求卡已确认 | 开发者 / AI 代理 | 分支上的实现与规范提交 |
+| 2 开发 | 需求卡已确认 | 开发者 / AI 代理 | `dev` 上的实现与规范提交 |
 | 3 测试 | 代码可编译 | 开发者自测 + 评审人复测 | 测试结果与已知限制说明 |
 | 4 评审 | 质量门全绿 | 评审人（非作者） | 评审结论与批准记录 |
 | 5 发布 | 评审通过 | 发布负责人 | tag + Release + CHANGELOG |
@@ -436,28 +556,29 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 **2) 开发**
 
 - 输入：需求卡。
-- 动作：建分支 → 读上下文（第 0 节）→ 实现 → 自测 → 按第 6 节提交。
-- 交付物：可编译分支、原子提交序列、变更说明（改了什么、为什么、影响哪些模块）。
+- 动作：切到 `dev` → 读上下文（第 0 节）→ 实现 → 自测 → 按第 6 节提交。
+- 约束：不得改 `Cargo.toml` / `src/version.rs` 的版本号，也不得改 `CHANGELOG.md` 的版本标题——版本号只在发版提交里动（8.3）。日常提交只往 `[Unreleased]` 追加条目。
+- 交付物：可编译的 `dev` 状态、原子提交序列、变更说明（改了什么、为什么、影响哪些模块）。
 - 准出：`cargo check --release --all-targets` 无警告；本地可运行。
 
 **3）测试**
 
-- 输入：开发分支。
+- 输入：`dev` 上待测的提交。
 - 动作：补/改集成测试；覆盖边界（空输入、越界页码、损坏文件、加密文件、权限受限目录、超长路径）；手工冒烟关键路径。
 - 交付物：测试结论（通过/失败项）、已知限制、复现步骤（失败时）。
 - 准出：`cargo test --release --lib --test integration` 全绿；新增行为有对应断言。
 
 **4）评审**
 
-- 输入：待合并分支 + 测试结论。
-- 动作：检查分层约束、错误处理、落盘路径、取消与进度、UI 一致性与明暗适配、测试有效性、提交信息规范。
-- 交付物：评审意见（阻塞项 / 建议项分类）与最终结论。
-- 准出：阻塞项清零；作者非评审人；合并方式符合 6.6。
+- 输入：`dev` 上待发版的提交 + 测试结论 + GitHub PR（base `main`，head `dev`）。
+- 动作：在 PR 上检查分层约束、错误处理、落盘路径、取消与进度、UI 一致性与明暗适配、测试有效性、提交信息规范；意见以 review comment 留痕。
+- 交付物：PR review 记录（阻塞项 / 建议项分类）与批准结论。
+- 准出：阻塞项清零；作者非评审人（无第二人时由作者自审并显式记录「自审」）；合并方式为 merge commit，符合 6.6。
 
 **5）发布**
 
-- 输入：`main` 上通过评审的提交。
-- 动作：确认版本号（`Cargo.toml` + `Cargo.lock` 的前三段、`src/version.rs` 的日期位，三处与 tag 对齐）→ 更新 `CHANGELOG.md` → 打 annotated tag `V主.副.修订.YYYYMMDD` → 推送分支与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）。
+- 输入：`dev` 上通过评审、准备发版的提交。
+- 动作：确认 `dev` 质量门全绿 → 在 `dev` 上改版本号与 `CHANGELOG.md` 并提交（`chore(release): 版本号 A -> B`）→ 推 `dev` → 在 GitHub 开 PR（base `main`，head `dev`）→ 评审通过后以 **Create a merge commit** 合并（不删 head 分支）→ 本地 `git switch main && git pull --ff-only`，确认版本号三处对齐（`Cargo.toml` + `Cargo.lock` 前三段、`src/version.rs` 日期位）→ 在合并后的 `main` 提交上打 annotated tag `V主.副.修订.YYYYMMDD` → 推送 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）→ 把 `main` 回合 `dev`。
 - 交付物：tag、Release 页面（含变更摘要与产物校验信息）、更新后的 CHANGELOG。
 - 准出：双平台产物可下载且可运行；`guard` 校验（tag 格式、版本一致、打包资源齐全）通过。
 - 回滚预案：产物异常时删除 Release 并标记 tag 作废，修复后升 patch 版本重新发布；不得移动既有 tag。
@@ -467,10 +588,10 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 | 阶段 | 代理必须做 | 代理不得做 |
 | --- | --- | --- |
 | 需求 | 复述验收标准，列出不确定点 | 自行扩大范围、臆造验收条件 |
-| 开发 | 读上下文、最小改动、分类型提交 | 顺手重构无关模块、改依赖、改 License |
+| 开发 | 读上下文、在 `dev` 上提交、最小改动、分类型提交 | 直接提交或推送到 `main`、顺手重构无关模块、改依赖、改 License |
 | 测试 | 运行质量门并粘贴真实输出 | 声称「应该通过」而无执行记录 |
 | 评审 | 逐项对照 5 节与 4.4 节自检 | 自行批准自己的改动 |
-| 发布 | 校验版本号一致性、给出推送命令 | 执行 `git push` / 创建 Release / 移动 tag |
+| 发布 | 校验版本号一致性、给出推送与打 tag 命令 | 执行 `git push` / 创建 Release / 移动 tag |
 
 ---
 
@@ -480,7 +601,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 
 - 位置：仓库根目录 `CHANGELOG.md`，格式遵循 **Keep a Changelog 1.1.0**。
 - 版本号遵循本文件 8.3 节的五位规则（`V主.副.修订.YYYYMMDD`），不采用 SemVer 作为对外版本号。
-- 唯一事实来源是**已合并到 `main` 的提交与 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
+- 唯一事实来源是**已合并到 `dev`（未发布）与 `main`（已发布）的提交及 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
 - 发布流水线按 tag 原样截取对应版本条目（`## [V主.副.修订.YYYYMMDD]` 到下一个二级标题为止），作为 GitHub Release 的更新说明；条目缺了 guard 直接失败，所以每条必须独立可读、不依赖上下文。
 - 顺序：新版本在上；未发布内容置于 `[Unreleased]`。
 
@@ -507,7 +628,11 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 | 2 | 主版本号 | 功能模块有较大变动（新增模块、整体架构变化） | 项目经理 |
 | 3 | 副版本号 | 功能有一定增加或变化（如权限控制、自定义视图） | 项目经理 |
 | 4 | 修订版本号 | Bug 修复与小改动；可高频发布，修掉一个严重 bug 即可发 | 项目经理 |
-| 5 | 日期版本号 | 改动当天的日期 `YYYYMMDD`，每天改动都要更新 | 开发人员 |
+| 5 | 日期版本号 | **发版当天**的日期 `YYYYMMDD`；日常提交不改它 | 发版人 |
+
+日期位只认「发版当天」：`release.yml` 的 guard 校验 `src/version.rs` 的 `DATE` 与 tag 第四段**完全相等**，
+日常改动顺手改成当天日期反而会在发版时对不上。它同时决定「关于」页展示的版本号，提前改会让
+开发中的构建显示一个并不存在的版本，所以只在发版那一次提交里动。
 
 落地方式（三处必须与 tag 对齐，缺一即视为版本漂移）：
 
@@ -607,6 +732,12 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 cargo check --release --all-targets
 cargo test --release --lib --test integration
 
+# 分支（只有 main / dev 两条，日常在 dev，main 只经 PR 合并）
+git fetch origin
+git switch dev                                  # 首次：git switch -c dev origin/dev
+git push origin dev
+# 发版 PR：网页 Compare & pull request（base main / head dev），合并选 Create a merge commit
+
 # 发布构建（CI 同款）
 cargo build --release --locked
 SPARROW_AS_INVOKER=1 cargo build --release      # Windows 免提权变体
@@ -615,9 +746,10 @@ SPARROW_AS_INVOKER=1 cargo build --release      # Windows 免提权变体
 # 改版本前三段：Cargo.toml 的 version 与 Cargo.lock 同步（cargo check 自动写锁文件）
 # 改日期位：src/version.rs 的 DATE，改成发布当天
 cargo check --release                            # 同步 Cargo.lock 中的版本号
+git switch main && git pull --ff-only             # PR 合并完成后取回 main
 git tag -a V0.4.2.20261104 -m "<该版本变更摘要>"
-git push origin main
-git push origin V0.4.2.20261104
+git push origin V0.4.2.20261104                  # tag 必须在 main 的合并提交上
+git switch dev && git merge --ff-only main       # 回合，避免两条线分叉
 
 # 日志与偏好定位（排查用）
 %LOCALAPPDATA%\sparrowpdf\sparrowpdf.log
@@ -640,30 +772,14 @@ git push origin V0.4.2.20261104
 2. 绕过 `pdf_io` 直接落盘，或吞掉写入错误。
 3. 在 `ui/` 层引用 PDF/图片库类型。
 4. 提交 `target/`、`.probe/`、`.workbuddy/`、密钥与个人绝对路径。
-5. 对 `main` 强制推送、移动已发布 tag、改写已共享历史。
+5. 直接向 `main` 提交或推送（发版合并除外）、对 `main` / `dev` 强制推送、移动已发布 tag、改写已共享历史。
 6. 未经授权执行 `git push`、创建 Release、修改仓库设置。
 7. 用 emoji 充当状态图标（字体缺字形会显示为方框）。
 
-### D. 合并请求（PR）模板
+### D. 合并请求（PR）
 
-```markdown
-## 变更内容
-<!-- 一句话说明这个 PR 解决什么问题 -->
+模板在 `.github/pull_request_template.md`，开 PR 时自动带出，含变更内容 / 关联需求 / 影响面 /
+验证方式 / 回滚方案五段与质量门勾选项；模板改动直接改该文件，本节不再复制一份。
 
-## 关联需求
-Closes #<编号>
-
-## 影响面
-- 涉及模块：
-- 用户可见变化：
-- 兼容性：无 / 有（说明）
-
-## 验证方式
-- [ ] `cargo check --release --all-targets` 无警告
-- [ ] `cargo test --release --lib --test integration` 全通过
-- [ ] 手动冒烟：（步骤）
-- [ ] 涉及 UI 时附截图
-
-## 回滚方案
-<!-- 撤销方式：回滚提交 / 关闭开关 / 恢复默认值 -->
-```
+合入条件（缺一不可）：状态检查「质量门（Windows）」通过（4.6）+ 评审意见已处理 + 合并方式为
+merge commit。发版 PR 的 base 是 `main`、head 是 `dev`，且不删 head 分支。

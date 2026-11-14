@@ -160,6 +160,64 @@ pub fn save_document(
     Ok(())
 }
 
+/// Serialise `doc` to memory.
+///
+/// The batch tool needs the exact artifact size *before* committing to disk
+/// (the 20 MB scan guard re-renders instead of patching a written file), so it
+/// serialises once, checks, and then writes the bytes.
+pub fn document_bytes(doc: &mut Document) -> Result<Vec<u8>, ToolError> {
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).map_err(|e| ToolError::Internal {
+        detail: format!("生成 PDF 失败：{e}"),
+    })?;
+    Ok(bytes)
+}
+
+/// Write already-serialised bytes through a sibling temp file.
+///
+/// Same contract as [`save_document`] — conflict re-check, temp file, rename —
+/// for callers that produced the bytes themselves.
+pub fn write_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    policy: ConflictPolicy,
+) -> Result<(), ToolError> {
+    ensure_still_free(path, policy)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
+                path: parent.to_path_buf(),
+                detail: write_error_detail(&e),
+            })?;
+        }
+    }
+
+    let tmp = temp_sibling(path);
+    fs::write(&tmp, bytes).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        ToolError::WriteFailed {
+            path: path.to_path_buf(),
+            detail: write_error_detail(&e),
+        }
+    })?;
+
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            // Windows can refuse a cross-device rename or an existing target.
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            ToolError::WriteFailed {
+                path: path.to_path_buf(),
+                detail: write_error_detail(&e),
+            }
+        })?;
+
+    Ok(())
+}
+
 /// A temp path next to `path`, so the final rename stays on the same volume.
 fn temp_sibling(path: &Path) -> PathBuf {
     let name = path

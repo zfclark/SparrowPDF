@@ -7,7 +7,9 @@
 use egui::{RichText, Ui};
 
 use crate::model::ToolId;
-use crate::tools::{BatchPageMode, Orientation, PageSize, ToolOptions, BATCH_TEMPLATES};
+use crate::tools::{
+    BatchPageMode, Orientation, PageSize, ScanQuality, ToolOptions, BATCH_TEMPLATES,
+};
 use crate::ui::panels::{
     FormState, add_folders_button, input_list_hinted, output_selector_hinted,
 };
@@ -112,6 +114,7 @@ fn params_card(ui: &mut Ui, form: &mut FormState, tool: ToolId) {
             use_merge_spec,
             merge_spec,
             auto_rotate,
+            scan_quality,
             ..
         } = form.options_mut(tool)
         else {
@@ -240,5 +243,24 @@ fn params_card(ui: &mut Ui, form: &mut FormState, tool: ToolId) {
                 },
             );
         }
+
+        // Print quality is not part of a layout, so every template offers it:
+        // a 600 DPI scan of an A4 sheet carries 4× the pixels the page can
+        // show, and that surplus is pure file size.
+        theme::field_row_hover(
+            ui,
+            "体积优化",
+            "扫描件按打印所需分辨率重新压缩；单个 PDF 超过 20 MB 时会自动再压一档",
+            |ui| {
+                egui::ComboBox::from_id_salt(("batch-scan-quality", tool))
+                    .width(230.0)
+                    .selected_text(scan_quality.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in ScanQuality::ALL {
+                            ui.selectable_value(scan_quality, candidate, candidate.label());
+                        }
+                    });
+            },
+        );
     });
 }

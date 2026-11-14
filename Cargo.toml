@@ -2,7 +2,7 @@
 name = "sparrowpdf"
 # Cargo 只接受 SemVer 三段：这里保存五位版本号的前三段（主.副.修订），
 # 不带 V 前缀、不带日期位。日期位在 src/version.rs 维护，展示用完整版本
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
@@ -38,6 +38,8 @@ weezl = "0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hayro-ccitt = "0.4"
 hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"] }
+fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["simd"] }
 
 [build-dependencies]
 # Embeds assets/app.ico into the Windows executable (taskbar / Explorer icon).
@@ -50,6 +52,7 @@ winresource = "0.1"
 windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
 ] }
 
 [profile.release]

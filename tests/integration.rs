@@ -322,11 +322,14 @@ fn log_lines_are_appended_to_the_log_file() {
         "log file must gain a line: {}",
         path.display()
     );
-    assert!(
-        lines.last().unwrap().contains("integration-log-probe"),
-        "last log line must contain the probe message"
-    );
-    assert!(lines.last().unwrap().contains("[TEST]"));
+    // Other tests log concurrently, so the probe is not necessarily the last
+    // line: look for it among the lines this test appended.
+    let probe = lines
+        .iter()
+        .skip(before)
+        .find(|line| line.contains("integration-log-probe"))
+        .unwrap_or_else(|| panic!("no probe line among {} new lines", lines.len() - before));
+    assert!(probe.contains("[TEST]"));
 }
 
 // ---------------------------------------------------------------- model
@@ -549,6 +552,226 @@ fn folder_batch_writes_one_pdf_per_folder_into_itself() {
     assert!(pdf1.is_file() && pdf2.is_file(), "PDFs named after folders");
     assert_eq!(pdf_io::page_count_of(&pdf1, None).unwrap(), 3);
     assert_eq!(pdf_io::page_count_of(&pdf2, None).unwrap(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A greyscale scan must stay greyscale: one component instead of three is a
+/// third of the bytes for the same page, and the JPEG encoder writes it as
+/// `DeviceGray` only when the source really has no colour.
+#[test]
+fn folder_batch_keeps_greyscale_scans_grey() {
+    let dir = scratch("folder-gray");
+    let album = dir.join("scan");
+    std::fs::create_dir_all(&album).unwrap();
+    let path = album.join("1.png");
+    let img = image::GrayImage::from_fn(1200, 1700, |x, y| {
+        image::Luma([((x * 7 + y * 13) % 251) as u8])
+    });
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let req = request(ToolId::FolderToPdf, vec![album.clone()], out_dir);
+    let outcome = run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+
+    let (width, height, filter, has_smask, colorspace) = first_image_xobject(&outcome.outputs[0]);
+    assert_eq!(filter, "DCTDecode");
+    assert_eq!(colorspace, "DeviceGray", "a grey scan must not become RGB");
+    assert!(!has_smask);
+    // 1200 x 1700 is ~145 DPI on A4: below the 300 DPI budget, so it is kept.
+    assert_eq!((width, height), (1200, 1700));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: one unreadable image used to abort the whole batch. The folder
+/// that fails is now reported as skipped while the others still convert.
+#[test]
+fn folder_batch_skips_only_the_broken_folder() {
+    let dir = scratch("folder-broken");
+    let good = dir.join("good");
+    let broken = dir.join("broken");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::create_dir_all(&broken).unwrap();
+    make_image(&good, "1.jpg", 40, 60);
+    make_image(&good, "2.jpg", 40, 60);
+    make_image(&broken, "1.jpg", 40, 60);
+    // A file that claims to be a PNG but holds nothing decodable.
+    std::fs::write(broken.join("2.png"), b"\x89PNG\r\n\x1a\nnot really").unwrap();
+
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let req = request(
+        ToolId::FolderToPdf,
+        vec![good.clone(), broken.clone()],
+        out_dir.clone(),
+    );
+
+    let err = run(ToolId::FolderToPdf, &req).expect_err("one folder failed");
+    match err {
+        ToolError::PartialSuccess {
+            succeeded,
+            failed,
+            detail,
+            outputs,
+        } => {
+            assert_eq!(succeeded, 1);
+            assert_eq!(failed, 1);
+            assert_eq!(outputs.len(), 1, "the healthy folder still produced a PDF");
+            assert!(outputs[0].ends_with("good.pdf"), "{:?}", outputs[0]);
+            assert!(detail.contains("broken"), "{detail}");
+        }
+        other => panic!("expected PartialSuccess, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scan-like fixture: RGBA (how phone scanning apps export a page), noisy
+/// enough that a lossless store cannot compress it.
+fn make_scan_png(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
+    let path = dir.join(name);
+    // Per-pixel hash noise: no repeating pattern for Flate to exploit, which
+    // is what a dithered scan looks like to a lossless codec.
+    fn noise(x: u32, y: u32, salt: u32) -> u8 {
+        let mut h = x
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add(y.wrapping_mul(0x85EB_CA77))
+            .wrapping_add(salt.wrapping_mul(0xC2B2_AE3D));
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2545_F491);
+        h ^= h >> 13;
+        (h & 0xFF) as u8
+    }
+
+    let img = image::RgbaImage::from_fn(w, h, |x, y| {
+        image::Rgba([noise(x, y, 1), noise(x, y, 7), noise(x, y, 19), 255])
+    });
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .expect("write png fixture");
+    path
+}
+
+/// `(width, height, filter, has SMask, colour space)` of the page's image
+/// XObject.
+///
+/// A page can hold an alpha mask next to the image, so a colour image wins over
+/// a grey one, and among greys the largest stream wins (the mask is tiny).
+fn first_image_xobject(path: &Path) -> (i64, i64, String, bool, String) {
+    fn num(o: &lopdf::Object) -> i64 {
+        match o {
+            lopdf::Object::Integer(v) => *v,
+            lopdf::Object::Real(v) => *v as i64,
+            other => panic!("not a number: {other:?}"),
+        }
+    }
+
+    let doc = lopdf::Document::load(path).expect("load output pdf");
+    let mut grey: Option<(usize, i64, i64, String, bool)> = None;
+    for object in doc.objects.values() {
+        let Ok(stream) = object.as_stream() else {
+            continue;
+        };
+        let is_image = matches!(
+            stream.dict.get(b"Subtype"),
+            Ok(lopdf::Object::Name(n)) if n.as_slice() == b"Image"
+        );
+        if !is_image {
+            continue;
+        }
+        let filter = match stream.dict.get(b"Filter") {
+            Ok(lopdf::Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
+            Ok(lopdf::Object::Array(items)) => items
+                .first()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let colorspace = match stream.dict.get(b"ColorSpace") {
+            Ok(lopdf::Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
+            _ => String::new(),
+        };
+        let entry = (
+            stream.content.len(),
+            num(stream.dict.get(b"Width").unwrap()),
+            num(stream.dict.get(b"Height").unwrap()),
+            filter,
+            stream.dict.get(b"SMask").is_ok(),
+        );
+        if colorspace == "DeviceRGB" {
+            return (entry.1, entry.2, entry.3, entry.4, colorspace);
+        }
+        if colorspace == "DeviceGray" && grey.as_ref().is_none_or(|g| entry.0 > g.0) {
+            grey = Some(entry);
+        }
+    }
+    match grey {
+        Some((_, w, h, filter, smask)) => (w, h, filter, smask, "DeviceGray".to_string()),
+        None => panic!("no image XObject in {}", path.display()),
+    }
+}
+
+/// Regression: a folder of high-resolution scans used to produce a PDF far
+/// larger than the scans themselves — every PNG page was stored as raw pixels
+/// plus a full-page alpha mask. The default budget stores the page at 200 DPI
+/// as JPEG instead, and drops an alpha channel that is fully opaque.
+#[test]
+fn folder_batch_stores_oversized_scans_at_print_resolution() {
+    let dir = scratch("scan-size");
+    let album = dir.join("scan");
+    std::fs::create_dir_all(&album).unwrap();
+    // 2500 x 3540 on A4 is ~302 DPI: just above the 300 DPI budget, so the
+    // default run has to downsample while 原图直通 keeps every pixel.
+    make_scan_png(&album, "1.png", 2500, 3540);
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let run_with = |quality: sparrowpdf::tools::ScanQuality, subdir: &str| -> PathBuf {
+        let target = out_dir.join(subdir);
+        std::fs::create_dir_all(&target).unwrap();
+        let mut req = request(ToolId::FolderToPdf, vec![album.clone()], target.clone());
+        if let ToolOptions::FolderToPdf { scan_quality, .. } = &mut req.options {
+            *scan_quality = quality;
+        }
+        let outcome = run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+        outcome.outputs[0].clone()
+    };
+
+    let balanced = run_with(sparrowpdf::tools::ScanQuality::Balanced, "balanced");
+    let original = run_with(sparrowpdf::tools::ScanQuality::Original, "original");
+
+    let (w, h, filter, has_smask, colorspace) = first_image_xobject(&balanced);
+    assert_eq!(colorspace, "DeviceRGB");
+    assert_eq!(filter, "DCTDecode", "a scan must be stored as JPEG");
+    // 300 DPI over the drawn box: a touch under 2480 x 3508 because the fixture
+    // is very slightly wider than A4.
+    assert!(
+        (2450..=2490).contains(&w) && (3470..=3515).contains(&h),
+        "expected the 300 DPI raster, got {w}x{h}"
+    );
+    assert!(
+        !has_smask,
+        "a fully opaque scan must not carry an alpha mask"
+    );
+
+    let (raw_w, _, raw_filter, raw_smask, _) = first_image_xobject(&original);
+    assert_eq!(raw_w, 2500, "原图直通 keeps the source pixels");
+    // Flate, or raw when compression would not pay off: either way the source
+    // raster is what gets written.
+    assert_ne!(raw_filter, "DCTDecode");
+    assert!(raw_smask, "原图直通 keeps the alpha channel");
+
+    let balanced_size = std::fs::metadata(&balanced).unwrap().len();
+    let original_size = std::fs::metadata(&original).unwrap().len();
+    // A noisy fixture is the worst case for both codecs; a real scan differs
+    // by an order of magnitude.
+    assert!(
+        balanced_size * 2 < original_size,
+        "the default budget must be far smaller: {balanced_size} vs {original_size}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

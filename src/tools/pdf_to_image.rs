@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use lopdf::{Document, ObjectId};
 
-use crate::engine::{pdf_io, render, validate};
+use crate::engine::{pdf_io, pool, render, validate};
 use crate::model::{ImageFormat, InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::{
     check_cancel, ensure_dir, CancelFlag, Progress, Tool, ToolOptions, ToolRequest,
@@ -152,11 +152,16 @@ impl Tool for PdfToImage {
         let resolved = pdf_io::resolve_outputs(&all_targets, req.conflict)?;
 
         // Phase 2 — render. Documents are reopened one at a time so a batch of
-        // large PDFs does not keep every parse in memory.
+        // large PDFs does not keep every parse in memory; within one document
+        // the pages are independent, so they rasterise on the shared pool.
+        // The font set is shared by reference (its glyph cache is behind a
+        // mutex) instead of being rebuilt per worker — one font collection is
+        // tens of megabytes.
         let total: usize = all_targets.len();
         let mut outputs: Vec<PathBuf> = Vec::with_capacity(total);
         let mut failed: Vec<(String, String)> = Vec::new();
         let mut cursor = 0usize;
+        let mut finished = 0usize;
 
         let fonts = render::FontSet::system();
         if fonts.is_empty() {
@@ -174,24 +179,53 @@ impl Tool for PdfToImage {
                 }
             };
             let pages = doc.get_pages();
-            for page_num in page_numbers {
-                check_cancel(cancel)?;
-                let out = &resolved[cursor];
-                cursor += 1;
-                progress.report(
-                    (cursor - 1) as f32 / total as f32,
-                    format!("{name}：第 {page_num}/{} 页", page_numbers.len()),
-                );
 
-                let Some(page_id) = pages.get(page_num).copied() else {
-                    failed.push((format!("{name} 第 {page_num} 页"), "页面不存在".to_string()));
-                    continue;
-                };
-                match render_and_save(&doc, page_id, *page_num, dpi, format, &fonts, out, req) {
-                    Ok(()) => outputs.push(out.clone()),
-                    Err(err) => failed.push((format!("{name} 第 {page_num} 页"), err.to_string())),
+            // Jobs are planned for the whole document first: every output name
+            // was reserved in phase 1, and a missing page is recorded without
+            // starting a worker for it.
+            let mut jobs: Vec<(u32, ObjectId, PathBuf)> = Vec::with_capacity(page_numbers.len());
+            for page_num in page_numbers {
+                let out = resolved[cursor].clone();
+                cursor += 1;
+                match pages.get(page_num).copied() {
+                    Some(page_id) => jobs.push((*page_num, page_id, out)),
+                    None => {
+                        failed.push((format!("{name} 第 {page_num} 页"), "页面不存在".to_string()))
+                    }
                 }
             }
+            if jobs.is_empty() {
+                continue;
+            }
+
+            let workers = pool::worker_count(jobs.len(), RENDER_WORKER_BYTES);
+            pool::run(
+                jobs.len(),
+                workers,
+                cancel,
+                // One unrenderable page is skipped, not fatal: the rest of the
+                // document is still worth exporting.
+                pool::OnError::Continue,
+                |index| {
+                    let (page_num, page_id, out) = &jobs[index];
+                    render_and_save(&doc, *page_id, *page_num, dpi, format, &fonts, out, req)
+                },
+                |index, result| {
+                    let (page_num, _, out) = &jobs[index];
+                    match result {
+                        Ok(()) => outputs.push(out.clone()),
+                        Err(err) => {
+                            failed.push((format!("{name} 第 {page_num} 页"), err.to_string()))
+                        }
+                    }
+                    finished += 1;
+                    progress.report(
+                        finished as f32 / total as f32,
+                        format!("{name}：第 {page_num} 页"),
+                    );
+                    Ok(())
+                },
+            )?;
         }
 
         if outputs.is_empty() {
@@ -234,6 +268,10 @@ impl Tool for PdfToImage {
         Ok(ToolOutcome::success(summary, outputs))
     }
 }
+
+/// Peak memory one render worker needs: a 600 DPI A4 pixmap is ~140 MB, plus
+/// the encoded byte buffer.
+const RENDER_WORKER_BYTES: u64 = 192 * 1024 * 1024;
 
 /// Render one page, encode it and write it through the shared save path.
 fn render_and_save(
