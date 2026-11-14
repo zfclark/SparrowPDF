@@ -740,7 +740,7 @@ fn render_with_size_guard(
     let mut budget = policy.budget;
     let mut passes = 0u32;
     loop {
-        let bytes = render_document(job, policy.with_budget(budget), cancel)?;
+        let bytes = render_document(job, policy.with_budget(budget), cancel, progress, index, total)?;
         if bytes.len() as u64 <= limit {
             return Ok((bytes, passes));
         }
@@ -767,9 +767,12 @@ fn render_document(
     job: &PlannedFolder<'_>,
     policy: PagePolicy,
     cancel: &CancelFlag,
+    progress: &Progress,
+    index: usize,
+    total: usize,
 ) -> Result<Vec<u8>, ToolError> {
     // Images first (parallel, no PDF state), then the page objects (serial).
-    let pages = prepare_pages(job, policy, cancel)?;
+    let pages = prepare_pages(job, policy, cancel, progress, index, total)?;
 
     let mut doc = Document::with_version("1.7");
     let pages_id = build_document_skeleton(&mut doc);
@@ -827,6 +830,9 @@ fn prepare_pages(
     job: &PlannedFolder<'_>,
     policy: PagePolicy,
     cancel: &CancelFlag,
+    progress: &Progress,
+    index: usize,
+    total: usize,
 ) -> Result<Vec<Vec<image_embed::PreparedImage>>, ToolError> {
     struct Job<'a> {
         path: &'a Path,
@@ -848,11 +854,25 @@ fn prepare_pages(
     }
 
     let mut done: Vec<Option<image_embed::PreparedImage>> = jobs.iter().map(|_| None).collect();
+    // One report per finished image, so a long folder keeps the bar moving
+    // even though the images themselves are prepared on worker threads.
+    let prepared_count = std::sync::atomic::AtomicUsize::new(0);
+    let folder_name = job.folder.display_name();
+    let report = |progress: &Progress| {
+        let finished = prepared_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let fraction = (index as f32 + finished as f32 / jobs.len() as f32) / total as f32;
+        progress.report(
+            fraction,
+            format!("{folder_name}：压缩 {finished}/{} 张", jobs.len()),
+        );
+    };
+
     let workers = worker_count(jobs.len());
     if workers <= 1 {
         for (slot, job) in jobs.iter().enumerate() {
             check_cancel(cancel)?;
             done[slot] = Some(image_embed::prepare_image(job.path, job.sheet, policy.budget)?);
+            report(progress);
         }
     } else {
         let chunk = jobs.len().div_ceil(workers);
@@ -869,6 +889,7 @@ fn prepare_pages(
                                 chunk_index * chunk + offset,
                                 image_embed::prepare_image(job.path, job.sheet, policy.budget)?,
                             ));
+                            report(progress);
                         }
                         Ok(out)
                     })
