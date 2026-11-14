@@ -22,6 +22,7 @@
 执行原则：
 
 - **先读后写**：不得在未读源码的情况下凭猜测改接口。
+- **分支默认 `dev`**：所有改动提交到 `dev`；`main` 只由发版合并推进（见 6.6），未经用户明确要求不得改动 `main`。
 - **最小改动**：一次任务只解决一个议题，不夹带格式重排、无关重命名。
 - **验证前置**：改完必须跑第 4.4 节的质量门，输出真实结果，不臆测「应该能过」。
 - **不做外部动作**：`git push`、`git tag` 推送、创建 Release、修改仓库设置等一律需人工明确授权。
@@ -85,7 +86,7 @@ SparrowPDF/
 ├── assets/               # 图标素材（icns / ico / png），不参与运行时解码逻辑
 ├── src/                  # 全部 Rust 源码（见 2.2）
 ├── tests/integration.rs  # 端到端集成测试（不启动 GUI，直接调 Tool）
-├── README.md             # 面向用户的功能与安装说明
+├── README.md             # 面向用户的功能、下载与开发/贡献说明
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
 ├── docs/                 # 技术实现文档（分层、工具、渲染、界面），改代码前读对应主题
 └── .github/workflows/    # 发布流水线（tag 触发，产出 Windows x64 / arm64 与 macOS 通用版）
@@ -449,24 +450,46 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 
 ### 6.6 分支管理策略
 
-采用 **主干开发 + 短生命周期分支**：
+**只有两条长期分支**：`dev` 开发、`main` 发布。不设 `feat/*`、`fix/*`、`release/*` 等临
+时分支——功能、缺陷、文档、构建改动一律直接提交到 `dev`。
 
-| 分支 | 命名 | 来源 | 合并去向 | 存活期 |
-| --- | --- | --- | --- | --- |
-| 主干 | `main` | — | — | 常驻，始终可发布 |
-| 功能 | `feat/<scope>-<简述>` | `main` | `main`（squash） | ≤ 3 天 |
-| 缺陷 | `fix/<scope>-<简述>` | `main` | `main`（squash） | ≤ 1 天 |
-| 维护 | `ci/<简述>`、`docs/<简述>`、`build/<简述>` | `main` | `main`（squash） | ≤ 1 天 |
-| 发布 | `release/<主.副.修订>` | `main` | `main` + `V主.副.修订.YYYYMMDD` tag | 发布窗口内 |
-| 紧急修复 | `hotfix/<主.副.修订>` | 线上 tag | `main` + 新 tag | ≤ 1 天 |
+```
+main  ──●────────────────●────────────●──▶  只放已发布版本，每个 ● 带 tag
+         \              /            /
+dev       ●──●──●──●───●──●──●──●───●────▶  日常开发，始终可编译
+```
+
+| 分支 | 角色 | 推进方式 |
+| --- | --- | --- |
+| `main` | 发布线：只保存可发布/已发布状态，承载版本 tag | 仅由 `dev` 发版合并推进 |
+| `dev` | 开发线：日常改动的唯一落点，始终可编译 | 直接提交，随进度推送 |
 
 规则：
 
-1. `main` 受保护：禁止直接推送，必须经评审合并；历史保持线性（squash 或 rebase-and-merge，不产生无意义 merge commit）。
-2. 分支名全小写、用连字符分隔，不含中文与空格。
-3. 发布以 **tag 为准**：`V主.副.修订.YYYYMMDD`（如 `V0.4.2.20261104`）打在 `main` 上，tag 一旦推送不得移动或复用。
-4. 禁止对 `main` 强制推送；`hotfix` 必须同时回合 `main`，避免双线分叉。
-5. 远程同步用 `git pull --rebase`，本地分支可随意整理，已共享的分支不改写。
+1. **日常开发只提交 `dev`**：禁止直接提交或推送到 `main`；`main` 只接受发版合并，保证任何时刻 `main` 上的状态都能发布。
+2. **`dev` 始终可编译**：每次提交前跑完 4.4 的质量门，`dev` 上任何一条提交都应能 `cargo build --release`，否则发版前无法用二分定位回归。
+3. **一次提交一个议题**：分支只有两条，原子性靠提交而不是分支保证，功能与格式重排不混在同一条提交里。
+4. **合并方式固定**：`dev` → `main` 用 `--no-ff`，在 `main` 上留下一次发布边界，便于按区间回溯该版本全部改动。
+5. **发布以 tag 为准**：`V主.副.修订.YYYYMMDD` 打在 `main` 上，推送后不得移动或复用；发版后把 `main` 回合 `dev`（`git switch dev && git merge --ff-only main`），避免两条线分叉。
+6. **不改写共享历史**：`main`、`dev` 均由多人共享，不 `--amend`、不 `rebase`、不 `push --force`；远程同步用 `git pull --rebase`。需要试验性改动时用本地临时分支或 `git worktree`，验证后 squash 回 `dev` 并删除。
+7. **本地先对齐再开工**：`git fetch origin` 后确认 `dev` 与 `origin/dev` 无分叉；本地 `main` 不得承载未发布的开发提交。
+
+常用操作：
+
+```bash
+git fetch origin
+git switch dev                        # 首次：git switch -c dev origin/dev
+
+# …实现 + 4.4 质量门… → 按 6.3 提交，然后
+git push origin dev
+
+# 发版（push 与 tag 均需人工授权，见 7.3）
+git switch main && git merge --no-ff dev
+git push origin main
+git tag -a V0.6.1.20261120 -m "<该版本变更摘要>"
+git push origin V0.6.1.20261120
+git switch dev && git merge --ff-only main
+```
 
 ---
 
@@ -477,7 +500,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 | 阶段 | 准入条件 | 负责人 | 准出交付物 |
 | --- | --- | --- | --- |
 | 1 需求 | 问题可复现或价值明确 | 需求提出方 | 需求卡（含验收标准） |
-| 2 开发 | 需求卡已确认 | 开发者 / AI 代理 | 分支上的实现与规范提交 |
+| 2 开发 | 需求卡已确认 | 开发者 / AI 代理 | `dev` 上的实现与规范提交 |
 | 3 测试 | 代码可编译 | 开发者自测 + 评审人复测 | 测试结果与已知限制说明 |
 | 4 评审 | 质量门全绿 | 评审人（非作者） | 评审结论与批准记录 |
 | 5 发布 | 评审通过 | 发布负责人 | tag + Release + CHANGELOG |
@@ -494,28 +517,28 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 **2) 开发**
 
 - 输入：需求卡。
-- 动作：建分支 → 读上下文（第 0 节）→ 实现 → 自测 → 按第 6 节提交。
-- 交付物：可编译分支、原子提交序列、变更说明（改了什么、为什么、影响哪些模块）。
+- 动作：切到 `dev` → 读上下文（第 0 节）→ 实现 → 自测 → 按第 6 节提交。
+- 交付物：可编译的 `dev` 状态、原子提交序列、变更说明（改了什么、为什么、影响哪些模块）。
 - 准出：`cargo check --release --all-targets` 无警告；本地可运行。
 
 **3）测试**
 
-- 输入：开发分支。
+- 输入：`dev` 上待测的提交。
 - 动作：补/改集成测试；覆盖边界（空输入、越界页码、损坏文件、加密文件、权限受限目录、超长路径）；手工冒烟关键路径。
 - 交付物：测试结论（通过/失败项）、已知限制、复现步骤（失败时）。
 - 准出：`cargo test --release --lib --test integration` 全绿；新增行为有对应断言。
 
 **4）评审**
 
-- 输入：待合并分支 + 测试结论。
+- 输入：`dev` 上待发版的提交 + 测试结论。
 - 动作：检查分层约束、错误处理、落盘路径、取消与进度、UI 一致性与明暗适配、测试有效性、提交信息规范。
 - 交付物：评审意见（阻塞项 / 建议项分类）与最终结论。
 - 准出：阻塞项清零；作者非评审人；合并方式符合 6.6。
 
 **5）发布**
 
-- 输入：`main` 上通过评审的提交。
-- 动作：确认版本号（`Cargo.toml` + `Cargo.lock` 的前三段、`src/version.rs` 的日期位，三处与 tag 对齐）→ 更新 `CHANGELOG.md` → 打 annotated tag `V主.副.修订.YYYYMMDD` → 推送分支与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）。
+- 输入：`dev` 上通过评审、准备发版的提交。
+- 动作：确认 `dev` 质量门全绿 → `git switch main && git merge --no-ff dev`（保留发布边界）→ 确认版本号（`Cargo.toml` + `Cargo.lock` 的前三段、`src/version.rs` 的日期位，三处与 tag 对齐）→ 更新 `CHANGELOG.md` → 打 annotated tag `V主.副.修订.YYYYMMDD` → 推送 `main` 与 tag → 流水线构建双平台并创建 Release → 验证产物（可启动、关于页版本号与 tag 一致、图标正确）→ 把 `main` 回合 `dev`。
 - 交付物：tag、Release 页面（含变更摘要与产物校验信息）、更新后的 CHANGELOG。
 - 准出：双平台产物可下载且可运行；`guard` 校验（tag 格式、版本一致、打包资源齐全）通过。
 - 回滚预案：产物异常时删除 Release 并标记 tag 作废，修复后升 patch 版本重新发布；不得移动既有 tag。
@@ -525,10 +548,10 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 | 阶段 | 代理必须做 | 代理不得做 |
 | --- | --- | --- |
 | 需求 | 复述验收标准，列出不确定点 | 自行扩大范围、臆造验收条件 |
-| 开发 | 读上下文、最小改动、分类型提交 | 顺手重构无关模块、改依赖、改 License |
+| 开发 | 读上下文、在 `dev` 上提交、最小改动、分类型提交 | 直接提交或推送到 `main`、顺手重构无关模块、改依赖、改 License |
 | 测试 | 运行质量门并粘贴真实输出 | 声称「应该通过」而无执行记录 |
 | 评审 | 逐项对照 5 节与 4.4 节自检 | 自行批准自己的改动 |
-| 发布 | 校验版本号一致性、给出推送命令 | 执行 `git push` / 创建 Release / 移动 tag |
+| 发布 | 校验版本号一致性、给出推送与打 tag 命令 | 执行 `git push` / 创建 Release / 移动 tag |
 
 ---
 
@@ -538,7 +561,7 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 
 - 位置：仓库根目录 `CHANGELOG.md`，格式遵循 **Keep a Changelog 1.1.0**。
 - 版本号遵循本文件 8.3 节的五位规则（`V主.副.修订.YYYYMMDD`），不采用 SemVer 作为对外版本号。
-- 唯一事实来源是**已合并到 `main` 的提交与 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
+- 唯一事实来源是**已合并到 `dev`（未发布）与 `main`（已发布）的提交及 tag**；CHANGELOG 是人工提炼的结果，不由 CI 自动生成。
 - 发布流水线按 tag 原样截取对应版本条目（`## [V主.副.修订.YYYYMMDD]` 到下一个二级标题为止），作为 GitHub Release 的更新说明；条目缺了 guard 直接失败，所以每条必须独立可读、不依赖上下文。
 - 顺序：新版本在上；未发布内容置于 `[Unreleased]`。
 
@@ -665,6 +688,11 @@ BREAKING CHANGE: 工具内部不得再直接 fs::write，必须经 pdf_io::save_
 cargo check --release --all-targets
 cargo test --release --lib --test integration
 
+# 分支（只有 main / dev 两条，日常在 dev，main 只由发版合并推进）
+git fetch origin
+git switch dev                                  # 首次：git switch -c dev origin/dev
+git push origin dev
+
 # 发布构建（CI 同款）
 cargo build --release --locked
 SPARROW_AS_INVOKER=1 cargo build --release      # Windows 免提权变体
@@ -698,7 +726,7 @@ git push origin V0.4.2.20261104
 2. 绕过 `pdf_io` 直接落盘，或吞掉写入错误。
 3. 在 `ui/` 层引用 PDF/图片库类型。
 4. 提交 `target/`、`.probe/`、`.workbuddy/`、密钥与个人绝对路径。
-5. 对 `main` 强制推送、移动已发布 tag、改写已共享历史。
+5. 直接向 `main` 提交或推送（发版合并除外）、对 `main` / `dev` 强制推送、移动已发布 tag、改写已共享历史。
 6. 未经授权执行 `git push`、创建 Release、修改仓库设置。
 7. 用 emoji 充当状态图标（字体缺字形会显示为方框）。
 
@@ -706,7 +734,7 @@ git push origin V0.4.2.20261104
 
 ```markdown
 ## 变更内容
-<!-- 一句话说明这个 PR 解决什么问题 -->
+<!-- 一句话说明这个 PR 解决什么问题。目标分支为 dev；main 只接受发版合并 -->
 
 ## 关联需求
 Closes #<编号>
