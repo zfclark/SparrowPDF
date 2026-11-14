@@ -123,6 +123,7 @@ pub fn panel_view(tool: ToolId, form: &FormState, reorder: &ReorderState) -> Pan
     match tool {
         ToolId::ImageToPdf => PanelView::new(has_input, "请先添加至少一张图片。"),
         ToolId::FolderToPdf => PanelView::new(has_input, "请先添加至少一个文件夹。"),
+        ToolId::PdfToImage => PanelView::new(has_input, "请先添加至少一个 PDF 文件。"),
         ToolId::Merge => PanelView::new(form.inputs.len() >= 2, "至少需要 2 个 PDF 文件。"),
         ToolId::Reorder => PanelView::new(
             has_input && !reorder.rows.is_empty(),

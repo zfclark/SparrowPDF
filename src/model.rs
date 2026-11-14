@@ -75,18 +75,18 @@ impl ToolId {
     /// One-line summary shown under the panel heading.
     pub fn description(self) -> &'static str {
         match self {
-            ToolId::ImageToPdf => "把 JPEG / PNG 合并为一份 PDF，自动纠正 EXIF 方向",
-            ToolId::FolderToPdf => "选择文件夹，图片按文件名数字排序合成 PDF，支持两图一页",
-            ToolId::Merge => "多个 PDF 按列表顺序合并为一个文件",
+            ToolId::ImageToPdf => "将多张 JPEG / PNG 合成为单个 PDF，并按 EXIF 方向校正",
+            ToolId::FolderToPdf => "按模板将文件夹内的图片批量合成为 PDF，顺序依据文件名中的数字",
+            ToolId::Merge => "按列表顺序合并多个 PDF",
             ToolId::Split => "按页码范围、每 N 页或逐页拆分",
-            ToolId::Rotate => "以 90° 增量旋转指定页面",
+            ToolId::Rotate => "按 90° 增量旋转指定页面，角度可累计",
             ToolId::DeletePages => "按页码范围删除页面",
-            ToolId::Reorder => "拖动调整页面顺序后重组",
-            ToolId::Extract => "把选中的页面抽取为新文件",
-            ToolId::TextWatermark => "添加文本水印，支持平铺、透明度与旋转",
-            ToolId::ImageWatermark => "把图片作为水印叠加到每一页",
-            ToolId::Encrypt => "AES-256 加密，或移除现有密码",
-            ToolId::PdfToImage => "渲染为 PNG / JPEG，36-600 DPI",
+            ToolId::Reorder => "拖动调整页序后重新生成文档",
+            ToolId::Extract => "将指定页面另存为新的 PDF",
+            ToolId::TextWatermark => "在页面上叠加文字水印，可设置字号、颜色、透明度与角度",
+            ToolId::ImageWatermark => "将图片作为水印叠加到每一页",
+            ToolId::Encrypt => "AES-256 加密，或移除已有密码",
+            ToolId::PdfToImage => "逐页渲染为 PNG / JPEG，支持 36–600 DPI 与多文件批量导出",
         }
     }
 
@@ -103,7 +103,7 @@ impl ToolId {
     /// How many file slots the tool takes. `None` means unbounded.
     pub fn max_inputs(self) -> Option<usize> {
         match self {
-            ToolId::Merge | ToolId::ImageToPdf | ToolId::FolderToPdf => None,
+            ToolId::Merge | ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage => None,
             ToolId::ImageWatermark => Some(2),
             _ => Some(1),
         }

@@ -584,7 +584,7 @@ impl SparrowApp {
             ToolId::TextWatermark => panels::text_watermark::show(ui, form),
             ToolId::ImageWatermark => panels::image_watermark::show(ui, form),
             ToolId::Encrypt => panels::encrypt::show(ui, form),
-            ToolId::PdfToImage => panels::pdf_to_image::show(ui, form),
+            ToolId::PdfToImage => panels::pdf_to_image::show(ui, form, preview),
         }
     }
 }
