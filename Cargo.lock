@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "sparrowpdf"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "allsorts",
  "eframe",

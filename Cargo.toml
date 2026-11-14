@@ -2,7 +2,7 @@
 name = "sparrowpdf"
 # Cargo 只接受 SemVer 三段：这里保存五位版本号的前三段（主.副.修订），
 # 不带 V 前缀、不带日期位。日期位在 src/version.rs 维护，展示用完整版本
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
