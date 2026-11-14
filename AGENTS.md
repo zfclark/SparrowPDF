@@ -89,7 +89,9 @@ SparrowPDF/
 ├── README.md             # 面向用户的功能、下载与开发/贡献说明
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
 ├── docs/                 # 技术实现文档（分层、工具、渲染、界面），改代码前读对应主题
-└── .github/workflows/    # 发布流水线（tag 触发，产出 Windows x64 / arm64 与 macOS 通用版）
+└── .github/
+     ├── workflows/         # release.yml：tag 触发，产出双平台产物；ci.yml：PR 检查（4.6）
+     └── pull_request_template.md  # PR 模板，开 PR 时自动填充
 ```
 
 本地开发期目录（**不入库**，已在 `.gitignore` 中）：`target/`、`.probe/`（截图与调试素材）、`.workbuddy/`（本机代理工作数据）。
@@ -309,6 +311,7 @@ cargo test --release --lib --test integration
 3. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
 4. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
 5. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
+6. PR 上「质量门（Windows）」状态检查必须通过才可合并（4.6）；本地绿而 CI 红时按 CI 日志修，不得绕过检查合并。
 
 ### 4.5 发布流水线（`.github/workflows/release.yml`）
 
@@ -353,6 +356,39 @@ cargo test --release --lib --test integration
 
 - 并发 20 作业、单作业 6 小时、矩阵 256 作业、缓存 10 GB；本流水线最多 5 个作业、每个 ≤60 分钟。
 - 公开仓库的标准 runner 不计费；macOS runner 排队无优先级，排队超时被取消时用 Re-run failed jobs。
+
+### 4.6 PR 检查与合并前置（`.github/workflows/ci.yml`）
+
+**触发与范围**
+
+- `pull_request` 指向 `main` 或 `dev` 时运行；同一 PR 的新提交会取消上一次运行（`concurrency`
+  按 PR 号分组），不排队等过期结果。另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+- 只做检查，不构建产物、不发 Release；产物由 `release.yml` 在 tag 上构建。
+
+**作业与步骤**
+
+- 单作业「质量门（Windows）」，内容即 4.4 的第 1、2 条：`cargo check --release --all-targets --locked`
+  与 `cargo test --release --lib --test integration --locked -- --test-threads=1`。
+- 测试串行的原因：多数用例共用目标临时目录与同一个日志文件，并发跑会偶发抢写（见 4.3），
+  串行只多花几秒。
+- 缓存键 `runner.os + pr-cargo-release + hash(Cargo.lock)`，与发布流水线的键分开，互不覆盖。
+
+**合并前置（状态审核，仓库设置里一次性开启）**
+
+- `Settings → Rules`（经典界面为 `Branches`）为 `main` 开启 **Require status checks to pass
+  before merging**，勾选「质量门（Windows）」；同时开启 **Require a pull request before merging**
+  与 **Block force pushes**，防止绕过。
+- **作业名就是检查名**：`ci.yml` 里 `name: 质量门（Windows）` 一改，分支保护中的旧检查名不再匹配，
+  PR 会一直等一个不会再出现的检查、永远无法合并——改名必须同步改设置。
+- 检查未通过时不得用管理员权限强行合并；确因基础设施故障（runner 宕机、配额）时，用 Re-run
+  failed jobs 重跑，仍失败则先修问题。
+
+**已知边界**
+
+- 不设 `cargo fmt --check` 门禁：仓库尚未全量 rustfmt 干净（当前 12 个文件、46 处），开启会立刻
+  全红；等一次性 `style` 提交整理干净后再作为独立检查加入，先加先红没有意义。
+- 只跑 Windows：产品主战场是 Windows，macOS 由发布流水线在真实产物上验证。若要覆盖 macOS，新增
+  `os` 矩阵后检查名会变成两个，分支保护需一并勾选。
 
 ---
 
@@ -466,10 +502,10 @@ dev       ●──●──●──●───●──●──●──●�
 
 规则：
 
-1. **日常开发只提交 `dev`**：禁止直接提交或推送到 `main`。`main` 开启分支保护（禁止直接 push、必须经 PR），任何时刻 `main` 上的状态都能发布。
+1. **日常开发只提交 `dev`**：禁止直接提交或推送到 `main`。`main` 开启分支保护（禁止直接 push、必须经 PR、状态检查「质量门（Windows）」通过才可合并，见 4.6），任何时刻 `main` 上的状态都能发布。
 2. **`dev` 始终可编译**：每次提交前跑完 4.4 的质量门，`dev` 上任何一条提交都应能 `cargo build --release`，否则发版前无法用二分定位回归。
 3. **一次提交一个议题**：分支只有两条，原子性靠提交而不是分支保证，功能与格式重排不混在同一条提交里。
-4. **发版走 PR**：`dev` → `main` 通过 GitHub PR 合入，评审意见与合并记录留在 PR 上；合并方式在 PR 上选 **Create a merge commit**（等价 `--no-ff`），在 `main` 上留下一次发布边界。**不要**用 Squash（`dev` 与 `main` 会分叉）或 Rebase（改写已共享历史）。
+4. **发版走 PR**：`dev` → `main` 通过 GitHub PR 合入，评审意见与合并记录留在 PR 上；检查未绿时合并按钮不可用，评审结论与检查结果共同构成准入。合并方式在 PR 上选 **Create a merge commit**（等价 `--no-ff`），在 `main` 上留下一次发布边界。**不要**用 Squash（`dev` 与 `main` 会分叉）或 Rebase（改写已共享历史）。
 5. **发布以 tag 为准**：PR 合入后，在**合并后的 `main` 提交**上打 `V主.副.修订.YYYYMMDD`，推送后不得移动或复用；随后把 `main` 回合 `dev`（`git switch dev && git merge --ff-only main`），避免两条线分叉。
 6. **不改写共享历史**：`main`、`dev` 均由多人共享，不 `--amend`、不 `rebase`、不 `push --force`；远程同步用 `git pull --rebase`。需要试验性改动时用本地临时分支或 `git worktree`，验证后 squash 回 `dev` 并删除。
 7. **本地先对齐再开工**：`git fetch origin` 后确认 `dev` 与 `origin/dev` 无分叉；本地 `main` 不得承载未发布的开发提交。
@@ -735,26 +771,10 @@ git switch dev && git merge --ff-only main       # 回合，避免两条线分�
 6. 未经授权执行 `git push`、创建 Release、修改仓库设置。
 7. 用 emoji 充当状态图标（字体缺字形会显示为方框）。
 
-### D. 合并请求（PR）模板
+### D. 合并请求（PR）
 
-```markdown
-## 变更内容
-<!-- 一句话说明这个 PR 解决什么问题。目标分支为 dev；main 只接受发版合并 -->
+模板在 `.github/pull_request_template.md`，开 PR 时自动带出，含变更内容 / 关联需求 / 影响面 /
+验证方式 / 回滚方案五段与质量门勾选项；模板改动直接改该文件，本节不再复制一份。
 
-## 关联需求
-Closes #<编号>
-
-## 影响面
-- 涉及模块：
-- 用户可见变化：
-- 兼容性：无 / 有（说明）
-
-## 验证方式
-- [ ] `cargo check --release --all-targets` 无警告
-- [ ] `cargo test --release --lib --test integration` 全通过
-- [ ] 手动冒烟：（步骤）
-- [ ] 涉及 UI 时附截图
-
-## 回滚方案
-<!-- 撤销方式：回滚提交 / 关闭开关 / 恢复默认值 -->
-```
+合入条件（缺一不可）：状态检查「质量门（Windows）」通过（4.6）+ 评审意见已处理 + 合并方式为
+merge commit。发版 PR 的 base 是 `main`、head 是 `dev`，且不删 head 分支。

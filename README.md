@@ -5,7 +5,7 @@
 面向日常 PDF 处理的桌面工具集：合并、拆分、旋转、删页、加水印、加密、转图片。全部在本机完成，
 无网络请求、无遥测、无需账号。
 
-![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue) ![rust](https://img.shields.io/badge/rust-1.95%2B-orange)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue) ![rust](https://img.shields.io/badge/rust-1.95%2B-orange) ![PR 检查](https://github.com/zfclark/SparrowPDF/actions/workflows/ci.yml/badge.svg)
 
 ## 下载
 
@@ -106,6 +106,7 @@ git push origin dev
   一次提交只做一件事，便于单条回滚。
 - 提交前质量门必须全绿：`cargo check --release --all-targets` 无警告，
   `cargo test --release --lib --test integration` 全通过；涉及界面的改动附一次实际启动确认。
+  同一组检查会在 PR 上自动跑（状态检查「质量门（Windows）」），红了不能合并。
 - 用户可见的行为变化，同步在 `CHANGELOG.md` 的 `[Unreleased]` 下加一条；测试与文档改动不必。
 - 没有写权限时先 fork，从 `dev` 切出改动，向本仓库的 `dev` 提 PR；有写权限就直接提交 `dev`。
 - 不直接提交 `main`：发版由维护者在 GitHub 开 `dev` → `main` 的 PR，评审通过后用

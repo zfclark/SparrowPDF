@@ -1,0 +1,70 @@
+# 轻雀 PDF PR 检查流水线
+#
+# 触发
+#   · pull_request 指向 main 或 dev：跑质量门，结果作为 PR 的状态检查。
+#   · 同一 PR 有新提交时取消上一次运行，不排队等旧结果。
+#   · 只做检查，不构建产物、不发 Release；发布由 release.yml 在 tag 上跑。
+#
+# 合并前置（仓库设置里一次性开启，见 AGENTS.md 4.6）
+#   Settings → Rules / Branches → Require status checks to pass before merging，
+#   勾选本文件的作业名「质量门（Windows）」。改作业名会让该设置失效。
+#
+# 维护约束见 AGENTS.md 4.4（质量门）与 4.6（PR 检查与合并前置）。
+
+name: 🔍 PR 检查
+
+on:
+    pull_request:
+        branches: [main, dev]
+    # 在分支上手动跑一次，用于排查「本地绿、CI 红」。
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: pr-check-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    quality-gate:
+        # 这个名字就是 PR 上状态检查显示的名称，分支保护引用的也是它：
+        # 改名必须同步改仓库设置，否则合并会一直等一个永远不会出现的检查。
+        name: 质量门（Windows）
+        runs-on: windows-latest
+        timeout-minutes: 45
+        steps:
+            - name: 检出 PR 提交
+              uses: actions/checkout@v7
+              with:
+                  # 只校验当前提交，不取历史；需要 merge-base 的只有发布流水线。
+                  fetch-depth: 1
+
+            - name: 安装 Rust（固定 1.97.1）
+              uses: dtolnay/rust-toolchain@1.97.1
+              with:
+                  # 版本由分支名决定，勿写 with.toolchain（未声明输入，只会触发警告）。
+                  targets: x86_64-pc-windows-msvc
+
+            - name: 缓存依赖
+              uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  # 与 release.yml 的缓存键分开：发布侧按架构分键且会被 UPX 步骤
+                  # 改动产物，混用容易命中一份不完整的 target。
+                  key: ${{ runner.os }}-pr-cargo-release-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-pr-cargo-release-
+
+            - name: 🧭 类型检查（含测试）
+              run: cargo check --release --all-targets --locked
+
+            # --test-threads=1：多数用例共用同一个目标临时目录与日志文件，并发跑
+            # 会偶发抢写（AGENTS.md 4.3）。串行只多花几秒，换来确定的结果。
+            - name: 🧪 集成测试
+              run: cargo test --release --lib --test integration --locked -- --test-threads=1
