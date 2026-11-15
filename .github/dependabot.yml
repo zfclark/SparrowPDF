@@ -1,8 +1,11 @@
 # Dependabot 配置
 #
-# 为什么写 target-branch：仓库的开发线是 dev，main 只由发版 PR 推进。不写这一行，
-# Dependabot 会对默认分支 main 开 PR —— PR #2 就是这样撞的（在 main 上只升 lopdf，
-# 两个 lopdf 并存，质量门 E0308）。安全更新（alerts）也沿用这里的 target-branch。
+# 为什么写 target-branch：仓库的开发线是 dev，main 只由发版 PR 推进；不写这一行，
+# 版本更新会对着默认分支 main 开 PR。
+#
+# 注意作用范围：target-branch 与下面的 ignore 都只作用于**版本更新**。由安全公告
+# 触发的 PR（如 PR #2 的 lopdf）固定面向默认分支，本文件既改不了它的目标分支，也
+# 拦不住它 —— 那条告警只能在 Security 页面处理（dismiss，或先把依赖修掉）。
 #
 # 为什么 ignore lopdf >= 0.40：medpdf / medpdf-image 至今声明 lopdf ^0.39，单独升 lopdf
 # 会出现两个版本并存、与 medpdf 类型不匹配而编译失败（PR #2 就是这么红的）。范围写

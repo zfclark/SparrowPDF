@@ -91,7 +91,7 @@ SPARROW_AS_INVOKER=1 cargo build --release
 `C1083 无法打开 stddef.h`，说明当前终端缺 `INCLUDE` / `LIB`，改用 VS 开发者命令提示符。
 
 ```bash
-cargo run                                                   # 开发期运行，改完即可看效果
+cargo run --release                                        # 开发期运行（debug 构建会触发 libz-sys D8050）
 cargo clippy --release --all-targets -- -D warnings        # 类型检查 + 警告门（CI 同款）
 cargo test --release --lib --test integration               # 单元 + 集成测试
 cargo build --release --locked                              # 本地发布构建（与 CI 一致）
