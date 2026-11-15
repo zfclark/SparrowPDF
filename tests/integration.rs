@@ -916,6 +916,106 @@ fn folder_batch_two_per_page_supports_portrait_pages() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `(resource name, translate y)` of every image a page draws, in draw order.
+fn page_draws(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Vec<(String, f32)> {
+    let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    let content_ref = page.get(b"Contents").unwrap().as_reference().unwrap();
+    let content = String::from_utf8(
+        doc.get_object(content_ref)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content
+            .clone(),
+    )
+    .unwrap();
+
+    let mut draws = Vec::new();
+    let mut lines = content.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        let Some(matrix) = line.strip_suffix(" cm") else {
+            continue;
+        };
+        let numbers: Vec<f32> = matrix
+            .split_whitespace()
+            .map(|n| n.parse().expect("matrix number"))
+            .collect();
+        let draw_op = lines.next().expect("an image draw follows its matrix");
+        let name = draw_op
+            .strip_prefix('/')
+            .and_then(|rest| rest.strip_suffix(" Do"))
+            .expect("draw operator")
+            .to_string();
+        draws.push((name, numbers[5]));
+    }
+    draws
+}
+
+/// Pixel width of the image a page draws under `name`.
+fn xobject_width(doc: &lopdf::Document, page_id: lopdf::ObjectId, name: &str) -> i64 {
+    let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+    let resources = page.get(b"Resources").unwrap().as_dict().unwrap();
+    let xobjects = resources.get(b"XObject").unwrap().as_dict().unwrap();
+    let image_id = xobjects
+        .get(name.as_bytes())
+        .expect("image resource")
+        .as_reference()
+        .unwrap();
+    doc.get_object(image_id)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .dict
+        .get(b"Width")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
+/// The 入团志愿书 preset merges pages 2 and 3 onto one sheet, each turned 90°.
+///
+/// The turn is clockwise, so the reader turns the sheet back
+/// counter-clockwise — which puts the **upper** slot on the left. Stacking the
+/// slots the other way round printed page 3 before page 2 on every convert.
+#[test]
+fn folder_batch_merges_pages_2_and_3_in_reading_order() {
+    let dir = scratch("folder-youth-order");
+    let album = dir.join("form");
+    std::fs::create_dir_all(&album).unwrap();
+    // Distinct pixel widths identify the two merged images on the page.
+    make_image(&album, "1.jpg", 60, 90);
+    make_image(&album, "2.jpg", 60, 90);
+    make_image(&album, "3.jpg", 62, 93);
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    let template = batch_template_by_key("youth-league-form").expect("preset");
+    req.options.apply_batch_template(template);
+    let outcome = run(ToolId::FolderToPdf, &req).expect("batch with the preset succeeds");
+    assert_eq!(outcome.outputs.len(), 1);
+
+    let doc = lopdf::Document::load(&outcome.outputs[0]).unwrap();
+    // Page 1 stays single; images 2 and 3 share page 2.
+    assert_eq!(doc.get_pages().len(), 2, "2-3 merged into one page");
+    let paired = doc.get_pages()[&2];
+
+    let draws = page_draws(&doc, paired);
+    assert_eq!(draws.len(), 2, "the merged page draws two images");
+    let (first_name, first_y) = &draws[0];
+    let (_, second_y) = &draws[1];
+    assert!(
+        first_y > second_y,
+        "the first image must be the upper slot: {first_y} vs {second_y}"
+    );
+    assert_eq!(
+        xobject_width(&doc, paired, first_name),
+        60,
+        "image 2 (60 px wide) owns the upper slot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn folder_batch_rejects_bad_merge_specs() {
     let dir = scratch("folder-spec");
@@ -1338,10 +1438,12 @@ fn id_card_template_prints_both_sides_at_real_size() {
             matrix[3]
         );
     }
-    // Centred pair, stacked: same x, one above the other.
+    // Centred pair, stacked: same column, front side on top. Slot order is
+    // image order, and the slot read first is the upper one — the assertion
+    // used to demand the opposite, contradicting its own message.
     assert!((matrices[0][4] - matrices[1][4]).abs() < 0.5, "aligned column");
     assert!(
-        matrices[1][5] - matrices[0][5] > 150.0,
+        matrices[0][5] - matrices[1][5] > 150.0,
         "front above back, got {:?}",
         matrices
     );
