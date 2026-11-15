@@ -58,8 +58,8 @@
 | `eframe` / `egui` 0.37 | 窗口与 immediate-mode UI |
 | `egui_dnd` 0.18 | 页面/文件拖拽排序 |
 | `rfd` 0.17 | 系统文件/文件夹选择对话框 |
-| `lopdf` 0.39 | PDF 对象模型、读写、加密 |
-| `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入 |
+| `lopdf` 0.42 | PDF 对象模型、读写、加密；0.42 起解析嵌套对象有上限（100 层），低于此版本的 `load*` 会因深嵌套栈溢出退出（GHSA-6fj4-rcr3-r7rr） |
+| `medpdf` 0.9.2 / `medpdf-image` 0.2.2（`[patch.crates-io]`，源码在 `vendor/`） | 文本度量、图片编解码与嵌入。官方包把 `lopdf` 锁在 `^0.39`，无法拿到 0.42 的修复，因此内置副本只改这一行依赖（详见 `vendor/README.md`），上游发版后整体撤掉 |
 | `kamadak-exif` 0.6 | JPEG 的 EXIF 方向读取 |
 | `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
 | `fast_image_resize` 6.1（std） | 图片重采样（AVX2 / NEON 运行时派发，Lanczos-3） |
@@ -84,6 +84,7 @@ SparrowPDF/
 ├── Cargo.lock            # 锁定依赖，发布构建使用 --locked
 ├── build.rs              # Windows 资源：app.ico + 应用清单（提权/长路径/DPI）
 ├── assets/               # 图标素材（icns / ico / png），不参与运行时解码逻辑
+├── vendor/               # 内置补丁依赖（medpdf / medpdf-image，仅改 lopdf 依赖行，见 vendor/README.md）
 ├── src/                  # 全部 Rust 源码（见 2.2）
 ├── tests/integration.rs  # 端到端集成测试（不启动 GUI，直接调 Tool）
 ├── README.md             # 面向用户的功能、下载与开发/贡献说明
@@ -297,7 +298,7 @@ cargo test --release --lib --test integration
 
 | 层级 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 集成测试 | `tests/integration.rs`（57 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号/合并页槽位顺序；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、重命名失败保留旧产物、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹、导出页写盘失败按页报告 |
+| 集成测试 | `tests/integration.rs`（58 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号/合并页槽位顺序；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、重命名失败保留旧产物、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹、导出页写盘失败按页报告、两万层嵌套 PDF 只报错不崩溃 |
 | 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
 
 规则：
