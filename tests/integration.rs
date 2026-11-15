@@ -2589,3 +2589,42 @@ fn pdf_to_image_reports_existing_page_files() {
     assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A page whose file cannot be written is reported on its own; the rest of the
+/// document still lands.
+///
+/// Writing moved onto the coordinating thread (the pool only rasterises now),
+/// so this is where a per-page write failure has to surface — with the page
+/// number, not as a failure of the whole document.
+#[test]
+fn pdf_to_image_reports_the_page_that_cannot_be_written() {
+    let dir = scratch("pdf2img-write-fail");
+    let src = make_pdf(&dir, "doc.pdf", 2, 0);
+    let out_dir = dir.join("images");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    // A directory squatting on the page-2 name makes that write fail.
+    std::fs::create_dir_all(out_dir.join("doc_p002.png")).unwrap();
+
+    let mut req = request(ToolId::PdfToImage, vec![src], out_dir.clone());
+    req.conflict = ConflictPolicy::Overwrite;
+    if let ToolOptions::PdfToImage { dpi, .. } = &mut req.options {
+        *dpi = 72;
+    }
+
+    match run(ToolId::PdfToImage, &req) {
+        Err(ToolError::PartialSuccess {
+            succeeded,
+            failed,
+            detail,
+            outputs,
+        }) => {
+            assert_eq!(succeeded, 1, "page 1 still exports");
+            assert_eq!(failed, 1, "page 2 is reported");
+            assert!(detail.contains("第 2 页"), "{detail}");
+            assert_eq!(outputs.len(), 1);
+            assert!(out_dir.join("doc_p001.png").is_file());
+        }
+        other => panic!("expected PartialSuccess, got {:?}", other.is_ok()),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

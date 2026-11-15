@@ -10,7 +10,7 @@
 //! rest of the batch.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use lopdf::{Document, ObjectId};
 
@@ -207,12 +207,19 @@ impl Tool for PdfToImage {
                 // document is still worth exporting.
                 pool::OnError::Continue,
                 |index| {
-                    let (page_num, page_id, out) = &jobs[index];
-                    render_and_save(&doc, *page_id, *page_num, dpi, format, &fonts, out, req)
+                    let (page_num, page_id, _) = &jobs[index];
+                    render_page_bytes(&doc, *page_id, *page_num, dpi, format, &fonts)
                 },
                 |index, result| {
                     let (page_num, _, out) = &jobs[index];
-                    match result {
+                    // The pool only computes; writing and verifying the
+                    // artifact happens here, on the coordinating thread, so no
+                    // worker touches the disk (AGENTS 3.6).
+                    let saved = result.and_then(|page| {
+                        pdf_io::write_file(out, &page.bytes, req.conflict)?;
+                        validate::assert_image(out, page.width, page.height)
+                    });
+                    match saved {
                         Ok(()) => outputs.push(out.clone()),
                         Err(err) => {
                             failed.push((format!("{name} 第 {page_num} 页"), err.to_string()))
@@ -273,17 +280,25 @@ impl Tool for PdfToImage {
 /// the encoded byte buffer.
 const RENDER_WORKER_BYTES: u64 = 192 * 1024 * 1024;
 
-/// Render one page, encode it and write it through the shared save path.
-fn render_and_save(
+/// One page's encoded artifact, ready to be written by the coordinator.
+///
+/// Rendering and encoding are pure: they read the document and the shared font
+/// set and return bytes, which is what keeps them safe to run on the pool.
+struct EncodedPage {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// Rasterise one page and encode it — no filesystem access.
+fn render_page_bytes(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
     dpi: u32,
     format: ImageFormat,
     fonts: &render::FontSet,
-    out: &Path,
-    req: &ToolRequest,
-) -> Result<(), ToolError> {
+) -> Result<EncodedPage, ToolError> {
     let pixmap = render::render_page(doc, page_id, dpi, fonts).map_err(|e| ToolError::Internal {
         detail: format!("第 {page_num} 页渲染失败：{e}"),
     })?;
@@ -295,8 +310,11 @@ fn render_and_save(
     .map_err(|e| ToolError::Internal {
         detail: format!("第 {page_num} 页编码失败：{e}"),
     })?;
-    pdf_io::write_file(out, &bytes, req.conflict)?;
-    validate::assert_image(out, width, height)
+    Ok(EncodedPage {
+        bytes,
+        width,
+        height,
+    })
 }
 
 /// Drop repeated inputs, keeping the first occurrence.
