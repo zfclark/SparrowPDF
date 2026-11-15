@@ -19,7 +19,11 @@ pub fn log(kind: &str, message: &str) {
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    let _ = writeln!(file, "{} [{}] {}", utc_now(), kind, message);
+    // One `write_all` per record: formatting straight into the file issues
+    // several writes, so a concurrent logger (the worker pool logs per folder)
+    // could split this line in two and interleave its own record inside it.
+    let line = format!("{} [{}] {}\n", utc_now(), kind, message);
+    let _ = file.write_all(line.as_bytes());
 }
 
 /// Where the log lives (also the path to give users for support requests).
