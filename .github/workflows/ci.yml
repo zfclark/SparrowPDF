@@ -51,6 +51,9 @@ jobs:
               with:
                   # 版本由分支名决定，勿写 with.toolchain（未声明输入，只会触发警告）。
                   targets: x86_64-pc-windows-msvc
+                  # 该 action 默认只装 minimal profile：不写 components 就没有 clippy，
+                  # `cargo clippy` 会直接以 exit 1 失败（而不是报「没有警告」）。
+                  components: clippy
 
             - name: 缓存依赖
               uses: actions/cache@v6
