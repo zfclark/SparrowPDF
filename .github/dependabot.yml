@@ -1,0 +1,32 @@
+# Dependabot 配置
+#
+# 为什么写 target-branch：仓库的开发线是 dev，main 只由发版 PR 推进。不写这一行，
+# Dependabot 会对默认分支 main 开 PR —— PR #2 就是这样撞的（在 main 上只升 lopdf，
+# 两个 lopdf 并存，质量门 E0308）。安全更新（alerts）也沿用这里的 target-branch。
+#
+# 为什么 ignore lopdf >= 0.43：vendor/medpdf 与 vendor/medpdf-image 声明 lopdf ^0.42
+# （见 vendor/README.md），0.43 起会编译失败。等上游发版、撤掉 vendor 补丁后删掉这条。
+#
+# medpdf / medpdf-image 故意不 ignore：上游一旦发布支持 lopdf 0.42 的版本，我们希望
+# 收到 PR。它会让 [patch.crates-io] 的 0.9.2 副本失效而质量门变红 —— 这正是提醒
+# 「该更新 vendor 或撤掉补丁了」。
+
+version: 2
+
+updates:
+    - package-ecosystem: cargo
+      directory: "/"
+      target-branch: dev
+      schedule:
+          interval: weekly
+      open-pull-requests-limit: 3
+      commit-message:
+          prefix: "chore(deps)"
+      # 补丁/次版本合成一个 PR，避免一周四个；主版本仍单独提，便于单独评估。
+      groups:
+          cargo-minor-patch:
+              patterns: ["*"]
+              update-types: [minor, patch]
+      ignore:
+          - dependency-name: lopdf
+            versions: [">=0.43"]
