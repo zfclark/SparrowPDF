@@ -82,6 +82,7 @@
 SparrowPDF/
 ├── Cargo.toml            # 包元数据、依赖、release profile（体积/性能开关）
 ├── Cargo.lock            # 锁定依赖，发布构建使用 --locked
+├── .cargo/audit.toml     # cargo audit 的例外登记（目前只有 lopdf 一条，见 1.2）
 ├── build.rs              # Windows 资源：app.ico + 应用清单（提权/长路径/DPI）
 ├── assets/               # 图标素材（icns / ico / png），不参与运行时解码逻辑
 ├── src/                  # 全部 Rust 源码（见 2.2）
@@ -313,8 +314,9 @@ cargo build --release --locked                        # 发布构建（CI 同款
 1. `cargo clippy --release --all-targets -- -D warnings` 零警告。clippy 同时做类型检查，
    所以它替代了原来的 `cargo check`；只想快速看能不能编译时仍可单跑 `cargo check`。
 2. `cargo test --release --lib --test integration` 全通过。
-3. 依赖漏洞：`cargo audit` 无告警（CI 每次必跑；本地在动过 `Cargo.toml` / `Cargo.lock`
-   时跑一次，新增告警按 5.8 处理或写清理由）。
+3. 依赖漏洞：`cargo audit` 无新增告警（CI 每次必跑；本地在动过 `Cargo.toml` / `Cargo.lock`
+   时跑一次，新增告警按 5.8 处理或写清理由）。已知例外只有 `.cargo/audit.toml` 里登记的
+   lopdf 那一条，原因见 1.2；登记新的例外必须在同一处写明为什么无法升级。
 4. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
 5. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
 6. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。

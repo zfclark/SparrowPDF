@@ -1,0 +1,12 @@
+# cargo-audit 配置（CI 与本地共用，路径必须是 .cargo/audit.toml）
+#
+# 只登记一条例外，其余保持默认（漏洞 → 失败，unmaintained → 仅告警）：
+#
+# RUSTSEC-2026-0187 / GHSA-6fj4-rcr3-r7rr（HIGH）：lopdf < 0.42 解析嵌套数组与字典
+# 没有递归上限，构造的 PDF 可让进程栈溢出退出。修复版是 0.42.0，但 medpdf 与
+# medpdf-image 都把依赖写成 lopdf ^0.39，本项目只能停在 0.39（见 AGENTS 1.2）。
+#
+# 上游放宽要求后：先升 medpdf / medpdf-image，再把 lopdf 提到 0.42+，然后删掉下面
+# 这行 ignore。
+[advisories]
+ignore = ["RUSTSEC-2026-0187"]
