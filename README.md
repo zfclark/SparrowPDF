@@ -91,10 +91,10 @@ SPARROW_AS_INVOKER=1 cargo build --release
 `C1083 无法打开 stddef.h`，说明当前终端缺 `INCLUDE` / `LIB`，改用 VS 开发者命令提示符。
 
 ```bash
-cargo run                                        # 开发期运行，改完即可看效果
-cargo check --release --all-targets              # 类型检查，含测试
-cargo test --release --lib --test integration    # 单元 + 集成测试
-cargo build --release --locked                   # 本地发布构建（与 CI 一致）
+cargo run                                                   # 开发期运行，改完即可看效果
+cargo clippy --release --all-targets -- -D warnings        # 类型检查 + 警告门（CI 同款）
+cargo test --release --lib --test integration               # 单元 + 集成测试
+cargo build --release --locked                              # 本地发布构建（与 CI 一致）
 ```
 
 `check` 与 `test` 一律带 `--release`：debug 构建会触发 `libz-sys` 的 `D8050`，渲染路径也慢到
@@ -105,12 +105,12 @@ cargo build --release --locked                   # 本地发布构建（与 CI �
 
 ### 贡献流程
 
-只有两条长期分支：`dev` 开发、`main` 发布，`main` 上的每个提交都对应一次发版。
+只有两条长期分支：`dev` 开发、`main` 发布；发版时把 `dev` 合并进 `main`，一次合并提交就是一个版本。
 
 ```bash
 git switch dev                          # 首次：git switch -c dev origin/dev
 
-# 改代码 → cargo check --release --all-targets → cargo test --release --lib --test integration
+# 改代码 → cargo clippy --release --all-targets -- -D warnings → cargo test --release --lib --test integration
 
 git commit -m "fix(merge): 合并时按用户拖拽结果写入页序"
 git push origin dev
@@ -119,9 +119,10 @@ git push origin dev
 - **提交信息**：Conventional Commits，标题与正文用中文，`type` 与 `scope` 用英文
   （`feat` / `fix` / `perf` / `refactor` / `docs` / `test` / `build` / `ci` / `chore` / `style`）。
   一次提交只做一件事，便于单条回滚。
-- **质量门**：提交前 `cargo check --release --all-targets` 无警告、
+- **质量门**：提交前 `cargo clippy --release --all-targets -- -D warnings` 零警告、
   `cargo test --release --lib --test integration` 全通过；改动涉及界面时附一次实际启动确认。
-  同一组检查会在 PR 上自动跑（状态检查「质量门（Windows）」），未通过不能合并。
+  同一组检查（外加 `cargo audit` 依赖漏洞扫描）会在 PR 与 `dev` 推送时自动跑（状态检查
+  「质量门（Windows）」），未通过不能合并。
 - **变更记录**：用户可见的行为变化在 `CHANGELOG.md` 的 `[Unreleased]` 下加一条；测试与文档改动
   不必。
 - **分支与权限**：没有写权限时先 fork，从 `dev` 切出改动并向本仓库的 `dev` 提 PR；有写权限直接
