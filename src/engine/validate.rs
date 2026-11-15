@@ -30,7 +30,11 @@ pub fn assert_page_count(
             path: path.to_path_buf(),
             detail: e.to_string(),
         })?;
-        let opened = lopdf::Document::load_mem_with_password(&bytes, pw).map_err(|e| {
+        let opened = lopdf::Document::load_mem_with_options(
+            &bytes,
+            lopdf::LoadOptions::with_password(pw),
+        )
+        .map_err(|e| {
             fail::<lopdf::Document>(path, format!("产物无法用校验密码打开：{e}"))
                 .err()
                 .unwrap()

@@ -21,7 +21,7 @@ eframe = { version = "0.37", default-features = false, features = ["glow", "defa
 egui = { version = "0.37", default-features = false }
 egui_dnd = "0.18"
 rfd = "0.17"
-lopdf = "0.39"
+lopdf = "0.42"
 medpdf = { version = "0.9.2", default-features = false }
 medpdf-image = { version = "0.2.2", default-features = false }
 kamadak-exif = "0.6"
@@ -44,6 +44,16 @@ jpeg-encoder = { version = "0.7.1", default-features = false, features = ["simd"
 [build-dependencies]
 # Embeds assets/app.ico into the Windows executable (taskbar / Explorer icon).
 winresource = "0.1"
+
+# medpdf / medpdf-image 0.9.2 / 0.2.2 pin `lopdf ^0.39`, which cannot satisfy the
+# 0.42+ requirement of GHSA-6fj4-rcr3-r7rr (unbounded recursion on nested PDF
+# objects -> stack-overflow abort). Upstream has no release that lifts the pin,
+# so both crates are vendored unchanged except for that one line; drop these two
+# entries and the `vendor/` directory as soon as medpdf ships a release built on
+# lopdf 0.42. See AGENTS 5.8 for the argument.
+[patch.crates-io]
+medpdf = { path = "vendor/medpdf" }
+medpdf-image = { path = "vendor/medpdf-image" }
 
 # Registry reads behind the About dialog (OS edition, CPU model). The crate is
 # already in the tree through winresource; only the registry feature is turned
