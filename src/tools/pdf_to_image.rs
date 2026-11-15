@@ -212,6 +212,9 @@ impl Tool for PdfToImage {
                 },
                 |index, result| {
                     let (page_num, _, out) = &jobs[index];
+                    // Cancelling must stop the writes too, not just the
+                    // rasterising: the remaining pages are not worth saving.
+                    check_cancel(cancel)?;
                     // The pool only computes; writing and verifying the
                     // artifact happens here, on the coordinating thread, so no
                     // worker touches the disk (AGENTS 3.6).
