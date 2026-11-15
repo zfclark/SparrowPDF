@@ -55,17 +55,39 @@ struct PagePolicy {
     budget: Option<ScanBudget>,
 }
 
+/// How one folder is laid out, exactly as the panel collects it.
+///
+/// Named fields instead of eight positional arguments: three of them are
+/// booleans/options and swapping two would still compile.
+#[derive(Debug, Clone, Copy)]
+struct LayoutSpec {
+    mode: BatchPageMode,
+    /// Orientation of single-image pages; `None` follows each image.
+    single_orientation: Option<Orientation>,
+    /// Orientation of pages holding two images.
+    pair_orientation: Orientation,
+    page_size: PageSize,
+    /// Fixed slot size for card-size copies; `None` halves the page.
+    slot_size: Option<(f32, f32)>,
+    /// Presets may ask for full-bleed single pages even in two-per-page mode.
+    inset_single_pages: bool,
+    auto_rotate: bool,
+    /// Storage budget for oversized scans (see `ScanQuality`).
+    budget: Option<ScanBudget>,
+}
+
 impl PagePolicy {
-    fn new(
-        mode: BatchPageMode,
-        force: Option<Orientation>,
-        pair_orientation: Orientation,
-        page_size: PageSize,
-        slot_size: Option<(f32, f32)>,
-        inset_single_pages: bool,
-        auto_rotate: bool,
-        budget: Option<ScanBudget>,
-    ) -> Self {
+    fn new(spec: LayoutSpec) -> Self {
+        let LayoutSpec {
+            mode,
+            single_orientation: force,
+            pair_orientation,
+            page_size,
+            slot_size,
+            inset_single_pages,
+            auto_rotate,
+            budget,
+        } = spec;
         match mode {
             BatchPageMode::Single => Self {
                 single_orientation: force,
@@ -388,16 +410,16 @@ impl Tool for FolderToPdf {
             );
 
             // Built once per folder, then reused by every page.
-            let policy = PagePolicy::new(
+            let policy = PagePolicy::new(LayoutSpec {
                 mode,
-                force,
+                single_orientation: force,
                 pair_orientation,
                 page_size,
                 slot_size,
                 inset_single_pages,
                 auto_rotate,
-                scan_quality.budget(),
-            );
+                budget: scan_quality.budget(),
+            });
             // A folder that fails to render (a corrupt image, a decoder bug)
             // must not discard the folders that do succeed: record, log and
             // continue, exactly like a failed write. Only a cancellation from
@@ -993,16 +1015,16 @@ mod tests {
 
     /// A4 portrait, one image per page — the layout a scan folder uses.
     fn scan_policy() -> PagePolicy {
-        PagePolicy::new(
-            BatchPageMode::Single,
-            Some(Orientation::Portrait),
-            Orientation::Portrait,
-            PageSize::A4,
-            None,
-            false,
-            true,
-            Some(ScanBudget::new(200.0, 85)),
-        )
+        PagePolicy::new(LayoutSpec {
+            mode: BatchPageMode::Single,
+            single_orientation: Some(Orientation::Portrait),
+            pair_orientation: Orientation::Portrait,
+            page_size: PageSize::A4,
+            slot_size: None,
+            inset_single_pages: false,
+            auto_rotate: true,
+            budget: Some(ScanBudget::new(200.0, 85)),
+        })
     }
 
     /// A noisy raster at ~290 DPI: downsampling is the only way to shrink it,
@@ -1020,16 +1042,16 @@ mod tests {
 
     /// Slot centres of a two-image page.
     fn pair_policy(orientation: Orientation, slot_size: Option<(f32, f32)>) -> PagePolicy {
-        PagePolicy::new(
-            BatchPageMode::TwoPerPage,
-            Some(orientation),
-            orientation,
-            PageSize::A4,
+        PagePolicy::new(LayoutSpec {
+            mode: BatchPageMode::TwoPerPage,
+            single_orientation: Some(orientation),
+            pair_orientation: orientation,
+            page_size: PageSize::A4,
             slot_size,
-            false,
-            true,
-            None,
-        )
+            inset_single_pages: false,
+            auto_rotate: true,
+            budget: None,
+        })
     }
 
     fn center(sheet: &Sheet) -> (f32, f32) {
