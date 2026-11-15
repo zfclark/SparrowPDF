@@ -124,14 +124,7 @@ pub fn save_document(
     policy: ConflictPolicy,
 ) -> Result<(), ToolError> {
     ensure_still_free(path, policy)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
-                path: parent.to_path_buf(),
-                detail: write_error_detail(&e),
-            })?;
-        }
-    }
+    create_parent(path)?;
 
     let tmp = temp_sibling(path);
     doc.save(&tmp).map_err(|e| {
@@ -143,21 +136,7 @@ pub fn save_document(
     })?;
 
     // `doc.save` wrote to the temp path; move it into place.
-    fs::rename(&tmp, path)
-        .or_else(|_| {
-            // Windows can refuse a cross-device rename or an existing target.
-            let _ = fs::remove_file(path);
-            fs::rename(&tmp, path)
-        })
-        .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            ToolError::WriteFailed {
-                path: path.to_path_buf(),
-                detail: write_error_detail(&e),
-            }
-        })?;
-
-    Ok(())
+    commit_temp(path, &tmp)
 }
 
 /// Serialise `doc` to memory.
@@ -183,14 +162,7 @@ pub fn write_file_atomic(
     policy: ConflictPolicy,
 ) -> Result<(), ToolError> {
     ensure_still_free(path, policy)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
-                path: parent.to_path_buf(),
-                detail: write_error_detail(&e),
-            })?;
-        }
-    }
+    create_parent(path)?;
 
     let tmp = temp_sibling(path);
     fs::write(&tmp, bytes).map_err(|e| {
@@ -201,21 +173,41 @@ pub fn write_file_atomic(
         }
     })?;
 
-    fs::rename(&tmp, path)
-        .or_else(|_| {
-            // Windows can refuse a cross-device rename or an existing target.
-            let _ = fs::remove_file(path);
-            fs::rename(&tmp, path)
-        })
-        .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            ToolError::WriteFailed {
-                path: path.to_path_buf(),
-                detail: write_error_detail(&e),
-            }
-        })?;
+    commit_temp(path, &tmp)
+}
 
-    Ok(())
+/// Create `path`'s parent directory when it is missing.
+fn create_parent(path: &Path) -> Result<(), ToolError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(parent).map_err(|e| ToolError::WriteFailed {
+        path: parent.to_path_buf(),
+        detail: write_error_detail(&e),
+    })
+}
+
+/// Move the finished temp file onto `path`.
+///
+/// `rename` replaces an existing target by itself (Unix `rename(2)`, Windows
+/// `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`), so "the target exists" is
+/// never the reason it fails. The common failure is transient: a virus scanner
+/// or the indexer still holds the temp file for a moment.
+///
+/// Deleting `path` and retrying — the old behaviour — turned exactly that case
+/// into data loss: the user's previous file was gone and the new one still did
+/// not arrive, which breaks the atomic-write contract in AGENTS 3.3.
+fn commit_temp(path: &Path, tmp: &Path) -> Result<(), ToolError> {
+    fs::rename(tmp, path).map_err(|e| {
+        let _ = fs::remove_file(tmp);
+        ToolError::WriteFailed {
+            path: path.to_path_buf(),
+            detail: write_error_detail(&e),
+        }
+    })
 }
 
 /// A temp path next to `path`, so the final rename stays on the same volume.
@@ -478,4 +470,81 @@ pub fn copy_pages(dest: &mut Document, source: &Document, pages: &[u32]) -> Resu
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        // `CARGO_TARGET_TMPDIR` is a compile-time value and is not defined for
+        // lib unit tests, so fall back to the workspace's own `target/tmp`.
+        let base = match option_env!("CARGO_TARGET_TMPDIR") {
+            Some(base) => PathBuf::from(base),
+            None => {
+                let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("tmp");
+                let _ = fs::create_dir_all(&base);
+                base
+            }
+        };
+        let dir = base.join(format!("sparrowpdf-pdfio-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// A failed rename must leave the existing output untouched.
+    ///
+    /// The removed fallback deleted the target first, so any transient rename
+    /// failure (a scanner holding the temp file) destroyed the user's file.
+    #[test]
+    fn failed_commit_keeps_the_existing_output() {
+        let dir = scratch("commit-fail");
+        let target = dir.join("report.pdf");
+        fs::write(&target, b"previous artifact").unwrap();
+
+        // Never created: the rename cannot succeed.
+        let missing_tmp = temp_sibling(&target);
+        let err = commit_temp(&target, &missing_tmp).expect_err("rename must fail");
+        assert!(matches!(err, ToolError::WriteFailed { .. }), "{err:?}");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"previous artifact",
+            "the file the user already had must survive"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The happy path still replaces the target and leaves no temp file.
+    #[test]
+    fn atomic_write_replaces_the_target_and_cleans_the_temp_file() {
+        let dir = scratch("commit-ok");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"old").unwrap();
+
+        write_file_atomic(&target, b"new", ConflictPolicy::Overwrite).expect("overwrite");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no .sparrowtmp may be left behind"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the fallback must not weaken the conflict re-check.
+    #[test]
+    fn atomic_write_refuses_an_existing_target_under_report() {
+        let dir = scratch("commit-report");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"old").unwrap();
+
+        let err = write_file_atomic(&target, b"new", ConflictPolicy::Report)
+            .expect_err("Report must refuse an existing file");
+        assert!(matches!(err, ToolError::OutputExists { .. }), "{err:?}");
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
