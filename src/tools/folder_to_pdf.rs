@@ -55,17 +55,39 @@ struct PagePolicy {
     budget: Option<ScanBudget>,
 }
 
+/// How one folder is laid out, exactly as the panel collects it.
+///
+/// Named fields instead of eight positional arguments: three of them are
+/// booleans/options and swapping two would still compile.
+#[derive(Debug, Clone, Copy)]
+struct LayoutSpec {
+    mode: BatchPageMode,
+    /// Orientation of single-image pages; `None` follows each image.
+    single_orientation: Option<Orientation>,
+    /// Orientation of pages holding two images.
+    pair_orientation: Orientation,
+    page_size: PageSize,
+    /// Fixed slot size for card-size copies; `None` halves the page.
+    slot_size: Option<(f32, f32)>,
+    /// Presets may ask for full-bleed single pages even in two-per-page mode.
+    inset_single_pages: bool,
+    auto_rotate: bool,
+    /// Storage budget for oversized scans (see `ScanQuality`).
+    budget: Option<ScanBudget>,
+}
+
 impl PagePolicy {
-    fn new(
-        mode: BatchPageMode,
-        force: Option<Orientation>,
-        pair_orientation: Orientation,
-        page_size: PageSize,
-        slot_size: Option<(f32, f32)>,
-        inset_single_pages: bool,
-        auto_rotate: bool,
-        budget: Option<ScanBudget>,
-    ) -> Self {
+    fn new(spec: LayoutSpec) -> Self {
+        let LayoutSpec {
+            mode,
+            single_orientation: force,
+            pair_orientation,
+            page_size,
+            slot_size,
+            inset_single_pages,
+            auto_rotate,
+            budget,
+        } = spec;
         match mode {
             BatchPageMode::Single => Self {
                 single_orientation: force,
@@ -146,10 +168,12 @@ impl PagePolicy {
     /// Sheets of a two-image page.
     ///
     /// Landscape pages hold the slots side by side (portrait slots); portrait
-    /// pages stack them vertically (landscape slots). `slot_size` switches to
-    /// card-size copies (身份证): both slots keep their real dimensions and the
-    /// pair is centred on the sheet, so the copy prints at 1:1 instead of being
-    /// blown up to half a page.
+    /// pages stack them vertically (landscape slots). Slot 0 is always the one
+    /// read first: left in a landscape page, **upper** in a portrait page —
+    /// see the comment on the stacked branch for why "upper" means "first".
+    /// `slot_size` switches to card-size copies (身份证): both slots keep their
+    /// real dimensions and the pair is centred on the sheet, so the copy prints
+    /// at 1:1 instead of being blown up to half a page.
     fn pair_sheets(&self) -> [Sheet; 2] {
         let (page_w, page_h) = self.page_size.page(self.pair_orientation);
         let (slot_w, slot_h, slots) = match self.slot_size {
@@ -160,10 +184,16 @@ impl PagePolicy {
                         let y = (page_h - h) / 2.0;
                         [(x, y), (x + w + SLOT_GAP, y)]
                     }
+                    // A landscape slot on a portrait page means the image is
+                    // drawn turned 90° clockwise, so the reader turns the sheet
+                    // back counter-clockwise — and that maps the *upper* slot
+                    // onto the left, the position read first. Stacking bottom-up
+                    // here put the second image first on every merged page
+                    // (入团志愿书 第 2、3 页 came out as 3, 2).
                     Orientation::Portrait => {
                         let x = (page_w - w) / 2.0;
                         let y = (page_h - (2.0 * h + SLOT_GAP)) / 2.0;
-                        [(x, y), (x, y + h + SLOT_GAP)]
+                        [(x, y + h + SLOT_GAP), (x, y)]
                     }
                 };
                 (w, h, slots)
@@ -183,6 +213,7 @@ impl PagePolicy {
                         ],
                     )
                 }
+                // Same rule as the card-size branch above: slot 0 on top.
                 Orientation::Portrait => {
                     let (w, h) = (
                         page_w - 2.0 * SLOT_MARGIN,
@@ -192,8 +223,8 @@ impl PagePolicy {
                         w,
                         h,
                         [
-                            (SLOT_MARGIN, SLOT_MARGIN),
                             (SLOT_MARGIN, SLOT_MARGIN + h + SLOT_GAP),
+                            (SLOT_MARGIN, SLOT_MARGIN),
                         ],
                     )
                 }
@@ -379,16 +410,16 @@ impl Tool for FolderToPdf {
             );
 
             // Built once per folder, then reused by every page.
-            let policy = PagePolicy::new(
+            let policy = PagePolicy::new(LayoutSpec {
                 mode,
-                force,
+                single_orientation: force,
                 pair_orientation,
                 page_size,
                 slot_size,
                 inset_single_pages,
                 auto_rotate,
-                scan_quality.budget(),
-            );
+                budget: scan_quality.budget(),
+            });
             // A folder that fails to render (a corrupt image, a decoder bug)
             // must not discard the folders that do succeed: record, log and
             // continue, exactly like a failed write. Only a cancellation from
@@ -984,16 +1015,16 @@ mod tests {
 
     /// A4 portrait, one image per page — the layout a scan folder uses.
     fn scan_policy() -> PagePolicy {
-        PagePolicy::new(
-            BatchPageMode::Single,
-            Some(Orientation::Portrait),
-            Orientation::Portrait,
-            PageSize::A4,
-            None,
-            false,
-            true,
-            Some(ScanBudget::new(200.0, 85)),
-        )
+        PagePolicy::new(LayoutSpec {
+            mode: BatchPageMode::Single,
+            single_orientation: Some(Orientation::Portrait),
+            pair_orientation: Orientation::Portrait,
+            page_size: PageSize::A4,
+            slot_size: None,
+            inset_single_pages: false,
+            auto_rotate: true,
+            budget: Some(ScanBudget::new(200.0, 85)),
+        })
     }
 
     /// A noisy raster at ~290 DPI: downsampling is the only way to shrink it,
@@ -1007,6 +1038,56 @@ mod tests {
         img.save_with_format(&path, image::ImageFormat::Png)
             .expect("write png fixture");
         path
+    }
+
+    /// Slot centres of a two-image page.
+    fn pair_policy(orientation: Orientation, slot_size: Option<(f32, f32)>) -> PagePolicy {
+        PagePolicy::new(LayoutSpec {
+            mode: BatchPageMode::TwoPerPage,
+            single_orientation: Some(orientation),
+            pair_orientation: orientation,
+            page_size: PageSize::A4,
+            slot_size,
+            inset_single_pages: false,
+            auto_rotate: true,
+            budget: None,
+        })
+    }
+
+    fn center(sheet: &Sheet) -> (f32, f32) {
+        match sheet {
+            Sheet::Fixed { center, .. } => *center,
+            Sheet::Follow { .. } => panic!("a two-image page always has fixed slots"),
+        }
+    }
+
+    /// Portrait pair pages stack the slots upper-first.
+    ///
+    /// The slots are landscape, so a portrait image is drawn turned 90°
+    /// clockwise and the reader turns the sheet back counter-clockwise — that
+    /// puts the upper slot on the left, the position read first. Stacking
+    /// bottom-up is what swapped the 入团志愿书's pages 2 and 3.
+    #[test]
+    fn portrait_pair_puts_the_first_image_in_the_upper_slot() {
+        for slot_size in [None, Some((242.65, 153.07))] {
+            let [first, second] = pair_policy(Orientation::Portrait, slot_size).pair_sheets();
+            let (x0, y0) = center(&first);
+            let (x1, y1) = center(&second);
+            assert!((x0 - x1).abs() < 0.01, "slots share one column: {x0} vs {x1}");
+            assert!(y0 > y1, "slot 0 must be the upper one: {y0} vs {y1}");
+        }
+    }
+
+    /// Landscape pair pages keep the usual left-to-right order.
+    #[test]
+    fn landscape_pair_puts_the_first_image_on_the_left() {
+        for slot_size in [None, Some((242.65, 153.07))] {
+            let [first, second] = pair_policy(Orientation::Landscape, slot_size).pair_sheets();
+            let (x0, y0) = center(&first);
+            let (x1, y1) = center(&second);
+            assert!((y0 - y1).abs() < 0.01, "slots share one row: {y0} vs {y1}");
+            assert!(x0 < x1, "slot 0 must be the left one: {x0} vs {x1}");
+        }
     }
 
     #[test]

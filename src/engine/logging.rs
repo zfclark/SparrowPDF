@@ -7,8 +7,17 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Serialises appends inside this process.
+///
+/// Append mode gives each `File` its own handle, so two threads writing one
+/// record each can still interleave on Windows. The lock covers opening and
+/// writing the whole line; a poisoned lock is recovered instead of dropping the
+/// record, because logging must never fail the caller.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Append one line to the app log. Best-effort by design.
 pub fn log(kind: &str, message: &str) {
@@ -16,10 +25,20 @@ pub fn log(kind: &str, message: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+    append_line(&path, &format!("{} [{}] {}\n", utc_now(), kind, message));
+}
+
+/// Append one already-formatted record to `path`.
+///
+/// One `write_all` per record: formatting straight into the file issues several
+/// writes, which a concurrent logger (the worker pool logs per folder) can split
+/// in two. The mutex keeps whole records from interleaving across threads.
+fn append_line(path: &Path, line: &str) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
-    let _ = writeln!(file, "{} [{}] {}", utc_now(), kind, message);
+    let _ = file.write_all(line.as_bytes());
 }
 
 /// Where the log lives (also the path to give users for support requests).
@@ -59,4 +78,59 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let base = match option_env!("CARGO_TARGET_TMPDIR") {
+            Some(base) => PathBuf::from(base),
+            None => {
+                let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("tmp");
+                let _ = std::fs::create_dir_all(&base);
+                base
+            }
+        };
+        let dir = base.join(format!("sparrowpdf-log-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// Concurrent appends must not split or interleave a record.
+    #[test]
+    fn concurrent_appends_keep_records_whole() {
+        let dir = scratch("parallel");
+        let path = Arc::new(dir.join("app.log"));
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    for index in 0..50 {
+                        append_line(&path, &format!("T{thread} #{index:02}\n"));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("writer thread");
+        }
+
+        let content = std::fs::read_to_string(path.as_path()).expect("read log");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 400, "every record is on its own line");
+        for line in lines {
+            let (thread, index) = line
+                .split_once(" #")
+                .unwrap_or_else(|| panic!("record was mangled: {line:?}"));
+            assert!(thread.starts_with('T') && thread.len() == 2, "thread tag: {line:?}");
+            assert!(index.len() == 2, "sequence number: {line:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

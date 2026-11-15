@@ -1,21 +1,24 @@
-# 轻雀 PDF PR 检查流水线
+# 轻雀 PDF 代码检查流水线
 #
 # 触发
 #   · pull_request 指向 main 或 dev：跑质量门，结果作为 PR 的状态检查。
-#   · 同一 PR 有新提交时取消上一次运行，不排队等旧结果。
+#   · push 到 dev：同一条门禁，防止「dev 直推后才发现编译不过」。
+#   · 同一 PR / 分支有新提交时取消上一次运行，不排队等旧结果。
 #   · 只做检查，不构建产物、不发 Release；发布由 release.yml 在 tag 上跑。
 #
 # 合并前置（仓库设置里一次性开启，见 AGENTS.md 4.6）
 #   Settings → Rules / Branches → Require status checks to pass before merging，
 #   勾选本文件的作业名「质量门（Windows）」。改作业名会让该设置失效。
 #
-# 维护约束见 AGENTS.md 4.4（质量门）与 4.6（PR 检查与合并前置）。
+# 维护约束见 AGENTS.md 4.4（质量门）与 4.6（代码检查与合并前置）。
 
-name: 🔍 PR 检查
+name: 🔍 代码检查
 
 on:
     pull_request:
         branches: [main, dev]
+    push:
+        branches: [dev]
     # 在分支上手动跑一次，用于排查「本地绿、CI 红」。
     workflow_dispatch:
 
@@ -48,6 +51,9 @@ jobs:
               with:
                   # 版本由分支名决定，勿写 with.toolchain（未声明输入，只会触发警告）。
                   targets: x86_64-pc-windows-msvc
+                  # 该 action 默认只装 minimal profile：不写 components 就没有 clippy，
+                  # `cargo clippy` 会直接以 exit 1 失败（而不是报「没有警告」）。
+                  components: clippy
 
             - name: 缓存依赖
               uses: actions/cache@v6
@@ -61,8 +67,21 @@ jobs:
                   key: ${{ runner.os }}-pr-cargo-release-${{ hashFiles('Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-pr-cargo-release-
 
-            - name: 🧭 类型检查（含测试）
-              run: cargo check --release --all-targets --locked
+            # clippy 同时完成类型检查，并把「未使用变量」这类警告升为错误，
+            # 因此不必再单独跑一次 cargo check（多一趟编译，收益为零）。
+            - name: 🧹 Clippy（类型检查 + 警告门）
+              run: cargo clippy --release --all-targets --locked -- -D warnings
+
+            # 依赖漏洞：lopdf 那次 HIGH 若有这一步，半年前就会红在 CI 里。
+            # 只对「漏洞」失败；uncategorized/unmaintained 类告警（如 paste、ttf-parser
+            # 已停止维护）只打印，不阻塞——它们没有可升级的目标版本。
+            - name: 安装 cargo-audit
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-audit
+
+            - name: 🛡️ 依赖漏洞扫描
+              run: cargo audit
 
             # --test-threads=1：多数用例共用同一个目标临时目录与日志文件，并发跑
             # 会偶发抢写（AGENTS.md 4.3）。串行只多花几秒，换来确定的结果。

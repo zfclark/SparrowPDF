@@ -58,8 +58,8 @@
 | `eframe` / `egui` 0.37 | 窗口与 immediate-mode UI |
 | `egui_dnd` 0.18 | 页面/文件拖拽排序 |
 | `rfd` 0.17 | 系统文件/文件夹选择对话框 |
-| `lopdf` 0.39 | PDF 对象模型、读写、加密 |
-| `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入 |
+| `lopdf` 0.39 | PDF 对象模型、读写、加密。**已知风险**：0.39 解析嵌套数组/字典没有递归上限，构造的 PDF 可让进程栈溢出退出（GHSA-6fj4-rcr3-r7rr，0.42.0 起修复）。上限由 `medpdf` 锁死（`lopdf ^0.39`），等上游放宽后一起升 |
+| `medpdf` 0.9.2 / `medpdf-image` 0.2.2 | 文本度量、图片编解码与嵌入。两者都声明 `lopdf ^0.39`，因此本项目的 `lopdf` 只能停在 0.39；**不要**单独升 `lopdf`（会出现两个版本并存、与 medpdf 类型不匹配而编译失败） |
 | `kamadak-exif` 0.6 | JPEG 的 EXIF 方向读取 |
 | `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
 | `fast_image_resize` 6.1（std） | 图片重采样（AVX2 / NEON 运行时派发，Lanczos-3） |
@@ -82,6 +82,7 @@
 SparrowPDF/
 ├── Cargo.toml            # 包元数据、依赖、release profile（体积/性能开关）
 ├── Cargo.lock            # 锁定依赖，发布构建使用 --locked
+├── .cargo/audit.toml     # cargo audit 的例外登记（目前只有 lopdf 一条，见 1.2）
 ├── build.rs              # Windows 资源：app.ico + 应用清单（提权/长路径/DPI）
 ├── assets/               # 图标素材（icns / ico / png），不参与运行时解码逻辑
 ├── src/                  # 全部 Rust 源码（见 2.2）
@@ -90,7 +91,8 @@ SparrowPDF/
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
 ├── docs/                 # 技术实现文档（分层、工具、渲染、界面），改代码前读对应主题
 └── .github/
-     ├── workflows/         # release.yml：tag 触发，产出双平台产物；ci.yml：PR 检查（4.6）
+     ├── workflows/         # release.yml：tag 触发，产出双平台产物；ci.yml：PR 与 dev 检查（4.6）
+     ├── dependabot.yml     # 依赖更新：打到 dev、收敛成组、lopdf 停在 0.39.x
      └── pull_request_template.md  # PR 模板，开 PR 时自动填充
 ```
 
@@ -252,7 +254,9 @@ CPU 密集的逐项工作统一走 `engine::pool`，两个工具共用一套调�
 1. **进池子的只有纯计算**：批量转换的图片准备（`prepare_image`）、PDF 转图片的页面
    栅格化。二者都不修改 `Document`、不写盘，因此可以乱序完成。
 2. **留在调用线程的一律串行**：文档对象增删、`resolve_outputs` 冲突解析、体积守卫的
-   序列化与落盘、结果汇总。它们要么依赖页序，要么共享可变状态，并发化只会换来竞态。
+   序列化与落盘、结果汇总，以及逐件产物的**写盘与 `validate::assert_*` 校验**（池任务只
+   返回字节与尺寸）。它们要么依赖页序，要么共享可变状态或触碰文件系统，并发化只会换来
+   竞态。
 3. **线程数按机器算**（`pool::worker_count`）：取「核数 − 1」「物理内存 / 3 ÷ 单任务
    峰值」「`MAX_WORKERS` = 8」三者的最小值；内存读不到时取上限而不是猜低值。单任务峰值
    由调用方声明（图片准备 400 MB，页面栅格化 192 MB），不要凭感觉改。
@@ -278,9 +282,10 @@ CPU 密集的逐项工作统一走 `engine::pool`，两个工具共用一套调�
 ### 4.1 常用命令
 
 ```bash
-cargo check --release --all-targets      # 快速类型检查（含测试）
-cargo build --release --locked           # 发布构建（CI 同款）
-cargo test --release --lib --test integration
+cargo clippy --release --all-targets -- -D warnings   # 质量门：类型检查 + 警告清零
+cargo test --release --lib --test integration         # 单元 + 集成测试
+cargo audit                                           # 依赖漏洞（动过依赖时跑）
+cargo build --release --locked                        # 发布构建（CI 同款）
 ```
 
 ### 4.2 Windows 构建环境要点
@@ -295,7 +300,7 @@ cargo test --release --lib --test integration
 
 | 层级 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 集成测试 | `tests/integration.rs`（54 个用例） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹 |
+| 集成测试 | `tests/integration.rs`（用例数随代码增长，不在此处记数字） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号/合并页槽位顺序；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、重命名失败保留旧产物、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹、导出页写盘失败按页报告 |
 | 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
 
 规则：
@@ -306,12 +311,16 @@ cargo test --release --lib --test integration
 
 ### 4.4 提交前质量门（必须全绿）
 
-1. `cargo check --release --all-targets` 无警告（`warning: unused` 视为失败）。
+1. `cargo clippy --release --all-targets -- -D warnings` 零警告。clippy 同时做类型检查，
+   所以它替代了原来的 `cargo check`；只想快速看能不能编译时仍可单跑 `cargo check`。
 2. `cargo test --release --lib --test integration` 全通过。
-3. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
-4. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
-5. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
-6. PR 上「质量门（Windows）」状态检查必须通过才可合并（4.6）；本地绿而 CI 红时按 CI 日志修，不得绕过检查合并。
+3. 依赖漏洞：`cargo audit` 无新增告警（CI 每次必跑；本地在动过 `Cargo.toml` / `Cargo.lock`
+   时跑一次，新增告警按 5.8 处理或写清理由）。已知例外只有 `.cargo/audit.toml` 里登记的
+   lopdf 那一条，原因见 1.2；登记新的例外必须在同一处写明为什么无法升级。
+4. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
+5. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
+6. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
+7. PR 上「质量门（Windows）」状态检查必须通过才可合并（4.6）；本地绿而 CI 红时按 CI 日志修，不得绕过检查合并。
 
 ### 4.5 发布流水线（`.github/workflows/release.yml`）
 
@@ -357,18 +366,21 @@ cargo test --release --lib --test integration
 - 并发 20 作业、单作业 6 小时、矩阵 256 作业、缓存 10 GB；本流水线最多 5 个作业、每个 ≤60 分钟。
 - 公开仓库的标准 runner 不计费；macOS runner 排队无优先级，排队超时被取消时用 Re-run failed jobs。
 
-### 4.6 PR 检查与合并前置（`.github/workflows/ci.yml`）
+### 4.6 代码检查与合并前置（`.github/workflows/ci.yml`）
 
 **触发与范围**
 
-- `pull_request` 指向 `main` 或 `dev` 时运行；同一 PR 的新提交会取消上一次运行（`concurrency`
-  按 PR 号分组），不排队等过期结果。另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+- `pull_request` 指向 `main` 或 `dev` 时运行；`push` 到 `dev` 也运行同一条门禁，避免
+  「直推后才发现编译不过」。同一 PR / 分支的新提交会取消上一次运行（`concurrency`
+  按 PR 号或 ref 分组），不排队等过期结果。另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
 - 只做检查，不构建产物、不发 Release；产物由 `release.yml` 在 tag 上构建。
 
 **作业与步骤**
 
-- 单作业「质量门（Windows）」，内容即 4.4 的第 1、2 条：`cargo check --release --all-targets --locked`
-  与 `cargo test --release --lib --test integration --locked -- --test-threads=1`。
+- 单作业「质量门（Windows）」，内容即 4.4 的第 1~3 条：
+  `cargo clippy --release --all-targets --locked -- -D warnings`（含类型检查与警告门）、
+  `cargo audit`（`taiki-e/install-action` 装预编译二进制，不现场编译），以及
+  `cargo test --release --lib --test integration --locked -- --test-threads=1`。
 - 测试串行的原因：多数用例共用目标临时目录与同一个日志文件，并发跑会偶发抢写（见 4.3），
   串行只多花几秒。
 - 缓存键 `runner.os + pr-cargo-release + hash(Cargo.lock)`，与发布流水线的键分开，互不覆盖。
@@ -385,7 +397,7 @@ cargo test --release --lib --test integration
 
 **已知边界**
 
-- 不设 `cargo fmt --check` 门禁：仓库尚未全量 rustfmt 干净（当前 12 个文件、46 处），开启会立刻
+- 不设 `cargo fmt --check` 门禁：仓库尚未全量 rustfmt 干净（当前 14 个文件、50 处），开启会立刻
   全红；等一次性 `style` 提交整理干净后再作为独立检查加入，先加先红没有意义。
 - 只跑 Windows：产品主战场是 Windows，macOS 由发布流水线在真实产物上验证。若要覆盖 macOS，新增
   `os` 矩阵后检查名会变成两个，分支保护需一并勾选。
@@ -525,7 +537,6 @@ git push origin dev
 # ② 合并后本地取回，并在合并提交上打 tag
 git switch main && git pull --ff-only
 git tag -a V0.6.1.20261120 -m "<该版本变更摘要>"
-git push origin main
 git push origin V0.6.1.20261120
 git switch dev && git merge --ff-only main
 ```
@@ -559,7 +570,7 @@ git switch dev && git merge --ff-only main
 - 动作：切到 `dev` → 读上下文（第 0 节）→ 实现 → 自测 → 按第 6 节提交。
 - 约束：不得改 `Cargo.toml` / `src/version.rs` 的版本号，也不得改 `CHANGELOG.md` 的版本标题——版本号只在发版提交里动（8.3）。日常提交只往 `[Unreleased]` 追加条目。
 - 交付物：可编译的 `dev` 状态、原子提交序列、变更说明（改了什么、为什么、影响哪些模块）。
-- 准出：`cargo check --release --all-targets` 无警告；本地可运行。
+- 准出：`cargo clippy --release --all-targets -- -D warnings` 零警告，集成测试通过；本地可运行。
 
 **3）测试**
 
@@ -729,8 +740,9 @@ git switch dev && git merge --ff-only main
 
 ```bash
 # 质量门
-cargo check --release --all-targets
+cargo clippy --release --all-targets -- -D warnings
 cargo test --release --lib --test integration
+cargo audit
 
 # 分支（只有 main / dev 两条，日常在 dev，main 只经 PR 合并）
 git fetch origin
