@@ -1595,47 +1595,60 @@ fn ccitt_gray(
         } else if k == 0 {
             EncodingMode::Group3_1D
         } else {
-            EncodingMode::Group3_2D { k: k as u32 }
+            // hayro-ccitt 0.5 dropped the `k` payload: the two-dimensional mode
+            // is selected by `/K > 0` alone, the value is not a decoder setting.
+            EncodingMode::Group3_2D
         },
-        // Deliberately *not* driven by `/BlackIs1`: that flag describes how the
-        // producer packed the samples, while the fax runs already carry the
-        // visual colour. This adapter emits a luminance raster (0 = dark), so
-        // fax-black is dark whichever way the samples were packed.
-        invert_black: false,
+        // Lenient, as in hayro-ccitt 0.4: a scan that violates the spec is still
+        // worth showing. Strict mode would reject the whole page over one bad
+        // code, and the rows before the damage are correct.
+        strict: false,
     };
 
-    struct Gray {
-        out: Vec<u8>,
-        index: usize,
+    // `push_row` hands over change positions instead of pixels: the row starts
+    // white and every even-indexed change opens a black run (T.4 §4.1.1). The
+    // buffer is pre-filled white, so only black runs need painting — and a
+    // coarse fax thereby costs one fill per run instead of one call per pixel.
+    struct Gray<'a> {
+        out: &'a mut [u8],
+        width: usize,
         rows: u32,
     }
-    impl Decoder for Gray {
-        fn push_pixels(&mut self, white: bool, count: u32) {
-            let end = (self.index + count as usize).min(self.out.len());
-            if !white {
-                self.out[self.index..end].fill(0);
+    impl Decoder for Gray<'_> {
+        fn push_row(&mut self, changes: &[u32]) {
+            let base = self.rows as usize * self.width;
+            if base + self.width > self.out.len() {
+                return;
             }
-            self.index = end;
-        }
-        fn next_line(&mut self) {
+            for pair in changes.chunks(2) {
+                let start = pair[0] as usize;
+                let end = pair.get(1).map_or(self.width, |c| *c as usize).min(self.width);
+                if start < end {
+                    self.out[base + start..base + end].fill(0);
+                }
+            }
             self.rows += 1;
         }
     }
 
     let total = settings.columns as usize * settings.rows as usize;
-    let mut decoder = Gray {
-        out: vec![0xFF; total],
-        index: 0,
-        rows: 0,
+    let mut out = vec![0xFF; total];
+    let (result, rows) = {
+        let mut decoder = Gray {
+            out: &mut out,
+            width: settings.columns as usize,
+            rows: 0,
+        };
+        let mut context = DecoderContext::new(settings);
+        let result = hayro_ccitt::decode(payload, &mut decoder, &mut context);
+        (result, decoder.rows)
     };
-    let mut context = DecoderContext::new(settings);
-    let result = hayro_ccitt::decode(payload, &mut decoder, &mut context);
     // Partial data is still worth showing: a truncated fax is a page, not an
     // error message, and the rows before the truncation are correct.
-    if result.is_err() && decoder.rows == 0 {
+    if result.is_err() && rows == 0 {
         return None;
     }
-    Some((decoder.out, settings.columns, settings.rows))
+    Some((out, settings.columns, settings.rows))
 }
 
 /// Decode a JBIG2 stream (with optional shared globals) into a raster.
@@ -1652,8 +1665,15 @@ fn jbig2_gray(
         .and_then(|o| o.as_stream().ok())
         .and_then(decoded_stream_content);
 
-    let image = hayro_jbig2::Image::new_embedded(payload, globals.as_deref()).ok()?;
-    let (width, height) = (image.width(), image.height());
+    // hayro-jbig2 0.4 replaced `Image` with `Page` + `Globals`: the shared
+    // dictionaries are decoded once and handed to the page, instead of being
+    // re-parsed for every embedded image of the same document.
+    let settings = hayro_jbig2::DecodeSettings::default();
+    let globals = globals
+        .as_deref()
+        .and_then(|data| hayro_jbig2::Globals::new(data, &settings).ok());
+    let page = hayro_jbig2::Page::new_embedded(payload, globals.as_ref(), &settings).ok()?;
+    let (width, height) = (page.width(), page.height());
     if width == 0 || height == 0 || width > 20_000 || height > 20_000 {
         return None;
     }
@@ -1684,7 +1704,7 @@ fn jbig2_gray(
         out: vec![0xFF; width as usize * height as usize],
         index: 0,
     };
-    image.decode(&mut decoder).ok()?;
+    page.decode(&mut decoder).ok()?;
     Some((decoder.out, width, height))
 }
 
