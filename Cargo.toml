@@ -20,7 +20,7 @@ path = "src/main.rs"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 egui = { version = "0.37", default-features = false }
 egui_dnd = "0.18"
-rfd = "0.17"
+rfd = "0.18"
 lopdf = "0.39"
 medpdf = { version = "0.9.2", default-features = false }
 medpdf-image = { version = "0.2.2", default-features = false }
