@@ -36,7 +36,9 @@ weezl = "0.2"
 # zlib decode for /FlateDecode; already in the tree via `image`, declared
 # explicitly because the rasterizer calls it directly.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-hayro-ccitt = "0.4"
+hayro-ccitt = "0.5"
+# hayro-jbig2 0.4 depends on hayro-ccitt 0.5, so the two must be bumped together:
+# leaving this one on 0.4 puts two copies of the fax decoder in the binary.
 hayro-jbig2 = { version = "0.4", default-features = false, features = ["std"] }
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 jpeg-encoder = { version = "0.7.1", default-features = false, features = ["simd"] }
