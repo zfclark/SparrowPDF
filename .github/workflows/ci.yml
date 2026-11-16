@@ -35,9 +35,13 @@ permissions:
     contents: read
 
 concurrency:
-    # 按提交分组而不是按 PR 号：dev 直推与指向同一提交的发版 PR 是同一份代码，
-    # 分两个组会白跑两遍；同组内后到的取消先到的，最终只留一次结果。
-    group: pr-check-${{ github.event.pull_request.head.sha || github.sha }}
+    # 按 PR 号 / 分支分组：同一 PR 的新提交取消旧提交的运行，同一分支的直推同理。
+    #
+    # 试过按提交 SHA 分组，想让「dev 直推」与「指向同一提交的发版 PR」共用一次运行。
+    # 不要这样改：后到的运行会取消同组的另一个，被取消的检查运行会留在同一个提交上，
+    # GitHub 把它计入 statusCheckRollup 并判为 FAILURE，于是 main 的必需检查一直是红的，
+    # 发版 PR 无法合并（PR #7 实测）。宁可多跑一次，也不要一个被取消的兄弟运行。
+    group: pr-check-${{ github.event.pull_request.number || github.ref }}
     cancel-in-progress: true
 
 env:

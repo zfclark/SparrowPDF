@@ -374,9 +374,11 @@ cargo build --release --locked                        # 发布构建（CI 同款
 **触发与范围**
 
 - `pull_request` 指向 `main` 或 `dev` 时运行；`push` 到 `dev` 也运行同一条门禁，避免
-  「直推后才发现编译不过」。同一提交的两次运行合并成一次：`concurrency` 按**提交 SHA**
-  分组（不是 PR 号），`dev` 直推与指向同一提交的发版 PR 因此只跑一遍，后到的取消先到的。
-  另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+  「直推后才发现编译不过」。`concurrency` 按 **PR 号 / 分支** 分组，同一 PR 的新提交取消
+  旧提交的运行；另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+  **不要改成按提交 SHA 分组**去省掉「dev 直推 + 发版 PR」的重复运行：后到的运行取消
+  同组另一个，被取消的检查运行留在同一提交上，GitHub 计入 `statusCheckRollup` 后判为
+  FAILURE，`main` 的必需检查从此是红的，发版 PR 再也合不进去（PR #7 实测，2026-11-16）。
 - `push` 侧设 `paths-ignore`：纯文档（`*.md`、`docs/**`、`LICENSE`）与依赖调度配置的提交
   不改变二进制，不重跑质量门。**`pull_request` 侧不设**——跳过会让必需检查永远不出现，
   反而把发版 PR 卡死。
