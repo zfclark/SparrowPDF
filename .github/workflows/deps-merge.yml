@@ -1,0 +1,87 @@
+# 依赖更新 PR 的分流与合并衔接
+#
+# 只处理 Dependabot 开的 PR：job 级 if 让其他 PR 一步都不跑，不占 runner、不出噪音。
+#
+# 分级依据是 dependabot/fetch-metadata 给出的 update-type：
+#   · patch          → 打 deps:auto，开启自动合并；「质量门（Windows）」一变绿，
+#                      GitHub 自己合，人不用守着 PR。
+#   · minor / major  → 打 deps:review，只在首次打开时留一条评审清单，不自动合并。
+#                      0.x 的「次版本」按语义化版本就是破坏性变更（hayro-jbig2
+#                      0.3 → 0.4 删掉了 Image，PR #6 第一次 CI 就是这么红的），
+#                      必须人工看一眼。
+#
+# 为什么用 merge commit：与 AGENTS.md 6.6 一致，PR 边界留在历史里，依赖更新可以整体
+# 回滚，`git log --first-parent` 也还能读。不要改成 squash。
+#
+# 前置条件（仓库设置，一次性）：Settings → General 勾选 Allow auto-merge。
+# 判据、冲突处理与例外登记的完整流程见 AGENTS.md 4.7。
+
+name: 🤖 依赖更新处置
+
+on:
+    pull_request:
+        # 不监听 labeled：本工作流自己要改标签，监听就会自激。
+        types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+    contents: write
+    pull-requests: write
+
+concurrency:
+    group: deps-merge-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+jobs:
+    triage:
+        name: 分流与合并
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: 读取更新类型
+              id: meta
+              uses: dependabot/fetch-metadata@v3
+              with:
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+
+            # 补丁版本（如 0.7.1 → 0.7.2）不改变 API，质量门绿了就是安全信号，
+            # 交给 GitHub 在检查通过后自动合并，省掉一次人工往返。
+            - name: 🔁 补丁版本：开启自动合并
+              if: steps.meta.outputs.update-type == 'version-update:semver-patch'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PR: ${{ github.event.pull_request.number }}
+              run: |
+                  set -euo pipefail
+                  gh pr edit "$PR" --add-label "deps:auto"
+                  gh pr edit "$PR" --remove-label "deps:review" 2>/dev/null || true
+                  gh pr merge "$PR" --auto --merge
+                  echo "已开启自动合并：质量门通过后由 GitHub 合并 $PR。"
+
+            # 次版本 / 主版本一律人工确认；清单只留一次，避免每次同步提交刷屏。
+            - name: 🧐 次版本与主版本：转人工评审
+              if: steps.meta.outputs.update-type != 'version-update:semver-patch'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PR: ${{ github.event.pull_request.number }}
+                  ACTION: ${{ github.event.action }}
+              run: |
+                  set -euo pipefail
+                  gh pr edit "$PR" --add-label "deps:review"
+                  gh pr edit "$PR" --remove-label "deps:auto" 2>/dev/null || true
+                  if [ "$ACTION" = "opened" ]; then
+                      gh pr comment "$PR" --body-file - <<'BODY'
+                  这条依赖更新不是补丁版本，因此没有开启自动合并。
+
+                  0.x 的次版本按语义化版本就是破坏性变更（hayro-jbig2 0.3 → 0.4 删掉了
+                  `Image`，hayro-ccitt 0.5 改掉了 `Decoder` 接口，PR #6 第一次 CI 变红就是
+                  这个原因）。合并前请确认：
+
+                  - [ ] 上游 CHANGELOG 有无 breaking change，是否影响 `src/engine/render.rs` 的解码路径
+                  - [ ] 动过编解码或 PDF 核心（`hayro-*`、`lopdf`、`medpdf*`、`image`）时，集成测试已跑过
+                  - [ ] 直接依赖没有出现同一 crate 的第二个版本（质量门的「直接依赖版本唯一性」已覆盖）
+                  - [ ] 合并方式选 Create a merge commit，不要 squash
+
+                  处理完成后照常点 Merge；检查未绿时合并按钮本来就是灰的，不必也不要用管理员权限绕过。
+                  BODY
+                  fi
