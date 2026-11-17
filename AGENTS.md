@@ -67,7 +67,7 @@
 | `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
 | `weezl` 0.2 | LZW 解码（图像 `/LZWDecode`） |
 | `hayro-ccitt` 0.5 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`）。**与 `hayro-jbig2` 同批升级**：jbig2 0.4 自身依赖 ccitt 0.5，两者错开会在锁文件里留下两份传真解码器（CI 的「直接依赖版本唯一性」会拦下）；0.5 的解码回调整行交给 `push_row`，不再逐像素 |
-| `hayro-jbig2` 0.4（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段。0.4 起入口是 `Page` + `Globals`（原先的 `Image` 已移除），全局段解码一次后可在同文档的多个图之间复用 |
+| `hayro-jbig2` 0.4（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段。0.4 起入口是 `Page` + `Globals`（原先的 `Image` 已移除）。**已知风险**：`Globals::new` 会立即展开全部图案字典，展开量与页面尺寸无关，构造的字典可让小输入吃满内存（CWE-400）。上游没有累计展开上限，本项目在 `render.rs` 用 `MAX_GLOBALS`（4 MiB）拒绝超大的共享字典，代价是该图被跳过；等上游提供计量接口再换成真正的限额 |
 | `flate2` 1（rust_backend） | zlib 解压（图像 `/FlateDecode` 与预测器流水线） |
 | `windows-sys` 0.61（registry / system-information 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号，线程池读取物理内存；同版本已在依赖树中（`winresource` 带入），只开这两组 API |
 | `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |

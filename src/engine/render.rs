@@ -1665,18 +1665,32 @@ fn jbig2_gray(
         .and_then(|o| o.as_stream().ok())
         .and_then(decoded_stream_content);
 
-    // hayro-jbig2 0.4 replaced `Image` with `Page` + `Globals`: the shared
-    // dictionaries are decoded once and handed to the page, instead of being
-    // re-parsed for every embedded image of the same document.
+    // hayro-jbig2 0.4 replaced `Image` with `Page` + `Globals`. The new API makes
+    // the two phases visible: `Globals::new` expands every pattern dictionary up
+    // front, while the page is the part we can bound by size.
     let settings = hayro_jbig2::DecodeSettings::default();
-    let globals = globals
-        .as_deref()
-        .and_then(|data| hayro_jbig2::Globals::new(data, &settings).ok());
-    let page = hayro_jbig2::Page::new_embedded(payload, globals.as_ref(), &settings).ok()?;
-    let (width, height) = (page.width(), page.height());
+
+    // Parse the page before touching globals: a page whose dimensions are already
+    // out of range is rejected without paying for the dictionary expansion.
+    let probe = hayro_jbig2::Page::new_embedded(payload, None, &settings).ok()?;
+    let (width, height) = (probe.width(), probe.height());
+    drop(probe);
     if width == 0 || height == 0 || width > 20_000 || height > 20_000 {
         return None;
     }
+
+    // `Globals::new` decodes all pattern dictionaries eagerly, and that expansion
+    // does not depend on the page size: a crafted stream can pull hundreds of MiB
+    // out of a few kilobytes (CWE-400). A real scan's globals stream is a few
+    // hundred KiB, so refuse anything oversized and let the page fail as a skipped
+    // image instead of exhausting memory. Bounding the expansion itself would need
+    // accounting inside the crate; recorded in AGENTS 1.2.
+    const MAX_GLOBALS: usize = 4 * 1024 * 1024;
+    let globals = globals
+        .as_deref()
+        .filter(|data| data.len() <= MAX_GLOBALS)
+        .and_then(|data| hayro_jbig2::Globals::new(data, &settings).ok());
+    let page = hayro_jbig2::Page::new_embedded(payload, globals.as_ref(), &settings).ok()?;
 
     struct Gray {
         out: Vec<u8>,
