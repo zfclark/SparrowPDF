@@ -1686,10 +1686,14 @@ fn jbig2_gray(
     // image instead of exhausting memory. Bounding the expansion itself would need
     // accounting inside the crate; recorded in AGENTS 1.2.
     const MAX_GLOBALS: usize = 4 * 1024 * 1024;
-    let globals = globals
-        .as_deref()
-        .filter(|data| data.len() <= MAX_GLOBALS)
-        .and_then(|data| hayro_jbig2::Globals::new(data, &settings).ok());
+    let globals = match globals.as_deref() {
+        None => None,
+        Some(data) if data.len() <= MAX_GLOBALS => hayro_jbig2::Globals::new(data, &settings).ok(),
+        // Dictionaries were supplied but are too large to expand. Dropping them and
+        // decoding anyway would paint whatever the missing symbols leave behind, so
+        // skip the image instead of showing a wrong one.
+        Some(_) => return None,
+    };
     let page = hayro_jbig2::Page::new_embedded(payload, globals.as_ref(), &settings).ok()?;
 
     struct Gray {
