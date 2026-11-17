@@ -66,8 +66,8 @@
 | `jpeg-encoder` 0.7（simd） | JPEG 编码（4:4:4、优化霍夫曼表；熵编码源自 IJG） |
 | `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
 | `weezl` 0.2 | LZW 解码（图像 `/LZWDecode`） |
-| `hayro-ccitt` 0.4 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`） |
-| `hayro-jbig2` 0.3（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段 |
+| `hayro-ccitt` 0.5 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`）。**与 `hayro-jbig2` 同批升级**：jbig2 0.4 自身依赖 ccitt 0.5，两者错开会在锁文件里留下两份传真解码器（CI 的「直接依赖版本唯一性」会拦下）；0.5 的解码回调整行交给 `push_row`，不再逐像素 |
+| `hayro-jbig2` 0.4（std） | JBIG2 解码（`/JBIG2Decode`），含共享全局段。0.4 起入口是 `Page` + `Globals`（原先的 `Image` 已移除）。**已知风险**：`Globals::new` 会立即展开全部图案字典，展开量与页面尺寸无关，构造的字典可让小输入吃满内存（CWE-400）。上游没有累计展开上限，本项目在 `render.rs` 用 `MAX_GLOBALS`（4 MiB）拒绝超大的共享字典，代价是该图被跳过；等上游提供计量接口再换成真正的限额 |
 | `flate2` 1（rust_backend） | zlib 解压（图像 `/FlateDecode` 与预测器流水线） |
 | `windows-sys` 0.61（registry / system-information 特性，仅 Windows） | 「关于」读取系统版本与 CPU 型号，线程池读取物理内存；同版本已在依赖树中（`winresource` 带入），只开这两组 API |
 | `winresource` 0.1（build-dep） | 向 Windows exe 注入图标与清单 |
@@ -91,8 +91,9 @@ SparrowPDF/
 ├── AGENTS.md             # 本文件：面向协作者的工程规范
 ├── docs/                 # 技术实现文档（分层、工具、渲染、界面），改代码前读对应主题
 └── .github/
-     ├── workflows/         # release.yml：tag 触发，产出双平台产物；ci.yml：PR 与 dev 检查（4.6）
-     ├── dependabot.yml     # 依赖更新：打到 dev、收敛成组、lopdf 停在 0.39.x
+     ├── workflows/         # release.yml：tag 触发，产出双平台产物；ci.yml：PR 与 dev 检查（4.6）；
+     │                      # deps-merge.yml：依赖 PR 分流与自动合并（4.7）
+     ├── dependabot.yml     # 依赖更新：打到 dev、hayro 家族并组、lopdf 停在 0.39.x（4.7）
      └── pull_request_template.md  # PR 模板，开 PR 时自动填充
 ```
 
@@ -317,6 +318,8 @@ cargo build --release --locked                        # 发布构建（CI 同款
 3. 依赖漏洞：`cargo audit` 无新增告警（CI 每次必跑；本地在动过 `Cargo.toml` / `Cargo.lock`
    时跑一次，新增告警按 5.8 处理或写清理由）。已知例外只有 `.cargo/audit.toml` 里登记的
    lopdf 那一条，原因见 1.2；登记新的例外必须在同一处写明为什么无法升级。
+   动过依赖时再看一眼 `cargo tree -d`：**直接依赖**不得出现同一 crate 的两个版本
+   （CI 同款门禁，判据与例外登记见 4.7）。
 4. 若改动涉及 UI：至少一次实际启动（`cargo build --release` 后运行）确认无渲染异常、无布局裁切。
 5. 若改动版本号：`Cargo.toml` 与 `Cargo.lock` 同步，且与将要打的 tag 一致。
 6. 若改动发布流水线：说明验证方式（无 actionlint 时至少核对结构与关键参数）。
@@ -371,8 +374,14 @@ cargo build --release --locked                        # 发布构建（CI 同款
 **触发与范围**
 
 - `pull_request` 指向 `main` 或 `dev` 时运行；`push` 到 `dev` 也运行同一条门禁，避免
-  「直推后才发现编译不过」。同一 PR / 分支的新提交会取消上一次运行（`concurrency`
-  按 PR 号或 ref 分组），不排队等过期结果。另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+  「直推后才发现编译不过」。`concurrency` 按 **PR 号 / 分支** 分组，同一 PR 的新提交取消
+  旧提交的运行；另留 `workflow_dispatch` 供排查「本地绿、CI 红」。
+  **不要改成按提交 SHA 分组**去省掉「dev 直推 + 发版 PR」的重复运行：后到的运行取消
+  同组另一个，被取消的检查运行留在同一提交上，GitHub 计入 `statusCheckRollup` 后判为
+  FAILURE，`main` 的必需检查从此是红的，发版 PR 再也合不进去（PR #7 实测，2026-11-16）。
+- `push` 侧设 `paths-ignore`：纯文档（`*.md`、`docs/**`、`LICENSE`）与依赖调度配置的提交
+  不改变二进制，不重跑质量门。**`pull_request` 侧不设**——跳过会让必需检查永远不出现，
+  反而把发版 PR 卡死。
 - 只做检查，不构建产物、不发 Release；产物由 `release.yml` 在 tag 上构建。
 
 **作业与步骤**
@@ -381,6 +390,10 @@ cargo build --release --locked                        # 发布构建（CI 同款
   `cargo clippy --release --all-targets --locked -- -D warnings`（含类型检查与警告门）、
   `cargo audit`（`taiki-e/install-action` 装预编译二进制，不现场编译），以及
   `cargo test --release --lib --test integration --locked -- --test-threads=1`。
+- 另加一道「直接依赖版本唯一性」：用 `cargo tree --depth 1` 取直接依赖、用 `cargo tree -d`
+  取出现多版本的 crate，交集非空即失败（例外见 4.7）。它拦的是「直接依赖停在旧版本、
+  新升的传递依赖要新版本」这一类隐性重复——编译能过、体积白涨、两份实现行为还可能不一致。
+  用文本输出而不是 `cargo metadata` 的 JSON：本包描述是中文，经 pwsh 解码易乱码。
 - 测试串行的原因：多数用例共用目标临时目录与同一个日志文件，并发跑会偶发抢写（见 4.3），
   串行只多花几秒。
 - 缓存键 `runner.os + pr-cargo-release + hash(Cargo.lock)`，与发布流水线的键分开，互不覆盖。
@@ -401,6 +414,67 @@ cargo build --release --locked                        # 发布构建（CI 同款
   全红；等一次性 `style` 提交整理干净后再作为独立检查加入，先加先红没有意义。
 - 只跑 Windows：产品主战场是 Windows，macOS 由发布流水线在真实产物上验证。若要覆盖 macOS，新增
   `os` 矩阵后检查名会变成两个，分支保护需一并勾选。
+
+### 4.7 依赖更新（Dependabot）流程
+
+依赖更新由三处协作：`dependabot.yml` 决定"提什么"，`ci.yml` 决定"能不能过"，
+`deps-merge.yml` 决定"谁来合"。三者缺一段都会退回人工盯 PR。
+
+**分组与调度**
+
+- 目标分支固定 `dev`，每周一次，同时在开的 PR 上限 2。少开一个 PR 就少一整轮质量门，
+  `Cargo.lock` 的冲突面也跟着变小；超出的更新排队，不会丢。
+- `hayro-*` 单独成组，`cargo-minor-patch` 收其余次版本与补丁（并用 `exclude-patterns`
+  把 hayro 排除，避免一个依赖同时命中两组）。hayro 家族互相锁版本——jbig2 0.4 依赖
+  ccitt 0.5——拆成两个 PR 时，锁文件会同时出现 0.4 与 0.5 两份传真解码器。
+- 主版本（含 0.x 的次版本）不并组，一次只评估一个。
+- `lopdf >= 0.40` 继续 ignore，理由见 1.2；`medpdf` / `medpdf-image` 不 ignore。
+- `rebase-strategy: auto`：基分支前进后自动跟进，减少"等人解冲突"。
+
+**更新类型与处置**
+
+| `update-type` | 处置 | 依据 |
+| --- | --- | --- |
+| `semver-patch` | 自动合并 | 补丁不改变 API。`deps-merge.yml` 打 `deps:auto` 并开启 auto-merge，质量门一变绿由 GitHub 合 |
+| `semver-minor` / `semver-major` | 人工评审 | 0.x 的次版本按语义化版本就是破坏性变更（hayro-jbig2 0.3 → 0.4 删掉了 `Image`，hayro-ccitt 0.5 改掉了 `Decoder` 接口）。打 `deps:review`，首次打开时留一条评审清单 |
+
+自动合并的唯一条件是「质量门（Windows）」通过，所以任何编译、clippy、测试、漏洞扫描、
+依赖唯一性失败都会把合并停在原地，不会带着红检查进 `dev`。合并方式固定 merge commit
+（与 6.6 一致），依赖更新可以整体回滚。
+
+**冲突处理**（成本从低到高，前一步能解决就不要往下走）
+
+1. 什么都不做，等 `rebase-strategy: auto`：多数情况 Dependabot 自己 rebase 完。
+2. 评论 `@dependabot rebase` 手动触发一次。
+3. `gh pr update-branch <n>`（仓库已开 Allow update branch）：只适用于"落后但无冲突"。
+4. 本地接手：`git switch <dependabot 分支> && git merge origin/dev`。`Cargo.lock` 冲突
+   **不要手改锁文件**——取任意一侧后跑一次 `cargo metadata --offline > NUL` 让 Cargo
+   重新求解，再补 `cargo clippy --release --all-targets -- -D warnings` 与
+   `cargo tree -d`，确认没有多版本残留。
+5. 以上都不行：关掉该 PR，在 `dev` 上直接写一条 `build(deps)` 提交完成升级。依赖升级
+   不依赖 PR 存在，PR 只是记录。
+
+**分支约定**
+
+- `dependabot/*` 由机器人创建维护，不受 6.6「只有 `main` / `dev` 两条长期分支」约束；
+  **合并后不删除**，也不要往里面塞无关提交。修复必须随该 PR 一起进 `dev` 时可以追加，
+  提交正文要说明原因（PR #6 的 `fix(engine)` 即此例）。
+- 不对 `dependabot/*` 做 `push --force`；要重新往返就让 Dependabot 自己 rebase。
+- 若发现合并后分支被自动清理（2026-11-16 合并 PR #5 时出现过一次），用
+  `git push origin <原提交>:refs/heads/<分支名>` 恢复，保持分支集合可追溯。
+
+**登记例外**
+
+直接依赖出现两个版本时 CI 会失败。确认属上游限制（传递依赖钉在另一条大版本线）而非
+疏漏时，在 `ci.yml` 的 `$allowed` 与本节**同时**登记 crate 名与原因，缺一即视为未登记。
+当前例外：`weezl`（`gif` / `tiff` 等锁 0.1，本项目用 0.2）、`windows-sys`（直接依赖
+0.61，另有更低版本来自传递依赖）。
+
+**仓库设置前置**（一次性，代码替代不了）
+
+- `Settings → General`：开启 **Allow auto-merge**（`deps-merge.yml` 依赖它）与
+  **Allow update branch**（冲突处理第 3 步）。
+- **不要**开启 Automatically delete head branches：分支集合要保留以便追溯。
 
 ---
 
@@ -521,6 +595,7 @@ dev       ●──●──●──●───●──●──●──●�
 5. **发布以 tag 为准**：PR 合入后，在**合并后的 `main` 提交**上打 `V主.副.修订.YYYYMMDD`，推送后不得移动或复用；随后把 `main` 回合 `dev`（`git switch dev && git merge --ff-only main`），避免两条线分叉。
 6. **不改写共享历史**：`main`、`dev` 均由多人共享，不 `--amend`、不 `rebase`、不 `push --force`；远程同步用 `git pull --rebase`。需要试验性改动时用本地临时分支或 `git worktree`，验证后 squash 回 `dev` 并删除。
 7. **本地先对齐再开工**：`git fetch origin` 后确认 `dev` 与 `origin/dev` 无分叉；本地 `main` 不得承载未发布的开发提交。
+8. **`dependabot/*` 分支是唯一例外**：由机器人创建维护，合并后保留、不手工删改，处置见 4.7。
 
 常用操作：
 
@@ -602,6 +677,7 @@ git switch dev && git merge --ff-only main
 | 开发 | 读上下文、在 `dev` 上提交、最小改动、分类型提交 | 直接提交或推送到 `main`、顺手重构无关模块、改依赖、改 License |
 | 测试 | 运行质量门并粘贴真实输出 | 声称「应该通过」而无执行记录 |
 | 评审 | 逐项对照 5 节与 4.4 节自检 | 自行批准自己的改动 |
+| 依赖更新 | 按 4.7 分流：补丁等质量门绿后合并；次版本 / 主版本先读上游 CHANGELOG 再决定 | 忽略安全告警、删 `dependabot/*` 分支、对共享分支强推 |
 | 发布 | 校验版本号一致性、给出推送与打 tag 命令 | 执行 `git push` / 创建 Release / 移动 tag |
 
 ---

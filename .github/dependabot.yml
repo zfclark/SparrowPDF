@@ -13,6 +13,17 @@
 #
 # medpdf / medpdf-image 不 ignore：上游一旦放宽 lopdf 要求，我们希望收到 PR —— 那时
 # 先升这两个包，再删掉上面的 ignore，让 lopdf 一起跟上。
+#
+# 分组规则（PR #6 的教训）：hayro 家族单独成组并排在前面，保证 ccitt 与 jbig2 同批到位。
+# 同一个依赖只会进第一个命中的组，这里再用 exclude-patterns 做双保险，避免两边都收。
+# 二者分开时，hayro-jbig2 0.4 自带的 ccitt 0.5 会与本项目的直接依赖 0.4 并存，锁文件
+# 里出现两份传真解码器，CI 要到编译阶段才报错。
+#
+# 主版本（含 0.x 的次版本）不并组：按语义化版本，0.x 的次版本就是破坏性变更，一次只
+# 评估一个，不跟其他更新混在同一个 PR 里。
+#
+# open-pull-requests-limit 收到 2：每个 PR 都会触发一次完整质量门，同时在开的 PR 越少，
+# Actions 排队与 Cargo.lock 冲突越少。多出来的更新按顺序排队，不会丢。
 
 version: 2
 
@@ -22,13 +33,21 @@ updates:
       target-branch: dev
       schedule:
           interval: weekly
-      open-pull-requests-limit: 3
+      open-pull-requests-limit: 2
       commit-message:
           prefix: "chore(deps)"
-      # 补丁/次版本合成一个 PR，避免一周四个；主版本仍单独提，便于单独评估。
+      # 基分支有新提交时自动跟进 rebase，少一条「等人手动解冲突」的路径。
+      rebase-strategy: auto
+      # 通用标签；deps:auto / deps:review 由 PR 分流工作流（deps-merge.yml）加。
+      labels: ["dependencies"]
       groups:
+          hayro:
+              patterns: ["hayro-*"]
+              update-types: [minor, patch]
           cargo-minor-patch:
               patterns: ["*"]
+              # 双保险：hayro 已被上一个组收走，这里不再重复收。
+              exclude-patterns: ["hayro-*"]
               update-types: [minor, patch]
       ignore:
           - dependency-name: lopdf

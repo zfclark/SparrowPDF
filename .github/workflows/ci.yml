@@ -19,6 +19,15 @@ on:
         branches: [main, dev]
     push:
         branches: [dev]
+        # 纯文档 / 依赖调度配置的提交不改变二进制，重跑一次完整质量门（约 1.5 分钟
+        # runner 时间）没有任何信息量。PR 侧不设 paths-ignore：那会让必需检查永远
+        # 不出现，反而卡住发版 PR。
+        paths-ignore:
+            - "**.md"
+            - "docs/**"
+            - "LICENSE"
+            - ".github/dependabot.yml"
+            - ".github/pull_request_template.md"
     # 在分支上手动跑一次，用于排查「本地绿、CI 红」。
     workflow_dispatch:
 
@@ -26,6 +35,12 @@ permissions:
     contents: read
 
 concurrency:
+    # 按 PR 号 / 分支分组：同一 PR 的新提交取消旧提交的运行，同一分支的直推同理。
+    #
+    # 试过按提交 SHA 分组，想让「dev 直推」与「指向同一提交的发版 PR」共用一次运行。
+    # 不要这样改：后到的运行会取消同组的另一个，被取消的检查运行会留在同一个提交上，
+    # GitHub 把它计入 statusCheckRollup 并判为 FAILURE，于是 main 的必需检查一直是红的，
+    # 发版 PR 无法合并（PR #7 实测）。宁可多跑一次，也不要一个被取消的兄弟运行。
     group: pr-check-${{ github.event.pull_request.number || github.ref }}
     cancel-in-progress: true
 
@@ -71,6 +86,45 @@ jobs:
             # 因此不必再单独跑一次 cargo check（多一趟编译，收益为零）。
             - name: 🧹 Clippy（类型检查 + 警告门）
               run: cargo clippy --release --all-targets --locked -- -D warnings
+
+            # 依赖 PR 最常见的隐性破坏：直接依赖停在旧版本，而新升的传递依赖要新版本，
+            # 锁文件里于是出现同一个 crate 的两份实现（PR #6：hayro-ccitt 0.4 与 0.5
+            # 并存）。编译能过、体积白涨，两份实现的行为还可能不一致，所以单列一道门。
+            # 只查直接依赖：传递依赖的重复多由上游互相锁版本造成，拦不住也不该拦。
+            # 用 cargo tree 的文本输出而不是 cargo metadata 的 JSON：本包描述是中文，
+            # 经 pwsh 解码容易变成乱码并让 JSON 解析失败。
+            - name: 🧬 直接依赖版本唯一性
+              shell: pwsh
+              run: |
+                  $ErrorActionPreference = "Stop"
+                  # 已登记例外（原因见 AGENTS.md 4.7）：传递依赖把版本钉在不同大版本上，
+                  # 与本项目的直接依赖无法合并，属上游事实而非疏漏。
+                  $allowed = @("weezl", "windows-sys")
+
+                  # 第一层即直接依赖，首行是本包自身。
+                  $direct = @{}
+                  $root = $true
+                  foreach ($line in (cargo tree --depth 1 --prefix none --edges normal,build,dev)) {
+                      if ($root) { $root = $false; continue }
+                      if ($line -match '^([A-Za-z0-9][A-Za-z0-9_-]*) v[0-9]') { $direct[$matches[1]] = $true }
+                  }
+
+                  # 出现两份及以上实现的 crate。
+                  $dup = @{}
+                  foreach ($line in (cargo tree -d)) {
+                      if ($line -match '^([A-Za-z0-9][A-Za-z0-9_-]*) v[0-9]') { $dup[$matches[1]] = $true }
+                  }
+
+                  $bad = @()
+                  foreach ($name in ($dup.Keys | Sort-Object)) {
+                      if ($direct.ContainsKey($name) -and $allowed -notcontains $name) { $bad += $name }
+                  }
+                  if ($bad.Count -gt 0) {
+                      foreach ($name in $bad) { Write-Host "::error::直接依赖 $name 出现多个版本" }
+                      Write-Host "::error::把直接依赖提到统一版本再合并；确有必要例外时，写明原因并在本步骤与 AGENTS.md 4.7 同时登记。"
+                      exit 1
+                  }
+                  Write-Host "通过：$($direct.Count) 个直接依赖均只有一个版本（例外 $($allowed -join '、')）。"
 
             # 依赖漏洞：lopdf 那次 HIGH 若有这一步，半年前就会红在 CI 里。
             # 只对「漏洞」失败；uncategorized/unmaintained 类告警（如 paste、ttf-parser

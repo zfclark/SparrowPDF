@@ -2,7 +2,7 @@
 name = "sparrowpdf"
 # Cargo 只接受 SemVer 三段：这里保存五位版本号的前三段（主.副.修订），
 # 不带 V 前缀、不带日期位。日期位在 src/version.rs 维护，展示用完整版本
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.95"
 description = "轻雀 PDF —— 基于 Rust 的本地 PDF 工具箱"
@@ -20,7 +20,7 @@ path = "src/main.rs"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 egui = { version = "0.37", default-features = false }
 egui_dnd = "0.18"
-rfd = "0.17"
+rfd = "0.18"
 lopdf = "0.39"
 medpdf = { version = "0.9.2", default-features = false }
 medpdf-image = { version = "0.2.2", default-features = false }
@@ -36,8 +36,10 @@ weezl = "0.2"
 # zlib decode for /FlateDecode; already in the tree via `image`, declared
 # explicitly because the rasterizer calls it directly.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-hayro-ccitt = "0.4"
-hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"] }
+hayro-ccitt = "0.5"
+# hayro-jbig2 0.4 depends on hayro-ccitt 0.5, so the two must be bumped together:
+# leaving this one on 0.4 puts two copies of the fax decoder in the binary.
+hayro-jbig2 = { version = "0.4", default-features = false, features = ["std"] }
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 jpeg-encoder = { version = "0.7.1", default-features = false, features = ["simd"] }
 

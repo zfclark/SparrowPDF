@@ -23,6 +23,7 @@ Closes #
 - [ ] `cargo clippy --release --all-targets -- -D warnings` 零警告
 - [ ] `cargo test --release --lib --test integration` 全通过
 - [ ] 动过依赖时 `cargo audit` 无新增漏洞（若有告警：修或写明理由）
+- [ ] 动过依赖时 `cargo tree -d` 中无「直接依赖出现两个版本」（判据与例外见 AGENTS.md 4.7）
 - [ ] 涉及界面时已实际启动确认，无渲染异常与布局裁切（附截图）
 - [ ] 用户可见变化已写入 `CHANGELOG.md` 的 `[Unreleased]`
 - [ ] 新增或修改工具行为时补了集成测试，且断言产物结构而非「执行成功」
