@@ -2943,3 +2943,41 @@ fn renderer_honours_short_cubic_operators() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The sidebar is generated from the registry, so the grouping contract lives
+/// in `model.rs`: four groups, "转换" first, PDF 转图片 inside it, and every
+/// group's tools contiguous in `ToolId::ALL` (otherwise a member is listed
+/// under the wrong caption).
+#[test]
+fn sidebar_groups_merge_pdf_to_image_into_convert() {
+    use sparrowpdf::model::ToolGroup;
+
+    let labels: Vec<&str> = ToolGroup::ALL.iter().map(|group| group.label()).collect();
+    assert_eq!(labels, vec!["转换", "结构操作", "页面编辑", "安全"]);
+
+    let convert = ToolGroup::Generate.tools();
+    assert_eq!(convert.len(), 3, "图片合并、批量转换、PDF 转图片");
+    assert!(convert.contains(&ToolId::PdfToImage));
+    assert!(convert.contains(&ToolId::ImageToPdf));
+    assert!(convert.contains(&ToolId::FolderToPdf));
+
+    let total: usize = ToolGroup::ALL
+        .iter()
+        .map(|group| group.tools().len())
+        .sum();
+    assert_eq!(total, ToolId::ALL.len(), "每个工具只属于一个分组");
+
+    for group in ToolGroup::ALL {
+        let rows: Vec<usize> = ToolId::ALL
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| tool.group() == group)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            rows.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "{:?} 的工具在注册表里不连续：{rows:?}",
+            group
+        );
+    }
+}
