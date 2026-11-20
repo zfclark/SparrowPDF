@@ -2981,3 +2981,45 @@ fn sidebar_groups_merge_pdf_to_image_into_convert() {
         );
     }
 }
+
+/// `ICCBased` keeps its component count on a *stream* dictionary. Resolving it
+/// through `get_dictionary` alone treated the image as having no colour space,
+/// so profile-tagged images were skipped as blank.
+#[test]
+fn renderer_reads_iccbased_images() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-iccbased");
+    let mut doc = Document::with_version("1.4");
+    let profile_id = doc.add_object(Stream::new(dictionary! { "N" => 3i64 }, Vec::new()));
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => vec![
+                Object::Name(b"ICCBased".to_vec()),
+                Object::Reference(profile_id),
+            ],
+            "BitsPerComponent" => 8i64,
+        },
+        (0..16).flat_map(|_| [0u8, 0, 200]).collect(),
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("iccbased.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        b > 150 && r < 80 && g < 80,
+        "ICCBased RGB image must paint its samples, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

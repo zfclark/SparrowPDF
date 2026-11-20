@@ -948,7 +948,11 @@ fn hex_value(token: &[u8]) -> Option<u32> {
 fn deref_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
     match obj {
         Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        // An ICC profile is a stream, and its `/N` lives on the stream
+        // dictionary: `get_dictionary` only accepts real dictionaries, so an
+        // ICCBased image used to be skipped as if it had no colour space.
+        Object::Stream(stream) => Some(&stream.dict),
+        Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| deref_dict(doc, o)),
         _ => None,
     }
 }
@@ -2212,6 +2216,11 @@ fn space_from(doc: &Document, value: &Object, depth: u8) -> Option<Space> {
                 }
                 b"Indexed" | b"I" => {
                     let base = space_from(doc, items.get(1)?, depth + 1)?;
+                    // A palette over a palette is invalid; accepting it would
+                    // index one byte as if it were three and panic.
+                    if matches!(base, Space::Indexed { .. }) {
+                        return None;
+                    }
                     let hival = items.get(2).and_then(number).unwrap_or(255.0) as usize;
                     let lookup = match items.get(3)? {
                         Object::String(bytes, _) => bytes.clone(),
