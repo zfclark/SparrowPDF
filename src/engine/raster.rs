@@ -460,6 +460,14 @@ pub fn draw_image(pixmap: &mut Pixmap, image: &ImageRgba, corners: [Point; 4], a
     }
 
     let inv = 1.0 / det;
+    // Upscaled content (icons, seals, photos on a page-sized box) looks blocky
+    // with nearest sampling; switch to bilinear once a source pixel covers more
+    // than a destination pixel. Downscaled scans keep the cheap path, where the
+    // difference is invisible anyway.
+    let scale = (ex.0.hypot(ex.1) / image.width as f32)
+        .max(ey.0.hypot(ey.1) / image.height as f32);
+    let smooth = scale > 1.25;
+
     for py in y_start..y_end {
         let dy = py as f32 + 0.5 - origin.1;
         for px in x_start..x_end {
@@ -469,22 +477,64 @@ pub fn draw_image(pixmap: &mut Pixmap, image: &ImageRgba, corners: [Point; 4], a
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
             }
-            let sx = (u * image.width as f32) as u32;
-            let sy = (v * image.height as f32) as u32;
-            let idx = ((sy as usize) * image.width as usize + sx as usize) * 4;
-            if idx + 3 >= image.data.len() {
+            let color = if smooth {
+                sample_bilinear(image, u * image.width as f32 - 0.5, (1.0 - v) * image.height as f32 - 0.5)
+            } else {
+                let sx = (u * image.width as f32) as u32;
+                // Image space starts at the top-left while the unit square
+                // starts at the bottom-left; without the flip every image
+                // placed with the usual `w 0 0 h` matrix came out mirrored.
+                let sy = ((1.0 - v) * image.height as f32) as u32;
+                let idx = ((sy as usize) * image.width as usize + sx as usize) * 4;
+                if idx + 3 >= image.data.len() {
+                    continue;
+                }
+                [
+                    image.data[idx] as f32 / 255.0,
+                    image.data[idx + 1] as f32 / 255.0,
+                    image.data[idx + 2] as f32 / 255.0,
+                    image.data[idx + 3] as f32 / 255.0,
+                ]
+            };
+            let a = color[3] * alpha;
+            if a <= 0.0 {
                 continue;
             }
-            let a = image.data[idx + 3] as f32 / 255.0 * alpha;
-            let color = [
-                image.data[idx] as f32 / 255.0,
-                image.data[idx + 1] as f32 / 255.0,
-                image.data[idx + 2] as f32 / 255.0,
-                a,
-            ];
-            pixmap.blend(px as u32, py as u32, color, 1.0);
+            pixmap.blend(px as u32, py as u32, [color[0], color[1], color[2], a], 1.0);
         }
     }
+}
+
+/// Bilinear sample in top-down image coordinates (pixel centres at `x + 0.5`).
+fn sample_bilinear(image: &ImageRgba, tx: f32, ty: f32) -> [f32; 4] {
+    let max_x = image.width.saturating_sub(1) as f32;
+    let max_y = image.height.saturating_sub(1) as f32;
+    let x = tx.clamp(0.0, max_x);
+    let y = ty.clamp(0.0, max_y);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(image.width - 1);
+    let y1 = (y0 + 1).min(image.height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let at = |px: u32, py: u32| -> [f32; 4] {
+        let i = ((py as usize) * image.width as usize + px as usize) * 4;
+        [
+            image.data[i] as f32,
+            image.data[i + 1] as f32,
+            image.data[i + 2] as f32,
+            image.data[i + 3] as f32,
+        ]
+    };
+    let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+    let mut out = [0.0f32; 4];
+    for channel in 0..4 {
+        let top = a[channel] + (b[channel] - a[channel]) * fx;
+        let bottom = c[channel] + (d[channel] - c[channel]) * fx;
+        out[channel] = (top + (bottom - top) * fy) / 255.0;
+    }
+    out
 }
 
 /// Decoded RGBA image ready for drawing.

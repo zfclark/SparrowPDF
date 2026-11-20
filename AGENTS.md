@@ -301,7 +301,7 @@ cargo build --release --locked                        # 发布构建（CI 同款
 
 | 层级 | 位置 | 覆盖内容 |
 | --- | --- | --- |
-| 集成测试 | `tests/integration.rs`（用例数随代码增长，不在此处记数字） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号/合并页槽位顺序；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、重命名失败保留旧产物、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹、导出页写盘失败按页报告 |
+| 集成测试 | `tests/integration.rs`（用例数随代码增长，不在此处记数字） | 工具端到端：页码解析、合并、旋转、删页、加密往返、拆分、中文水印位图断言、日志追加、图片自动旋转、批量排序/两图一页/非法序号/合并页槽位顺序；同名文件三种策略（Report/Overwrite/Unique）与落盘前复核、重命名失败保留旧产物、LZW / CCITT / JBIG2（含有效码流）/ PNG 预测器 / 原始采样图像渲染、CID 文本经 `/ToUnicode` 取字（含 `bfchar` 计数与 `bfrange` 数组）、`BT` 跨块保留字体、图像行序与旋转变换、内嵌 `/FontFile2` 无 ToUnicode 出字、扫描件存 DCTDecode 的像素尺寸与 SMask 取舍、体积守卫收紧阶梯、坏图只跳过所在文件夹、导出页写盘失败按页报告 |
 | 单元测试 | 模块内 `#[cfg(test)]` | 纯函数（码表、偏好文件读写等） |
 
 规则：

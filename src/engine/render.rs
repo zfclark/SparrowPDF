@@ -829,88 +829,158 @@ fn glyph_name_char(name: &str) -> Option<char> {
 /// rest of a CMap (codespace ranges, notdef ranges) does not change how a code
 /// maps to a character.
 fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
-    let mut map = BTreeMap::new();
-    let mut tokens: Vec<Vec<u8>> = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
-    let mut depth_hex = false;
-    for &byte in cmap {
-        match byte {
-            b'<' if !depth_hex => {
-                depth_hex = true;
-                current.clear();
-            }
-            b'>' if depth_hex => {
-                depth_hex = false;
-                tokens.push(current.clone());
-                current.clear();
-            }
-            b'[' | b']' | b' ' | b'\n' | b'\r' | b'\t' => {
-                if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
+    #[derive(Clone)]
+    enum Tok {
+        Hex(Vec<u8>),
+        Word(String),
+    }
+
+    // Hex strings and words must stay distinguishable: the count in front of
+    // `beginbfchar` / `beginbfrange` is a word, and treating it as the first
+    // source code shifted every pair by one token. That mis-mapping is why a
+    // glyph could resolve to the wrong character (or to nothing) even though
+    // the CMap was complete.
+    fn tokenize(cmap: &[u8]) -> Vec<Tok> {
+        let mut out = Vec::new();
+        let mut index = 0usize;
+        while index < cmap.len() {
+            match cmap[index] {
+                b'<' if cmap.get(index + 1) == Some(&b'<') => {
+                    out.push(Tok::Word("<<".into()));
+                    index += 2;
+                }
+                b'>' if cmap.get(index + 1) == Some(&b'>') => {
+                    out.push(Tok::Word(">>".into()));
+                    index += 2;
+                }
+                b'<' => {
+                    let start = index + 1;
+                    let mut end = start;
+                    while end < cmap.len() && cmap[end] != b'>' {
+                        end += 1;
+                    }
+                    out.push(Tok::Hex(cmap[start..end].to_vec()));
+                    index = end + 1;
+                }
+                b'[' | b']' => {
+                    out.push(Tok::Word((cmap[index] as char).to_string()));
+                    index += 1;
+                }
+                b'%' => {
+                    while index < cmap.len() && cmap[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                byte if byte.is_ascii_whitespace() => index += 1,
+                _ => {
+                    let start = index;
+                    while index < cmap.len()
+                        && !cmap[index].is_ascii_whitespace()
+                        && !matches!(cmap[index], b'<' | b'>' | b'[' | b']' | b'%')
+                    {
+                        index += 1;
+                    }
+                    out.push(Tok::Word(String::from_utf8_lossy(&cmap[start..index]).into_owned()));
                 }
             }
-            _ if depth_hex => current.push(byte),
-            _ => current.push(byte),
+        }
+        out
+    }
+
+    let hex = |token: &[u8]| hex_value(token).unwrap_or(0);
+    // The tokenizer keeps the ASCII digits of a hex string; destinations are
+    // UTF-16BE bytes, so they have to be decoded before pairing them up. Using
+    // the digits directly turned `<0030>` into U+3030 instead of '0', which is
+    // why fallback glyphs came out as random CJK punctuation.
+    let char_of = |token: &[u8]| -> Option<char> {
+        let bytes = unhex(token);
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]))
+            .collect();
+        String::from_utf16_lossy(&units).chars().next()
+    };
+    fn as_hex(token: &Tok) -> Option<&[u8]> {
+        match token {
+            Tok::Hex(bytes) => Some(bytes),
+            Tok::Word(_) => None,
+        }
+    }
+    fn word(token: &Tok) -> Option<&str> {
+        match token {
+            Tok::Word(text) => Some(text.as_str()),
+            Tok::Hex(_) => None,
         }
     }
 
-    let value = |token: &[u8]| -> u32 { hex_value(token).unwrap_or(0) };
-    let char_of = |token: &[u8]| -> Option<char> {
-        let units: Vec<u16> = token
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-            .collect();
-        let text = String::from_utf16_lossy(&units);
-        text.chars().next()
-    };
-
-    // Tokens are in file order; beginbfchar/bfrange markers were consumed as
-    // ordinary tokens above, so walk the list and act on the markers.
+    let tokens = tokenize(cmap);
+    let mut map = BTreeMap::new();
     let mut index = 0usize;
     while index < tokens.len() {
-        let marker = String::from_utf8_lossy(&tokens[index]).into_owned();
-        index += 1;
-        match marker.as_str() {
-            "beginbfchar" => {
-                while index + 1 < tokens.len() {
-                    if String::from_utf8_lossy(&tokens[index]) == "endbfchar" {
+        match word(&tokens[index]) {
+            Some("beginbfchar") => {
+                index += 1;
+                while index < tokens.len() {
+                    if word(&tokens[index]) == Some("endbfchar") {
                         index += 1;
                         break;
                     }
-                    let code = value(&tokens[index]);
-                    if let Some(ch) = char_of(&tokens[index + 1]) {
-                        map.insert(code, ch);
-                    }
-                    index += 2;
-                }
-            }
-            "beginbfrange" => {
-                while index + 2 < tokens.len() {
-                    if String::from_utf8_lossy(&tokens[index]) == "endbfrange" {
-                        index += 1;
-                        break;
-                    }
-                    let low = value(&tokens[index]);
-                    let high = value(&tokens[index + 1]);
-                    // Array form: <lo> <hi> [ <dst> <dst> … ]
-                    if index + 3 < tokens.len()
-                        && String::from_utf8_lossy(&tokens[index + 2]) == "["
-                    {
-                        index += 3;
-                        let mut code = low;
-                        while index < tokens.len() && String::from_utf8_lossy(&tokens[index]) != "]"
-                        {
-                            if let Some(ch) = char_of(&tokens[index]) {
+                    match (
+                        as_hex(&tokens[index]).map(hex),
+                        tokens.get(index + 1).and_then(as_hex),
+                    ) {
+                        (Some(code), Some(dest)) => {
+                            if let Some(ch) = char_of(dest) {
                                 map.insert(code, ch);
                             }
-                            code += 1;
-                            index += 1;
+                            index += 2;
                         }
+                        // The section count, or anything else that is not a
+                        // `<src> <dst>` pair.
+                        _ => index += 1,
+                    }
+                }
+            }
+            Some("beginbfrange") => {
+                index += 1;
+                while index < tokens.len() {
+                    if word(&tokens[index]) == Some("endbfrange") {
+                        index += 1;
+                        break;
+                    }
+                    let Some(low) = as_hex(&tokens[index]).map(hex) else {
                         index += 1;
                         continue;
+                    };
+                    let Some(high) = tokens.get(index + 1).and_then(as_hex).map(hex) else {
+                        index += 1;
+                        continue;
+                    };
+                    // Array form: `<lo> <hi> [ <dst> … ]`.
+                    if tokens.get(index + 2).and_then(word) == Some("[") {
+                        let mut cursor = index + 3;
+                        let mut code = low;
+                        while cursor < tokens.len() {
+                            if word(&tokens[cursor]) == Some("]") {
+                                cursor += 1;
+                                break;
+                            }
+                            if let Some(dest) = as_hex(&tokens[cursor]) {
+                                if let Some(ch) = char_of(dest) {
+                                    map.insert(code, ch);
+                                }
+                                code += 1;
+                            }
+                            cursor += 1;
+                        }
+                        index = cursor;
+                        continue;
                     }
-                    let Some(first) = char_of(&tokens[index + 2]) else {
+                    let Some(dest) = tokens.get(index + 2).and_then(as_hex) else {
+                        index += 1;
+                        continue;
+                    };
+                    let Some(first) = char_of(dest) else {
                         index += 3;
                         continue;
                     };
@@ -923,10 +993,29 @@ fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
                     index += 3;
                 }
             }
-            _ => {}
+            _ => index += 1,
         }
     }
     map
+}
+
+/// Decode a hex string (the bytes between `<` and `>`) into raw bytes.
+fn unhex(token: &[u8]) -> Vec<u8> {
+    let mut digits: Vec<u8> = Vec::with_capacity(token.len());
+    for &byte in token {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => continue,
+        };
+        digits.push(digit);
+    }
+    // An odd digit count is padded with a leading zero, as the spec requires.
+    if digits.len() % 2 == 1 {
+        digits.insert(0, 0);
+    }
+    digits.chunks_exact(2).map(|pair| (pair[0] << 4) | pair[1]).collect()
 }
 
 fn hex_value(token: &[u8]) -> Option<u32> {
@@ -1161,7 +1250,13 @@ fn execute(
                 }
             }
             "BT" => {
-                text = TextState::default();
+                // BT resets the text matrix and line matrix only. Font, size,
+                // spacing, leading and render mode belong to the graphics
+                // state and survive BT/ET. Clearing them here dropped the font
+                // for every `Tj` that follows the first block — which is how
+                // most CJK producers emit text — and those runs then fell back
+                // to WinAnsi at 12 pt: characters "disappeared" or turned into
+                // Latin noise.
                 text.line_matrix = Matrix::IDENTITY;
             }
             "ET" => {}
@@ -2440,4 +2535,40 @@ fn lzw_decode(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
         Decoder::new(BitOrder::Msb, 8)
     };
     decoder.decode(data).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_to_unicode;
+
+    /// The count in front of `beginbfchar` / `beginbfrange` is a word, not a
+    /// source code. Reading it as one shifted every pair by a token, so codes
+    /// resolved to the neighbouring character or to nothing.
+    #[test]
+    fn to_unicode_skips_section_counts() {
+        let cmap = b"/CIDInit /ProcSet findresource begin\n\
+            2 beginbfchar\n\
+            <0011> <0030>\n\
+            <01DA> <300A>\n\
+            endbfchar\n\
+            1 beginbfrange\n\
+            <0041> <0043> <4E2D>\n\
+            endbfrange\n";
+        let map = parse_to_unicode(cmap);
+        assert_eq!(map.get(&0x0011), Some(&'0'));
+        assert_eq!(map.get(&0x01DA), Some(&'\u{300A}'));
+        assert_eq!(map.get(&0x0041), Some(&'中'));
+        assert_eq!(map.get(&0x0042), Some(&'丮'));
+        assert_eq!(map.get(&0x0043), Some(&'丯'));
+    }
+
+    /// The array form of `bfrange` lists destinations explicitly instead of
+    /// incrementing one base character.
+    #[test]
+    fn to_unicode_reads_bfrange_arrays() {
+        let cmap = b"1 beginbfrange\n<0050> <0051> [<0061> <0062>]\nendbfrange\n";
+        let map = parse_to_unicode(cmap);
+        assert_eq!(map.get(&0x0050), Some(&'a'));
+        assert_eq!(map.get(&0x0051), Some(&'b'));
+    }
 }

@@ -3023,3 +3023,107 @@ fn renderer_reads_iccbased_images() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `BT` resets the text and line matrices only. Clearing font and size there
+/// dropped the font for every `Tj` after the first block — a layout most CJK
+/// producers emit — and the run collapsed into WinAnsi noise at 12 pt.
+#[test]
+fn renderer_keeps_text_state_across_bt_blocks() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-bt-state");
+    let mut doc = Document::with_version("1.4");
+    let proc_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f".to_vec(),
+    ));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let pdf = finish_page(
+        doc,
+        // The second block has no `Tf`: it must inherit font and size.
+        "BT /F1 100 Tf 50 200 Td (A) Tj ET BT 150 200 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("bt-state.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 100.0, 250.0);
+    assert!(r < 80 && g < 80 && b < 80, "first block must paint, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 250.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "second block must inherit the font, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Image space is top-down while the unit square is bottom-up. Sampling the
+/// square top-down mirrored every image placed with the usual `w 0 0 h` matrix,
+/// which is exactly how the bundled image tools write their pages.
+#[test]
+fn renderer_places_image_rows_top_down() {
+    use lopdf::{dictionary, Document, Stream};
+
+    let dir = scratch("render-image-orientation");
+    let mut doc = Document::with_version("1.4");
+    let mut pixels: Vec<u8> = Vec::new();
+    for y in 0..8 {
+        for _ in 0..4 {
+            pixels.extend_from_slice(if y < 4 { &[220, 20, 20] } else { &[20, 20, 220] });
+        }
+    }
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 8i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+        },
+        pixels,
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("image-row-order.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 250.0);
+    assert!(
+        r > 150 && b < 100,
+        "the first image row belongs at the top of the box, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 50.0);
+    assert!(
+        b > 150 && r < 100,
+        "the last image row belongs at the bottom of the box, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
