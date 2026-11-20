@@ -4,13 +4,16 @@
 //! in-crate software rasterizer in [`super::raster`]. No PDFium, no MuPDF, no
 //! C/C++ libraries and no new dependencies are involved.
 //!
-//! The fidelity boundary is intentional and documented in README: text,
-//! vector paths, solid colours, images with DCTDecode/FlateDecode and the
-//! standard page transformations are supported; shadings, blend modes,
-//! transparency groups, Type3 fonts and soft masks are approximated or
-//! skipped.
+//! The fidelity boundary is intentional and documented in README: text (simple,
+//! CID and Type3 fonts, embedded TrueType programs or the system substitute),
+//! vector paths, solid colours, images with DCTDecode/FlateDecode and their
+//! soft masks, indexed colour and the standard page transformations are
+//! supported; shadings, blend modes, clipping paths, transparency groups and
+//! CFF outlines are approximated or skipped.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use lopdf::{Document, Object, ObjectId};
 
@@ -339,7 +342,9 @@ struct State {
     stroke: [f32; 4],
     line_width: f32,
     path: Path,
-    pending: Option<(f32, f32)>,
+    /// Set while running a `d1` Type3 glyph: the text fill colour wins, and
+    /// colour operators in the procedure must not override it.
+    uniform_fill: bool,
 }
 
 impl State {
@@ -350,7 +355,7 @@ impl State {
             stroke: [0.0, 0.0, 0.0, 1.0],
             line_width: 1.0,
             path: Path::new(),
-            pending: None,
+            uniform_fill: false,
         }
     }
 }
@@ -387,6 +392,90 @@ struct FontResource {
     cid_to_gid: Option<Vec<u16>>,
     /// `/Encoding /Differences`: code -> glyph name.
     differences: BTreeMap<u8, String>,
+    /// Type3 fonts store each glyph as a content stream instead of an outline.
+    type3: Option<Type3Font>,
+}
+
+/// A Type3 font: the glyphs are procedures, not outlines.
+///
+/// Icon fonts and print drivers that predate CID fonts use Type3; without it
+/// the glyphs have no outline to draw and the whole run disappears.
+struct Type3Font {
+    /// `/FontMatrix`: glyph space -> text space.
+    matrix: Matrix,
+    /// `/CharProcs`, keyed by glyph name.
+    procs: BTreeMap<Vec<u8>, ObjectId>,
+    /// Encoding code -> glyph name (`/Encoding /Differences`).
+    names: BTreeMap<u8, Vec<u8>>,
+    /// Parsed procedures, so a repeated glyph is decoded once per page.
+    cache: RefCell<BTreeMap<u8, Option<Rc<Type3Glyph>>>>,
+}
+
+struct Type3Glyph {
+    ops: Vec<lopdf::content::Operation>,
+    /// `d0` / `d1` horizontal displacement, in glyph space.
+    width: f32,
+    /// `d1`: the glyph takes the text fill colour, and colour operators inside
+    /// the procedure are ignored.
+    uniform: bool,
+}
+
+/// Remove the `d0` / `d1` statement from a Type3 glyph procedure.
+///
+/// Returns the remaining content, the advance (`wx`), and whether the glyph is
+/// colour-uniform (`d1`). A procedure without either operator keeps its content
+/// and reports a zero advance.
+fn split_type3_width(content: &[u8]) -> (Vec<u8>, f32, bool) {
+    let text = String::from_utf8_lossy(content);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        let count = match *token {
+            "d0" => 2,
+            "d1" => 6,
+            _ => continue,
+        };
+        if index < count {
+            continue;
+        }
+        let width = tokens[index - count].parse::<f32>().unwrap_or(0.0).abs();
+        let mut kept: Vec<&str> = Vec::with_capacity(tokens.len() - count - 1);
+        kept.extend_from_slice(&tokens[..index - count]);
+        kept.extend_from_slice(&tokens[index + 1..]);
+        return (kept.join(" ").into_bytes(), width, *token == "d1");
+    }
+    (content.to_vec(), 0.0, false)
+}
+
+impl Type3Font {
+    fn glyph(&self, doc: &Document, code: u8) -> Option<Rc<Type3Glyph>> {
+        {
+            let cache = self.cache.borrow();
+            if let Some(hit) = cache.get(&code) {
+                return hit.clone();
+            }
+        }
+        let parsed = self.parse(doc, code);
+        self.cache.borrow_mut().insert(code, parsed.clone());
+        parsed
+    }
+
+    fn parse(&self, doc: &Document, code: u8) -> Option<Rc<Type3Glyph>> {
+        let name = self.names.get(&code)?;
+        let id = self.procs.get(name)?;
+        let stream = doc.get_object(*id).ok()?.as_stream().ok()?;
+        let content = decoded_stream_content(stream)?;
+        // `d0` / `d1` cannot go through the content lexer: it splits `d1` into
+        // the operator `d` plus the number 1, which shifts every following
+        // operand by one. Their only payload we need is the advance, so the
+        // statement is lifted out of the stream and read here.
+        let (content, width, uniform) = split_type3_width(&content);
+        let ops = lopdf::content::Content::decode(&content).ok()?.operations;
+        Some(Rc::new(Type3Glyph {
+            ops,
+            width,
+            uniform,
+        }))
+    }
 }
 
 impl FontResource {
@@ -451,9 +540,10 @@ fn resources_from(doc: &Document, res: &lopdf::Dictionary) -> Resources {
     }
     if let Some(font_dict) = res.get(b"Font").ok().and_then(|o| deref_dict(doc, o)) {
         for (name, value) in font_dict.iter() {
-            if let Ok(id) = value.as_reference() {
-                fonts.insert(name.clone(), parse_font(doc, id));
-            }
+            // A font may be an inline dictionary as well as a reference;
+            // treating only references as fonts made those runs fall back to
+            // WinAnsi and lose every non-Latin character.
+            fonts.insert(name.clone(), parse_font(doc, value));
         }
     }
     Resources {
@@ -465,12 +555,12 @@ fn resources_from(doc: &Document, res: &lopdf::Dictionary) -> Resources {
 
 /// Read the parts of a `/Font` dictionary that affect *which characters* the
 /// byte string stands for.
-fn parse_font(doc: &Document, id: ObjectId) -> FontResource {
+fn parse_font(doc: &Document, object: &Object) -> FontResource {
     /// A font program bigger than this is not a subset; keeping it would cost
     /// more memory than substituting a system face.
     const MAX_EMBEDDED_FONT: usize = 32 * 1024 * 1024;
 
-    let Ok(dict) = doc.get_dictionary(id) else {
+    let Some(dict) = deref_dict(doc, object) else {
         return FontResource::default();
     };
     let name_of = |d: &lopdf::Dictionary, key: &[u8]| -> String {
@@ -519,13 +609,7 @@ fn parse_font(doc: &Document, id: ObjectId) -> FontResource {
     let embedded = descendant
         .and_then(|d| d.get(b"FontDescriptor").ok())
         .and_then(|o| deref_dict(doc, o))
-        .and_then(|fd| fd.get(b"FontFile2").ok())
-        .and_then(|o| o.as_reference().ok())
-        .and_then(|id| doc.get_object(id).ok())
-        .and_then(|o| o.as_stream().ok())
-        .and_then(decoded_stream_content)
-        .filter(|program| program.len() <= MAX_EMBEDDED_FONT)
-        .and_then(TrueTypeFont::parse)
+        .and_then(|descriptor| embedded_program(doc, descriptor, MAX_EMBEDDED_FONT))
         .map(Box::new);
 
     let cid_to_gid = if is_cid {
@@ -563,6 +647,9 @@ fn parse_font(doc: &Document, id: ObjectId) -> FontResource {
             .unwrap_or_default()
     };
 
+    let is_type3 = name_of(dict, b"Subtype") == "Type3";
+    let type3 = is_type3.then(|| parse_type3(dict, doc, &differences));
+
     FontResource {
         base,
         is_cid,
@@ -570,6 +657,81 @@ fn parse_font(doc: &Document, id: ObjectId) -> FontResource {
         embedded,
         cid_to_gid,
         differences,
+        type3,
+    }
+}
+
+/// Embedded font program, whichever key the producer used.
+///
+/// `/FontFile2` is TrueType, `/FontFile3` is CFF or OpenType and `/FontFile` is
+/// Type1. Only the TrueType flavour can be outlined here, so a CFF program is
+/// tried and rejected rather than ignored: OpenType with a `glyf` table lives
+/// in `/FontFile3` often enough to matter.
+fn embedded_program(
+    doc: &Document,
+    descriptor: &lopdf::Dictionary,
+    max_bytes: usize,
+) -> Option<TrueTypeFont> {
+    for key in [b"FontFile2".as_slice(), b"FontFile3", b"FontFile"] {
+        let Some(id) = descriptor.get(key).ok().and_then(|o| o.as_reference().ok()) else {
+            continue;
+        };
+        let Some(stream) = doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) else {
+            continue;
+        };
+        let Some(program) = decoded_stream_content(stream) else {
+            continue;
+        };
+        if program.len() > max_bytes {
+            continue;
+        }
+        if let Some(font) = TrueTypeFont::parse(program) {
+            return Some(font);
+        }
+    }
+    None
+}
+
+/// Type3 font resources: `/FontMatrix`, `/CharProcs` and the encoding that maps
+/// codes to procedure names.
+fn parse_type3(dict: &lopdf::Dictionary, doc: &Document, differences: &BTreeMap<u8, String>) -> Type3Font {
+    let matrix = dict
+        .get(b"FontMatrix")
+        .ok()
+        .and_then(|o| o.as_array().ok())
+        .map(|items| {
+            let n: Vec<f32> = items.iter().filter_map(number).collect();
+            if n.len() >= 6 {
+                Matrix::new(n[0], n[1], n[2], n[3], n[4], n[5])
+            } else {
+                // The 1000-unit default is what almost every Type3 font uses.
+                Matrix::scale(0.001, 0.001)
+            }
+        })
+        .unwrap_or_else(|| Matrix::scale(0.001, 0.001));
+
+    let procs = dict
+        .get(b"CharProcs")
+        .ok()
+        .and_then(|o| deref_dict(doc, o))
+        .map(|procs| {
+            procs
+                .iter()
+                .filter_map(|(name, value)| value.as_reference().ok().map(|id| (name.clone(), id)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let names = differences
+        .iter()
+        .map(|(code, name)| (*code, name.as_bytes().to_vec()))
+        .collect();
+
+    Type3Font {
+        matrix,
+        procs,
+        names,
+        cache: RefCell::new(BTreeMap::new()),
     }
 }
 
@@ -834,18 +996,24 @@ fn execute(
                     state.line_width = v;
                 }
             }
+            // A `d1` Type3 glyph is painted in the text fill colour; the spec
+            // forbids its procedure from overriding that.
             "g" => {
-                if let Some(v) = operands.first().and_then(number) {
-                    state.fill = [v, v, v, state.fill[3]];
+                if !state.uniform_fill {
+                    if let Some(v) = operands.first().and_then(number) {
+                        state.fill = [v, v, v, state.fill[3]];
+                    }
                 }
             }
             "G" => {
-                if let Some(v) = operands.first().and_then(number) {
-                    state.stroke = [v, v, v, state.stroke[3]];
+                if !state.uniform_fill {
+                    if let Some(v) = operands.first().and_then(number) {
+                        state.stroke = [v, v, v, state.stroke[3]];
+                    }
                 }
             }
             "rg" => {
-                if operands.len() >= 3 {
+                if !state.uniform_fill && operands.len() >= 3 {
                     let c: Vec<f32> = operands.iter().filter_map(number).collect();
                     if c.len() >= 3 {
                         state.fill = [c[0], c[1], c[2], state.fill[3]];
@@ -853,7 +1021,7 @@ fn execute(
                 }
             }
             "RG" => {
-                if operands.len() >= 3 {
+                if !state.uniform_fill && operands.len() >= 3 {
                     let c: Vec<f32> = operands.iter().filter_map(number).collect();
                     if c.len() >= 3 {
                         state.stroke = [c[0], c[1], c[2], state.stroke[3]];
@@ -861,7 +1029,7 @@ fn execute(
                 }
             }
             "k" => {
-                if operands.len() >= 4 {
+                if !state.uniform_fill && operands.len() >= 4 {
                     let c: Vec<f32> = operands.iter().filter_map(number).collect();
                     if c.len() >= 4 {
                         state.fill = cmyk_to_rgba(c[0], c[1], c[2], c[3], state.fill[3]);
@@ -869,7 +1037,7 @@ fn execute(
                 }
             }
             "K" => {
-                if operands.len() >= 4 {
+                if !state.uniform_fill && operands.len() >= 4 {
                     let c: Vec<f32> = operands.iter().filter_map(number).collect();
                     if c.len() >= 4 {
                         state.stroke = cmyk_to_rgba(c[0], c[1], c[2], c[3], state.stroke[3]);
@@ -881,7 +1049,6 @@ fn execute(
                     if let (Some(x), Some(y)) = (number(&operands[0]), number(&operands[1])) {
                         let p = state.ctm.apply((x, y));
                         state.path.move_to(p.0, p.1);
-                        state.pending = Some((x, y));
                     }
                 }
             }
@@ -890,7 +1057,6 @@ fn execute(
                     if let (Some(x), Some(y)) = (number(&operands[0]), number(&operands[1])) {
                         let p = state.ctm.apply((x, y));
                         state.path.line_to(p.0, p.1);
-                        state.pending = Some((x, y));
                     }
                 }
             }
@@ -902,20 +1068,37 @@ fn execute(
                         let c2 = state.ctm.apply((n[2], n[3]));
                         let end = state.ctm.apply((n[4], n[5]));
                         state.path.cubic_to(c1, c2, end);
-                        state.pending = Some((n[4], n[5]));
                     }
                 }
             }
-            "v" | "y" => {
+            // `v` and `y` are short cubic forms. Treating both as a full `c`
+            // (with the first operand reused as a control point) bent every
+            // rounded icon corner the wrong way; `y` was also read one operand
+            // short, so the curve ended at the wrong point.
+            "v" => {
                 if operands.len() >= 4 {
                     let n: Vec<f32> = operands.iter().filter_map(number).collect();
                     if n.len() >= 4 {
-                        let start = state.pending.unwrap_or((n[0], n[1]));
-                        let c1 = state.ctm.apply((n[0], n[1]));
+                        let start = state
+                            .path
+                            .contours
+                            .last()
+                            .and_then(|contour| contour.last().copied())
+                            .unwrap_or_else(|| state.ctm.apply((n[0], n[1])));
+                        let c2 = state.ctm.apply((n[0], n[1]));
                         let end = state.ctm.apply((n[2], n[3]));
-                        state.path.cubic_to(c1, c1, end);
-                        let _ = start;
-                        state.pending = Some((n[2], n[3]));
+                        state.path.cubic_to(start, c2, end);
+                    }
+                }
+            }
+            "y" => {
+                if operands.len() >= 6 {
+                    let n: Vec<f32> = operands.iter().filter_map(number).collect();
+                    if n.len() >= 6 {
+                        let c1 = state.ctm.apply((n[0], n[1]));
+                        let c2 = state.ctm.apply((n[2], n[3]));
+                        let end = state.ctm.apply((n[4], n[5]));
+                        state.path.cubic_to(c1, c2, end);
                     }
                 }
             }
@@ -1031,15 +1214,20 @@ fn execute(
                     text.h_scale = v / 100.0;
                 }
             }
+            "Tr" => {
+                if let Some(v) = operands.first().and_then(number) {
+                    text.render_mode = v.clamp(0.0, 7.0) as u8;
+                }
+            }
             "Tj" => {
                 if let Some(Object::String(bytes, _)) = operands.first() {
-                    draw_text(pixmap, state, &text, bytes, fonts, resources);
+                    draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth);
                 }
             }
             "'" => {
                 text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
                 if let Some(Object::String(bytes, _)) = operands.first() {
-                    draw_text(pixmap, state, &text, bytes, fonts, resources);
+                    draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth);
                 }
             }
             "\"" => {
@@ -1050,7 +1238,7 @@ fn execute(
                     }
                     text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
                     if let Object::String(bytes, _) = &operands[2] {
-                        draw_text(pixmap, state, &text, bytes, fonts, resources);
+                        draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth);
                     }
                 }
             }
@@ -1059,7 +1247,7 @@ fn execute(
                     for item in items {
                         match item {
                             Object::String(bytes, _) => {
-                                draw_text(pixmap, state, &text, bytes, fonts, resources)
+                                draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth)
                             }
                             other => {
                                 if let Some(k) = number(other) {
@@ -1214,6 +1402,9 @@ struct TextState {
     char_spacing: f32,
     word_spacing: f32,
     h_scale: f32,
+    /// `Tr`: 0 fill, 1 stroke, 2 both, 3 invisible, 4-6 the same plus clip,
+    /// 7 clip only. OCR layers use 3, so painting them would double every line.
+    render_mode: u8,
 }
 
 impl Default for TextState {
@@ -1226,6 +1417,7 @@ impl Default for TextState {
             char_spacing: 0.0,
             word_spacing: 0.0,
             h_scale: 1.0,
+            render_mode: 0,
         }
     }
 }
@@ -1236,15 +1428,20 @@ impl Default for TextState {
 /// and a subset font stores whatever the producer chose. `/ToUnicode` turns them
 /// back into characters; without it a simple font is read as WinAnsi (the
 /// encoding of every standard-14 font) and a composite font draws nothing rather
-/// than random Latin letters. Glyphs come from a substituted system font, with a
-/// per-character fallback so a document mixing scripts does not lose characters.
+/// than random Latin letters. Glyphs come from an embedded program when the file
+/// ships one, otherwise from a substituted system font with a per-character
+/// fallback. A Type3 font has no outline at all: its glyph is a content stream,
+/// which is executed with the glyph matrix as CTM.
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
+    doc: &Document,
     pixmap: &mut Pixmap,
     state: &mut State,
     text: &TextState,
     bytes: &[u8],
     fonts: &FontSet,
     resources: &Resources,
+    depth: u8,
 ) {
     let resource = text
         .font
@@ -1253,7 +1450,8 @@ fn draw_text(
     // A document that carries its own glyph program is drawn from it; the
     // system font is only a stand-in for fonts the file does not embed.
     let embedded = resource.and_then(|r| r.embedded.as_deref());
-    if embedded.is_none() && fonts.is_empty() {
+    let type3 = resource.and_then(|r| r.type3.as_ref());
+    if embedded.is_none() && type3.is_none() && fonts.is_empty() {
         return;
     }
     let preferred = fonts.pick(resource.map(|r| r.base.as_str()).unwrap_or_default());
@@ -1267,15 +1465,17 @@ fn draw_text(
     } else {
         text.h_scale
     };
+    // Modes 3 and 7 render nothing; OCR layers rely on that.
+    let visible = !matches!(text.render_mode, 3 | 7);
 
-    // (character, embedded glyph, is a single-byte space) per code unit.
-    let decoded: Vec<(Option<char>, Option<u16>, bool)> = match resource {
+    // (code, character, embedded glyph, is a single-byte space) per code unit.
+    let decoded: Vec<(u32, Option<char>, Option<u16>, bool)> = match resource {
         Some(font) if font.is_cid => bytes
             .chunks(2)
             .map(|pair| {
                 let code = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]) as u32;
                 let ch = font.char_for(code);
-                (ch, font.glyph(code, ch), false)
+                (code, ch, font.glyph(code, ch), false)
             })
             .collect(),
         Some(font) => bytes
@@ -1283,47 +1483,89 @@ fn draw_text(
             .map(|&byte| {
                 let code = byte as u32;
                 let ch = font.char_for(code);
-                (ch, font.glyph(code, ch), byte == b' ')
+                (code, ch, font.glyph(code, ch), byte == b' ')
             })
             .collect(),
         None => bytes
             .iter()
-            .map(|&byte| (win_ansi(byte), None, byte == b' '))
+            .map(|&byte| (byte as u32, win_ansi(byte), None, byte == b' '))
             .collect(),
     };
 
     // Pen position in text space; the outline is scaled by size/upem.
     let mut pen = text.line_matrix;
 
-    for (ch, embedded_gid, is_space) in decoded {
+    for (code, ch, embedded_gid, is_space) in decoded {
         let mut step = size * 0.5;
-        // The embedded program wins when it has the glyph; otherwise a system
-        // face that does. A subset without the character falls back per glyph.
-        let drawn = match (embedded, embedded_gid) {
-            (Some(font), Some(gid)) => Some((font, gid)),
-            _ => ch.and_then(|ch| fonts.resolve(preferred, ch)),
-        };
-        if let Some((font, gid)) = drawn {
-            let upem = font.units_per_em();
-            let to_device = state
-                .ctm
-                .mul(&pen)
-                .mul(&Matrix::scale(size / upem, size / upem));
-            let mut path = Path::new();
-            for contour in font.outline(gid) {
-                if contour.len() < 2 {
-                    continue;
+
+        if let (Some(font), true) = (type3, visible) {
+            // Type3: run the glyph procedure. FontMatrix maps glyph space to
+            // text space, size and Tm then take it to the device.
+            if let Ok(byte) = u8::try_from(code) {
+                if let Some(glyph) = font.glyph(doc, byte) {
+                    let mut inner = state.clone();
+                    inner.ctm = state
+                        .ctm
+                        .mul(&pen)
+                        .mul(&Matrix::scale(size, size))
+                        .mul(&font.matrix);
+                    inner.path = Path::new();
+                    inner.uniform_fill = glyph.uniform;
+                    let mut stack: Vec<State> = Vec::new();
+                    execute(
+                        doc,
+                        &glyph.ops,
+                        pixmap,
+                        &mut inner,
+                        &mut stack,
+                        resources,
+                        fonts,
+                        depth + 1,
+                    );
+                    if glyph.width > 0.0 {
+                        // The advance is reported in glyph space and inherits
+                        // the FontMatrix's horizontal scale.
+                        step = glyph.width * font.matrix.a * size;
+                    }
                 }
-                let first = to_device.apply(contour[0]);
-                path.move_to(first.0, first.1);
-                for point in contour.iter().skip(1) {
-                    let p = to_device.apply(*point);
-                    path.line_to(p.0, p.1);
-                }
-                path.close();
             }
-            raster::fill(pixmap, &path, state.fill);
-            step = font.advance(gid) / upem * size;
+        } else if visible {
+            // The embedded program wins when it has the glyph; otherwise a
+            // system face that does. A subset without the character falls back
+            // per glyph.
+            let drawn = match (embedded, embedded_gid) {
+                (Some(font), Some(gid)) => Some((font, gid)),
+                _ => ch.and_then(|ch| fonts.resolve(preferred, ch)),
+            };
+            if let Some((font, gid)) = drawn {
+                let upem = font.units_per_em();
+                let to_device = state
+                    .ctm
+                    .mul(&pen)
+                    .mul(&Matrix::scale(size / upem, size / upem));
+                let mut path = Path::new();
+                for contour in font.outline(gid) {
+                    if contour.len() < 2 {
+                        continue;
+                    }
+                    let first = to_device.apply(contour[0]);
+                    path.move_to(first.0, first.1);
+                    for point in contour.iter().skip(1) {
+                        let p = to_device.apply(*point);
+                        path.line_to(p.0, p.1);
+                    }
+                    path.close();
+                }
+                // Modes 1/5 stroke, 2/6 do both, the rest fill.
+                if matches!(text.render_mode, 0 | 2 | 4 | 6) {
+                    raster::fill(pixmap, &path, state.fill);
+                }
+                if matches!(text.render_mode, 1 | 2 | 5 | 6) {
+                    let width = (state.line_width * state.ctm.stroke_scale()).max(0.4);
+                    raster::stroke(pixmap, &path, state.stroke, width);
+                }
+                step = font.advance(gid) / upem * size;
+            }
         }
 
         // Advance: glyph advance in text space, plus spacing, scaled by Tz.
@@ -1365,8 +1607,58 @@ fn win_ansi(byte: u8) -> Option<char> {
 /// DCTDecode (JPEG, passed through), FlateDecode and LZWDecode (optionally with
 /// a PNG or TIFF predictor), CCITTFaxDecode (G3 1D/2D and G4) and JBIG2. A
 /// stencil mask (`/ImageMask true`) is painted with the current fill colour
-/// instead of black.
+/// instead of black. `/SMask` is applied afterwards: without it a transparent
+/// icon is painted as a solid rectangle.
 fn decode_image(doc: &Document, stream: &lopdf::Stream, fill: [f32; 4]) -> Option<ImageRgba> {
+    let mut image = decode_image_pixels(doc, stream, fill)?;
+    apply_soft_mask(doc, stream, &mut image);
+    Some(image)
+}
+
+/// Multiply an image's alpha by its `/SMask`.
+///
+/// The mask is a DeviceGray image of its own; it can be at a different
+/// resolution than the colour image, so it is sampled with nearest neighbour.
+fn apply_soft_mask(doc: &Document, stream: &lopdf::Stream, image: &mut ImageRgba) {
+    let Some(id) = stream
+        .dict
+        .get(b"SMask")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+    else {
+        return;
+    };
+    let Some(mask_stream) = doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) else {
+        return;
+    };
+    // A mask has no alpha of its own: decode its luminance, not a second mask.
+    let Some(mask) = decode_image_pixels(doc, mask_stream, [1.0, 1.0, 1.0, 1.0]) else {
+        return;
+    };
+    if mask.width == 0 || mask.height == 0 {
+        return;
+    }
+    for y in 0..image.height {
+        let my = (y as u64 * mask.height as u64 / image.height as u64) as usize;
+        for x in 0..image.width {
+            let mx = (x as u64 * mask.width as u64 / image.width as u64) as usize;
+            let mi = (my * mask.width as usize + mx) * 4;
+            let ii = ((y as usize) * image.width as usize + x as usize) * 4;
+            if mi + 3 >= mask.data.len() || ii + 3 >= image.data.len() {
+                continue;
+            }
+            let coverage = mask.data[mi] as u32;
+            image.data[ii + 3] = (image.data[ii + 3] as u32 * coverage / 255) as u8;
+        }
+    }
+}
+
+/// Decode the pixels of an image XObject, without its soft mask.
+fn decode_image_pixels(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    fill: [f32; 4],
+) -> Option<ImageRgba> {
     let width = stream.dict.get(b"Width").ok().and_then(number)? as u32;
     let height = stream.dict.get(b"Height").ok().and_then(number)? as u32;
     if width == 0 || height == 0 || width > 8000 || height > 8000 {
@@ -1459,7 +1751,7 @@ fn decode_image(doc: &Document, stream: &lopdf::Stream, fill: [f32; 4]) -> Optio
         }
     }
 
-    samples_to_rgba(stream, &data, width, height, paint)
+    samples_to_rgba(doc, stream, &data, width, height, paint)
 }
 
 /// How a decoded raster should become pixels.
@@ -1763,6 +2055,7 @@ fn bilevel_rgba(gray: &[u8], width: u32, height: u32, paint: Paint) -> ImageRgba
 
 /// Unpack 8-bit and sub-byte samples, then map them through the colour space.
 fn samples_to_rgba(
+    doc: &Document,
     stream: &lopdf::Stream,
     plain: &[u8],
     width: u32,
@@ -1776,25 +2069,50 @@ fn samples_to_rgba(
         .and_then(number)
         .unwrap_or(8.0)
         .clamp(1.0, 16.0) as u32;
-    let components = match stream.dict.get(b"ColorSpace") {
-        Ok(Object::Name(name)) => match name.as_slice() {
-            b"DeviceGray" | b"G" => 1usize,
-            b"DeviceCMYK" | b"CMYK" => 4,
-            _ => 3,
-        },
-        _ => 3,
-    };
     if paint.mask && bits != 1 {
         return None;
     }
-    let samples = unpack_samples(plain, width, height, components, bits)?;
     if paint.mask {
+        let samples = unpack_samples(plain, width, height, 1, bits)?;
         // A mask has one component and paints where the sample is "on".
         let gray: Vec<u8> = samples.iter().map(|&s| 255 - s).collect();
         return Some(bilevel_rgba(&gray, width, height, paint));
     }
 
+    let space = resolve_space(doc, stream).unwrap_or(Space::Rgb);
     let mut data = Vec::with_capacity(width as usize * height as usize * 4);
+
+    // Indexed colour: the samples are palette indices, not components, so they
+    // must not be scaled to 0-255 on the way out.
+    if let Space::Indexed {
+        base,
+        lookup,
+        hival,
+    } = &space
+    {
+        let count = width as usize * height as usize;
+        let indices = unpack_indices(plain, count, bits)?;
+        let per_entry = base.components();
+        for index in indices {
+            let entry = (index as usize).min(*hival);
+            let start = entry * per_entry;
+            // A truncated palette is a broken file; white keeps the page legible
+            // instead of painting whatever bytes follow.
+            if start + per_entry > lookup.len() {
+                data.extend_from_slice(&[255, 255, 255, 255]);
+                continue;
+            }
+            push_sample(&mut data, base, &lookup[start..start + per_entry], false);
+        }
+        return Some(ImageRgba {
+            width,
+            height,
+            data,
+        });
+    }
+
+    let components = space.components();
+    let samples = unpack_samples(plain, width, height, components, bits)?;
     match components {
         1 => {
             for &value in &samples {
@@ -1831,6 +2149,146 @@ fn samples_to_rgba(
         height,
         data,
     })
+}
+
+/// An image's colour space, as far as decoding samples needs it.
+#[derive(Clone)]
+enum Space {
+    Gray,
+    Rgb,
+    Cmyk,
+    /// Palette image: samples index `lookup`, `base` describes each entry.
+    Indexed {
+        base: Box<Space>,
+        lookup: Vec<u8>,
+        hival: usize,
+    },
+}
+
+impl Space {
+    fn components(&self) -> usize {
+        match self {
+            Space::Gray => 1,
+            Space::Rgb => 3,
+            Space::Cmyk => 4,
+            Space::Indexed { .. } => 1,
+        }
+    }
+}
+
+/// Resolve `/ColorSpace`, following references and the array forms that carry
+/// an embedded profile or a palette.
+fn resolve_space(doc: &Document, stream: &lopdf::Stream) -> Option<Space> {
+    space_from(doc, stream.dict.get(b"ColorSpace").ok()?, 0)
+}
+
+fn space_from(doc: &Document, value: &Object, depth: u8) -> Option<Space> {
+    if depth > 4 {
+        return None;
+    }
+    match value {
+        Object::Name(name) => Some(match name.as_slice() {
+            b"DeviceGray" | b"G" | b"CalGray" => Space::Gray,
+            b"DeviceCMYK" | b"CMYK" => Space::Cmyk,
+            // DeviceRGB and any unknown named space: three components is the
+            // only other thing an image stream can be here.
+            _ => Space::Rgb,
+        }),
+        Object::Reference(id) => doc
+            .get_object(*id)
+            .ok()
+            .and_then(|object| space_from(doc, object, depth + 1)),
+        Object::Array(items) => match items.first() {
+            Some(Object::Name(kind)) => match kind.as_slice() {
+                b"ICCBased" => {
+                    let dict = items.get(1).and_then(|o| deref_dict(doc, o))?;
+                    Some(
+                        match dict.get(b"N").ok().and_then(|o| o.as_i64().ok()).unwrap_or(3) {
+                            1 => Space::Gray,
+                            4 => Space::Cmyk,
+                            _ => Space::Rgb,
+                        },
+                    )
+                }
+                b"Indexed" | b"I" => {
+                    let base = space_from(doc, items.get(1)?, depth + 1)?;
+                    let hival = items.get(2).and_then(number).unwrap_or(255.0) as usize;
+                    let lookup = match items.get(3)? {
+                        Object::String(bytes, _) => bytes.clone(),
+                        Object::Reference(id) => doc
+                            .get_object(*id)
+                            .ok()
+                            .and_then(|o| o.as_stream().ok())
+                            .and_then(decoded_stream_content)?,
+                        _ => return None,
+                    };
+                    Some(Space::Indexed {
+                        base: Box::new(base),
+                        lookup,
+                        hival,
+                    })
+                }
+                b"CalRGB" | b"Lab" => Some(Space::Rgb),
+                // Separation / DeviceN need a tint transform; painting the raw
+                // samples would put noise on the page.
+                b"Separation" | b"DeviceN" => None,
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Append one colour entry (RGB, already 8-bit) to the pixel buffer.
+fn push_sample(data: &mut Vec<u8>, space: &Space, bytes: &[u8], inverted: bool) {
+    match space {
+        Space::Gray => {
+            let mut value = bytes[0];
+            if inverted {
+                value = 255 - value;
+            }
+            data.extend_from_slice(&[value, value, value, 255]);
+        }
+        Space::Cmyk => {
+            let mut c = [bytes[0], bytes[1], bytes[2], bytes[3]];
+            if inverted {
+                c = [255 - c[0], 255 - c[1], 255 - c[2], 255 - c[3]];
+            }
+            let k = c[3] as f32 / 255.0;
+            for &ink in &c[..3] {
+                let v = ink as f32 / 255.0;
+                data.push(((1.0 - (v + k).min(1.0)) * 255.0) as u8);
+            }
+            data.push(255);
+        }
+        _ => data.extend_from_slice(&[bytes[0], bytes[1], bytes[2], 255]),
+    }
+}
+
+/// Unpack palette indices without scaling them: index 3 must stay 3.
+fn unpack_indices(plain: &[u8], count: usize, bits: u32) -> Option<Vec<u8>> {
+    if bits == 8 {
+        if plain.len() < count {
+            return None;
+        }
+        return Some(plain[..count].to_vec());
+    }
+    if bits > 8 {
+        return None;
+    }
+    let per_byte = (8 / bits) as usize;
+    let mask = ((1u32 << bits) - 1) as u8;
+    let mut out = Vec::with_capacity(count);
+    'outer: for &byte in plain {
+        for slot in 0..per_byte {
+            out.push((byte >> (8 - bits * (slot as u32 + 1))) & mask);
+            if out.len() == count {
+                break 'outer;
+            }
+        }
+    }
+    (out.len() == count).then_some(out)
 }
 
 /// Expand samples of `bits` width into one byte per sample (high bit first).

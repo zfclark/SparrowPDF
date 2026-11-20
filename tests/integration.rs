@@ -2629,3 +2629,317 @@ fn pdf_to_image_reports_the_page_that_cannot_be_written() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+// ---------------------------------------------------------------------------
+// Renderer: text and icon fidelity
+// ---------------------------------------------------------------------------
+
+/// Finish a one-page document whose single page already has its objects.
+fn finish_page(
+    mut doc: lopdf::Document,
+    content: String,
+    resources: lopdf::Dictionary,
+    width: f32,
+    height: f32,
+    path: &Path,
+) -> PathBuf {
+    use lopdf::{dictionary, Object, Stream};
+
+    let content_id = doc.add_object(Stream::new(Default::default(), content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "MediaBox" => vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(width),
+            Object::Real(height),
+        ],
+        "Contents" => content_id,
+        "Resources" => resources,
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => 1i64,
+        "Kids" => vec![page_id.into()],
+    });
+    if let Ok(dict) = doc.get_object_mut(page_id).unwrap().as_dict_mut() {
+        dict.set("Parent", pages_id);
+    }
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    doc.save(path).expect("save fixture");
+    path.to_path_buf()
+}
+
+/// Render at 72 DPI so one point is one pixel, then read the pixel under a
+/// user-space coordinate (`y` grows upward in PDF space).
+fn pixel_at(pdf: &Path, page_pt: f32, x: f32, y: f32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let pages = render::render_page_thumbnails(pdf, None, &[1], page_pt, &fonts)
+        .expect("render fixture page");
+    let pixmap = &pages[0].1;
+    let px = x.floor().clamp(0.0, pixmap.width as f32 - 1.0) as usize;
+    let py = (page_pt - y).floor().clamp(0.0, pixmap.height as f32 - 1.0) as usize;
+    let index = (py * pixmap.width as usize + px) * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// One-page PDF using a Type3 font whose single glyph (`A`) is a filled square.
+fn make_type3_pdf(dir: &Path, name: &str, render_mode: u8) -> PathBuf {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.4");
+    let proc_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f".to_vec(),
+    ));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let content = format!("BT /F1 100 Tf {render_mode} Tr 100 100 Td (A) Tj ET");
+    finish_page(doc, content, resources, 300.0, 300.0, &dir.join(name))
+}
+
+/// Type3 text used to disappear completely: the font has no outline to draw and
+/// its glyphs live in `/CharProcs`. The same mechanism draws icon fonts.
+#[test]
+fn renderer_draws_type3_glyph_procedures() {
+    let dir = scratch("render-type3");
+    let pdf = make_type3_pdf(&dir, "type3.pdf", 0);
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "Type3 glyph must paint its square, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 40.0, 260.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "outside the glyph must stay white, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Tr 3` marks text as invisible (OCR layers); painting it doubles the page.
+#[test]
+fn renderer_skips_invisible_text() {
+    let dir = scratch("render-type3-hidden");
+    let pdf = make_type3_pdf(&dir, "type3-hidden.pdf", 3);
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "invisible text must not be painted, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 4x4 green image whose `/SMask` clears the left half.
+fn make_smask_pdf(dir: &Path, name: &str) -> PathBuf {
+    use lopdf::{dictionary, Document, Stream};
+
+    let mut doc = Document::with_version("1.4");
+    let rgb: Vec<u8> = (0..16).flat_map(|_| [0u8, 180, 0]).collect();
+    let mask: Vec<u8> = (0..4)
+        .flat_map(|_| [0u8, 0, 255, 255])
+        .collect();
+    let mask_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8i64,
+        },
+        mask,
+    ));
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+            "SMask" => mask_id,
+        },
+        rgb,
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    finish_page(
+        doc,
+        "q 200 0 0 200 50 50 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join(name),
+    )
+}
+
+/// Without `/SMask` a transparent icon is painted as a solid rectangle.
+#[test]
+fn renderer_applies_image_soft_mask() {
+    let dir = scratch("render-smask");
+    let pdf = make_smask_pdf(&dir, "smask.pdf");
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 150.0);
+    assert!(
+        g > 120 && r < 80 && b < 80,
+        "opaque half must show the green image, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 100.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "masked half must stay page white, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 4x4 image using an `Indexed` palette (entry 0 red, entry 1 green); every
+/// sample is 1, so the page must be green.
+#[test]
+fn renderer_decodes_indexed_colour_images() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-indexed");
+    let mut doc = Document::with_version("1.4");
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => vec![
+                Object::Name(b"Indexed".to_vec()),
+                Object::Name(b"DeviceRGB".to_vec()),
+                Object::Integer(1),
+                Object::String(vec![255, 0, 0, 0, 255, 0], lopdf::StringFormat::Literal),
+            ],
+            "BitsPerComponent" => 8i64,
+        },
+        vec![1u8; 16],
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("indexed.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        g > 150 && r < 80 && b < 80,
+        "index 1 must resolve to the green palette entry, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A wide image (left half red, right half blue) placed with a `cm` that turns
+/// it 90°. Sampling the bounding box instead of the affine map painted the
+/// wrong half on each side — the "icon looks broken" report.
+#[test]
+fn renderer_places_rotated_images_through_the_affine_map() {
+    use lopdf::{dictionary, Document, Stream};
+
+    let dir = scratch("render-rotated-image");
+    let mut doc = Document::with_version("1.4");
+    let mut pixels: Vec<u8> = Vec::new();
+    for _ in 0..4 {
+        for x in 0..8 {
+            pixels.extend_from_slice(if x < 4 { &[255, 0, 0] } else { &[0, 0, 255] });
+        }
+    }
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 8i64,
+            "Height" => 4i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+        },
+        pixels,
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        // Unit square -> 200 pt tall, 100 pt wide, rotated a quarter turn.
+        "q 0 200 -100 0 250 50 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("rotated.pdf"),
+    );
+
+    // `pixel_at` takes user space (y up): the bottom of the strip is y=80.
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 80.0);
+    assert!(
+        r > 150 && g < 80 && b < 80,
+        "bottom of the rotated strip must be the red half, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 220.0);
+    assert!(
+        b > 150 && r < 80 && g < 80,
+        "top of the rotated strip must be the blue half, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `y` is a cubic with two control points and a distinct end point. Reading it
+/// as `v` ended the edge at the first control point, so the filled region lost
+/// its bottom-left corner (rounded icon corners came out squared off wrong).
+#[test]
+fn renderer_honours_short_cubic_operators() {
+    use lopdf::{dictionary, Document};
+
+    let dir = scratch("render-short-cubic");
+    let doc = Document::with_version("1.4");
+    let pdf = finish_page(
+        doc,
+        "0 0 0 rg 10 10 m 190 10 190 190 10 190 y 10 10 l f".to_string(),
+        dictionary! {},
+        200.0,
+        200.0,
+        &dir.join("curve.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 200.0, 13.0, 178.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "region left of the curve must be filled, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

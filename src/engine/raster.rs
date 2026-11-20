@@ -424,40 +424,51 @@ pub fn stroke(pixmap: &mut Pixmap, path: &Path, color: [f32; 4], width: f32) {
     fill(pixmap, &out, color);
 }
 
-/// Draw an axis-aligned image into the pixmap, sampling nearest-neighbour.
+/// Draw an image into the pixmap through its unit-square corners.
+///
+/// The mapping is a full inverse affine transform, not a bounding box: an icon
+/// placed with a rotated `cm` used to be skipped entirely (the old axis-aligned
+/// fast path), which read as "the icon is missing". Sampling stays
+/// nearest-neighbour, so a document-sized scan does not pay for bilinear.
 pub fn draw_image(pixmap: &mut Pixmap, image: &ImageRgba, corners: [Point; 4], alpha: f32) {
     if image.width == 0 || image.height == 0 || alpha <= 0.0 {
         return;
     }
-    // Axis-aligned fast path only; rotated images are skipped rather than wrong.
+    let origin = corners[0];
+    let ex = (corners[1].0 - origin.0, corners[1].1 - origin.1);
+    let ey = (corners[3].0 - origin.0, corners[3].1 - origin.1);
+    let det = ex.0 * ey.1 - ex.1 * ey.0;
+    if !det.is_finite() || det.abs() < 1e-6 {
+        return;
+    }
     let xs = [corners[0].0, corners[1].0, corners[2].0, corners[3].0];
     let ys = [corners[0].1, corners[1].1, corners[2].1, corners[3].1];
+    if !xs.iter().chain(ys.iter()).all(|v| v.is_finite()) {
+        return;
+    }
     let min_x = xs.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_x = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let min_y = ys.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_y = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    if !(min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite()) {
-        return;
-    }
-
-    let dw = max_x - min_x;
-    let dh = max_y - min_y;
-    if dw.abs() < 0.5 || dh.abs() < 0.5 {
-        return;
-    }
 
     let x_start = min_x.max(0.0).floor() as i64;
     let x_end = max_x.min(pixmap.width as f32).ceil() as i64;
     let y_start = min_y.max(0.0).floor() as i64;
     let y_end = max_y.min(pixmap.height as f32).ceil() as i64;
+    if x_end <= x_start || y_end <= y_start {
+        return;
+    }
 
+    let inv = 1.0 / det;
     for py in y_start..y_end {
+        let dy = py as f32 + 0.5 - origin.1;
         for px in x_start..x_end {
-            if px < 0 || py < 0 || px >= pixmap.width as i64 || py >= pixmap.height as i64 {
+            let dx = px as f32 + 0.5 - origin.0;
+            let u = (dx * ey.1 - dy * ey.0) * inv;
+            let v = (ex.0 * dy - ex.1 * dx) * inv;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
             }
-            let u = ((px as f32 + 0.5 - min_x) / dw).clamp(0.0, 0.999);
-            let v = ((py as f32 + 0.5 - min_y) / dh).clamp(0.0, 0.999);
             let sx = (u * image.width as f32) as u32;
             let sy = (v * image.height as f32) as u32;
             let idx = ((sy as usize) * image.width as usize + sx as usize) * 4;
