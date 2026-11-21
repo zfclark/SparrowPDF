@@ -3398,3 +3398,254 @@ fn renderer_survives_type3_resource_cycle() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------- batch: grouping by name
+
+/// Request for the folder batch tool with the by-name grouping selected.
+fn batch_by_name(folders: Vec<PathBuf>, output: PathBuf) -> ToolRequest {
+    let mut req = request(ToolId::FolderToPdf, folders, output);
+    if let ToolOptions::FolderToPdf { grouping, .. } = &mut req.options {
+        *grouping = sparrowpdf::tools::BatchGrouping::ByName;
+    }
+    req
+}
+
+fn pdf_pages(path: &Path) -> usize {
+    lopdf::Document::load(path).expect("load pdf").get_pages().len()
+}
+
+#[test]
+fn folder_batch_groups_images_by_base_name() {
+    let dir = scratch("batch-by-name");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["xxx_1.png", "xxx_2.png", "yyy_1.png", "yyy_2.png"] {
+        make_image(&album, name, 40, 30);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    let outcome = run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert_eq!(outcome.outputs.len(), 2, "one PDF per base name");
+    assert_eq!(pdf_pages(&out.join("xxx.pdf")), 2);
+    assert_eq!(pdf_pages(&out.join("yyy.pdf")), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_sort_sequence_numerically() {
+    let dir = scratch("batch-by-name-order");
+    for name in ["xxx_10.png", "xxx_2.png"] {
+        make_image(&dir, name, 40, 30);
+    }
+    let images = sparrowpdf::tools::folder_to_pdf::collect_images(&dir);
+    let groups = sparrowpdf::tools::folder_to_pdf::group_images(&images);
+    assert_eq!(groups.len(), 1);
+    let names: Vec<String> = groups[0]
+        .images
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["xxx_2.png", "xxx_10.png"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_keep_same_base_from_two_folders_apart() {
+    let dir = scratch("batch-by-name-collision");
+    let album1 = dir.join("one");
+    let album2 = dir.join("two");
+    std::fs::create_dir_all(&album1).unwrap();
+    std::fs::create_dir_all(&album2).unwrap();
+    for album in [&album1, &album2] {
+        make_image(album, "xxx_1.png", 40, 30);
+        make_image(album, "xxx_2.png", 40, 30);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album1, album2], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert!(out.join("xxx.pdf").is_file());
+    assert!(out.join("xxx-2.pdf").is_file(), "second folder gets a serial");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_leave_unnumbered_files_alone() {
+    let dir = scratch("batch-by-name-plain");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "cover.png", 40, 30);
+    make_image(&album, "xxx_1.png", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert_eq!(pdf_pages(&out.join("cover.pdf")), 1);
+    assert_eq!(pdf_pages(&out.join("xxx.pdf")), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_date_prefix_by_sequence() {
+    let dir = scratch("batch-by-name-date");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["2025年总结_1.png", "2025年总结_2.png"] {
+        make_image(&album, name, 40, 30);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert_eq!(pdf_pages(&out.join("年总结.pdf")), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_pure_numbers_stay_separate() {
+    let dir = scratch("batch-by-name-numbers");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "1.png", 40, 30);
+    make_image(&album, "2.png", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert_eq!(pdf_pages(&out.join("1.pdf")), 1);
+    assert_eq!(pdf_pages(&out.join("2.pdf")), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_report_existing_without_writing() {
+    use sparrowpdf::model::ConflictPolicy;
+
+    let dir = scratch("batch-by-name-conflict");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "xxx_1.png", 40, 30);
+    make_image(&album, "yyy_1.png", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("xxx.pdf"), b"taken").unwrap();
+
+    let mut req = batch_by_name(vec![album], out.clone());
+    req.conflict = ConflictPolicy::Report;
+    match run(ToolId::FolderToPdf, &req) {
+        Err(ToolError::OutputExists { paths }) => {
+            assert!(paths.iter().any(|p| p.ends_with("xxx.pdf")));
+        }
+        other => panic!("expected OutputExists, got {:?}", other.is_ok()),
+    }
+    assert!(
+        !out.join("yyy.pdf").exists(),
+        "nothing may be written before the conflict is resolved"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_skip_one_broken_group() {
+    let dir = scratch("batch-by-name-broken");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "good_1.png", 40, 30);
+    make_image(&album, "bad_1.png", 40, 30);
+    std::fs::write(album.join("bad_2.png"), b"not an image").unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    match run(ToolId::FolderToPdf, &req) {
+        Err(ToolError::PartialSuccess {
+            succeeded,
+            failed,
+            detail,
+            outputs,
+        }) => {
+            assert_eq!(succeeded, 1);
+            assert_eq!(failed, 1);
+            assert!(detail.contains("bad"), "{detail}");
+            assert_eq!(outputs.len(), 1);
+            assert!(out.join("good.pdf").is_file());
+        }
+        other => panic!("expected PartialSuccess, got {:?}", other.is_ok()),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_skip_short_merge_spec_group() {
+    let dir = scratch("batch-by-name-spec-short");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "short_1.png", 40, 30);
+    for name in ["long_1.png", "long_2.png", "long_3.png"] {
+        make_image(&album, name, 40, 30);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let mut req = batch_by_name(vec![album], out.clone());
+    if let ToolOptions::FolderToPdf {
+        mode,
+        use_merge_spec,
+        merge_spec,
+        ..
+    } = &mut req.options
+    {
+        *mode = sparrowpdf::tools::BatchPageMode::TwoPerPage;
+        *use_merge_spec = true;
+        *merge_spec = "2-3".to_string();
+    }
+
+    match run(ToolId::FolderToPdf, &req) {
+        Err(ToolError::PartialSuccess {
+            succeeded,
+            failed,
+            detail,
+            outputs,
+        }) => {
+            assert_eq!(succeeded, 1, "the long group still converts");
+            assert_eq!(failed, 1, "the short group is reported");
+            assert!(detail.contains("short"), "{detail}");
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(pdf_pages(&out.join("long.pdf")), 2);
+            assert!(!out.join("short.pdf").exists());
+        }
+        other => panic!("expected PartialSuccess, got {:?}", other.is_ok()),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_apply_template_inside_each_group() {
+    let dir = scratch("batch-by-name-template");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["stu_1.jpg", "stu_2.jpg", "stu_3.jpg"] {
+        make_image(&album, name, 124, 175);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let mut req = batch_by_name(vec![album], out.clone());
+    req.options.apply_batch_template(
+        batch_template_by_key("youth-league-form").expect("preset exists"),
+    );
+
+    run(ToolId::FolderToPdf, &req).expect("template applies per group");
+    assert_eq!(
+        pdf_pages(&out.join("stu.pdf")),
+        2,
+        "pages 2 and 3 merge into one sheet inside the group"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

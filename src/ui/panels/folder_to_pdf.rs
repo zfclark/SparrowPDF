@@ -7,8 +7,9 @@
 use egui::{RichText, Ui};
 
 use crate::model::ToolId;
+use crate::tools::folder_to_pdf::{collect_images, group_images, preview_page_numbers};
 use crate::tools::{
-    BatchPageMode, Orientation, PageSize, ScanQuality, ToolOptions, BATCH_TEMPLATES,
+    BatchGrouping, BatchPageMode, Orientation, PageSize, ScanQuality, ToolOptions, BATCH_TEMPLATES,
 };
 use crate::ui::panels::{
     FormState, add_folders_button, input_list_hinted, output_selector_hinted,
@@ -19,6 +20,11 @@ use crate::ui::theme;
 pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::PreviewState) {
     let tool = ToolId::FolderToPdf;
 
+    let mut grouping = match form.options_for(tool) {
+        ToolOptions::FolderToPdf { grouping, .. } => *grouping,
+        _ => BatchGrouping::ByFolder,
+    };
+
     theme::card(ui, "输入文件夹", |ui| {
         add_folders_button(ui, tool, form);
         input_list_hinted(
@@ -28,9 +34,31 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
             true,
             "拖放文件夹到此处，或点击「添加文件夹…」",
         );
+        theme::field_row_hover(
+            ui,
+            "分组方式",
+            "整个文件夹：每个文件夹一个 PDF；按文件名：同名序号合并为一个 PDF",
+            |ui| {
+                ui.radio_value(&mut grouping, BatchGrouping::ByFolder, "整个文件夹");
+                ui.radio_value(&mut grouping, BatchGrouping::ByName, "按文件名");
+            },
+        );
+        if let ToolOptions::FolderToPdf {
+            grouping: current, ..
+        } = form.options_mut(tool)
+        {
+            *current = grouping;
+        }
         theme::hint(
             ui,
-            "每个文件夹生成一个 PDF。文件名中的数字按数值排序（1、2、…、10），无数字者排在末尾。",
+            match grouping {
+                BatchGrouping::ByFolder => {
+                    "每个文件夹生成一个 PDF。文件名中的数字按数值排序（1、2、…、10），无数字者排在末尾。"
+                }
+                BatchGrouping::ByName => {
+                    "同一基名的图片合成一个 PDF（xxx_1、xxx_2 → xxx.pdf），按文件名中的第一个数字排序；同组内请勿重复序号。"
+                }
+            },
         );
     });
 
@@ -50,14 +78,25 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
             two_per_page: *mode == BatchPageMode::TwoPerPage,
             use_merge_spec: *use_merge_spec,
             merge_spec: merge_spec.clone(),
-            strict_merge_spec: !template.owns_merge_spec(merge_spec),
+            // By-name runs apply a typed spec per group leniently, so the
+            // preview must not claim pages the run will not produce.
+            strict_merge_spec: grouping == BatchGrouping::ByFolder
+                && !template.owns_merge_spec(merge_spec),
         }),
         _ => None,
     };
-    preview::show_folders(ui, &folders, numbering.as_ref(), preview_state);
+    if grouping == BatchGrouping::ByName {
+        group_preview(ui, &folders, numbering.as_ref());
+    } else {
+        preview::show_folders(ui, &folders, numbering.as_ref(), preview_state);
+    }
 
     theme::card(ui, "输出", |ui| {
-        output_selector_hinted(ui, form, "", &[], true, "未选择时存入各自文件夹，文件名为文件夹名");
+        let hint = match grouping {
+            BatchGrouping::ByFolder => "未选择时存入各自文件夹，文件名为文件夹名",
+            BatchGrouping::ByName => "未选择时存入各自文件夹，文件名为分组名",
+        };
+        output_selector_hinted(ui, form, "", &[], true, hint);
     });
 }
 
@@ -262,5 +301,66 @@ fn params_card(ui: &mut Ui, form: &mut FormState, tool: ToolId) {
                     });
             },
         );
+    });
+}
+
+/// Preview for the by-name mode: one line per output document.
+///
+/// Thumbnails are keyed by folder, which would mislabel a run that produces
+/// several PDFs from one folder. Page counts are enough to spot a short group.
+fn group_preview(
+    ui: &mut Ui,
+    folders: &[std::path::PathBuf],
+    numbering: Option<&preview::PageNumbering>,
+) {
+    theme::card(ui, "预览", |ui| {
+        let mut total = 0usize;
+        let mut shown = 0usize;
+        let mut singles: Vec<String> = Vec::new();
+        for dir in folders {
+            for group in group_images(&collect_images(dir)) {
+                total += 1;
+                if group.images.len() == 1 {
+                    singles.push(group.name.clone());
+                }
+                if shown < 8 {
+                    let pages = numbering
+                        .map(|n| {
+                            preview_page_numbers(
+                                group.images.len(),
+                                n.two_per_page,
+                                n.use_merge_spec,
+                                &n.merge_spec,
+                                false,
+                            )
+                            .len()
+                        })
+                        .unwrap_or(group.images.len());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{}.pdf", group.name)).small());
+                        ui.label(RichText::new(format!("{pages} 页")).small().weak());
+                    });
+                    shown += 1;
+                }
+            }
+        }
+        if total == 0 {
+            theme::hint(ui, "尚未找到可用的 JPG / PNG 图片");
+            return;
+        }
+        if total > shown {
+            theme::hint(ui, &format!("按文件名分组：共 {total} 个 PDF，仅显示前 {shown} 组"));
+        } else {
+            theme::hint(ui, &format!("按文件名分组：共 {total} 个 PDF"));
+        }
+        if !singles.is_empty() {
+            let sample = singles
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("、");
+            theme::hint(ui, &format!("{} 组只有 1 张图：{sample}", singles.len()));
+        }
     });
 }

@@ -79,7 +79,7 @@ impl ToolId {
     pub fn description(self) -> &'static str {
         match self {
             ToolId::ImageToPdf => "将多张 JPEG / PNG 合成为单个 PDF，并按 EXIF 方向校正",
-            ToolId::FolderToPdf => "按模板将文件夹内的图片批量合成为 PDF，顺序依据文件名中的数字",
+            ToolId::FolderToPdf => "按模板将文件夹内的图片合成为 PDF，可按文件名分组把同名序号合并",
             ToolId::Merge => "按列表顺序合并多个 PDF",
             ToolId::Split => "按页码范围、每 N 页或逐页拆分",
             ToolId::Rotate => "按 90° 增量旋转指定页面，角度可累计",

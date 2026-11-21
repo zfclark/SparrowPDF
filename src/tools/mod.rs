@@ -52,6 +52,8 @@ pub enum ToolOptions {
         /// merge spec; every effective value lives in the fields below, so a
         /// preset is only ever applied by copying its values in.
         template: &'static BatchTemplate,
+        /// Whether the folder becomes one PDF or one PDF per base name.
+        grouping: BatchGrouping,
         /// How images are laid out on pages.
         mode: BatchPageMode,
         /// Page orientation for one-image-per-page mode.
@@ -143,6 +145,7 @@ impl ToolOptions {
                 let template = default_batch_template();
                 let mut options = ToolOptions::FolderToPdf {
                     template,
+                    grouping: BatchGrouping::ByFolder,
                     mode: BatchPageMode::Single,
                     force_orientation: None,
                     pair_orientation: Orientation::Landscape,
@@ -217,6 +220,18 @@ pub enum BatchPageMode {
     /// Two images share one landscape page.
     TwoPerPage,
 }
+
+/// How one input folder is split into output documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchGrouping {
+    /// One PDF per folder — the original behaviour.
+    #[default]
+    ByFolder,
+    /// One PDF per shared base name: `xxx_1.png` and `xxx_2.png` become
+    /// `xxx.pdf`, `yyy_1.png` becomes `yyy.pdf`.
+    ByName,
+}
+
 
 /// How much of a scan's resolution the batch tool is allowed to throw away.
 ///
@@ -527,6 +542,9 @@ impl ToolOptions {
     pub fn apply_batch_template(&mut self, template: &'static BatchTemplate) {
         let ToolOptions::FolderToPdf {
             template: current,
+            // Grouping is a run mode, not a layout: switching template must not
+            // change how many PDFs a folder produces.
+            grouping: _,
             mode,
             force_orientation,
             pair_orientation,
