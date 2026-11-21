@@ -1,8 +1,9 @@
 //! Tool: batch conversion — one PDF per input folder.
 //!
-//! * Images inside each folder are ordered by the number in their file name
-//!   (`1.png`, `2.png`, …, `10.png` sorts numerically); names without any
-//!   number keep the system listing order after the numbered ones.
+//! * Images inside each folder are ordered by the number in their trailing
+//!   segment (`1.png`, `2.png`, …, `10.png`, and `xxx_p001` sorts as 1);
+//!   numbers earlier in the name are part of the base. Names without a
+//!   trailing number keep the system listing order after the numbered ones.
 //! * Page layout comes from a preset (`BATCH_TEMPLATES`): paper size, page
 //!   orientation and one-or-two images per page. One image per page, or two
 //!   images sharing one page (`BatchPageMode::TwoPerPage`, landscape = side by
@@ -10,7 +11,10 @@
 //!   `2-3`. The chosen layout applies to *every* page of a document, including
 //!   the pages that end up with a single image.
 //! * Each folder becomes `<folder name>.pdf`, written into the folder itself
-//!   by default or into the user-chosen output directory.
+//!   by default or into the user-chosen output directory. With
+//!   `BatchGrouping::ByName` the folder is split by base name instead:
+//!   `xxx_1.png` + `xxx_2.png` become `xxx.pdf`, and every group is its own
+//!   document for layouts, merge specs and the size guard.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -21,8 +25,8 @@ use crate::engine::{pdf_io, pool, validate};
 use crate::model::{InputFile, ToolError, ToolId, ToolOutcome};
 use crate::tools::image_embed::{self, add_page, ScanBudget, Sheet, PAGE_MARGIN};
 use crate::tools::{
-    check_cancel, ensure_dir, BatchPageMode, CancelFlag, Orientation, PageSize, Progress, Tool,
-    ToolOptions, ToolRequest, SCAN_SIZE_LIMIT,
+    check_cancel, ensure_dir, BatchGrouping, BatchPageMode, CancelFlag, Orientation, PageSize,
+    Progress, Tool, ToolOptions, ToolRequest, SCAN_SIZE_LIMIT,
 };
 
 /// Outer margin between the page edge and the two image slots, in points.
@@ -241,9 +245,13 @@ impl PagePolicy {
     }
 }
 
-/// One folder's conversion job: what to read, how to lay it out, where it goes.
-struct PlannedFolder<'a> {
-    folder: &'a InputFile,
+/// One output document: what to read, how to lay it out, where it goes.
+///
+/// A folder produces one of these in `ByFolder` mode and one per base name in
+/// `ByName` mode, so the render loop no longer assumes a folder per document.
+struct PlannedOutput {
+    /// Folder name, or `folder/group`, for progress and skip messages.
+    label: String,
     images: Vec<PathBuf>,
     plans: Vec<PagePlan>,
     out_path: PathBuf,
@@ -282,6 +290,7 @@ impl Tool for FolderToPdf {
     ) -> Result<ToolOutcome, ToolError> {
         let (
             template,
+            grouping,
             mode,
             force,
             pair_orientation,
@@ -295,6 +304,7 @@ impl Tool for FolderToPdf {
         ) = match &req.options {
             ToolOptions::FolderToPdf {
                 template,
+                grouping,
                 mode,
                 force_orientation,
                 pair_orientation,
@@ -307,6 +317,7 @@ impl Tool for FolderToPdf {
                 scan_quality,
             } => (
                 *template,
+                *grouping,
                 *mode,
                 *force_orientation,
                 *pair_orientation,
@@ -336,9 +347,8 @@ impl Tool for FolderToPdf {
             Some(req.output.clone())
         };
 
-        let total = req.inputs.len();
         let mut outputs: Vec<PathBuf> = Vec::new();
-        let mut used_names: HashSet<PathBuf> = HashSet::new();
+        let mut used_names: HashSet<String> = HashSet::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut total_images = 0usize;
         // Size telemetry for the summary: how big the largest artifact ended
@@ -350,7 +360,7 @@ impl Tool for FolderToPdf {
         // Phase 1 — plan. Every output name is known before a single page is
         // rendered, so the caller can be asked about existing files up front
         // instead of after minutes of conversion.
-        let mut planned: Vec<PlannedFolder<'_>> = Vec::new();
+        let mut planned: Vec<PlannedOutput> = Vec::new();
         for folder in &req.inputs {
             let images = collect_images(&folder.path);
             if images.is_empty() {
@@ -361,38 +371,71 @@ impl Tool for FolderToPdf {
                 continue;
             }
 
-            let plans = match mode {
-                BatchPageMode::Single => single_page_plans(images.len()),
-                BatchPageMode::TwoPerPage => {
-                    if use_merge_spec {
-                        // Checked: only the user-listed images merge; an
-                        // empty spec is a mistake, not a default.
-                        if spec.trim().is_empty() {
-                            return Err(ToolError::InvalidPageRange {
-                                detail: "已勾选合并序号但未输入序号：请填写（如 2-3），或取消勾选以按顺序合并".to_string(),
-                            });
+            match grouping {
+                BatchGrouping::ByFolder => {
+                    // A preset's own spec is advisory (a folder with fewer
+                    // images keeps those pages separate); a spec the user
+                    // typed stays strict.
+                    let strict = !template.owns_merge_spec(&spec);
+                    let plans = plan_pages(images.len(), mode, use_merge_spec, &spec, strict)?;
+                    let out_path = output_path(folder, out_root.as_deref(), &mut used_names);
+                    planned.push(PlannedOutput {
+                        label: folder.display_name(),
+                        images,
+                        plans,
+                        out_path,
+                    });
+                }
+                BatchGrouping::ByName => {
+                    // Validate the spec once so a typo still aborts before any
+                    // rendering.
+                    // A leftover spec from the two-per-page layout must not
+                    // reject groups once the layout is one image per page.
+                    let merge_active = mode == BatchPageMode::TwoPerPage && use_merge_spec;
+                    if merge_active && !spec.trim().is_empty() {
+                        parse_merge_spec(&spec, 1, false)?;
+                    }
+                    // A spec the user typed stays strict, but a group that is
+                    // too short is skipped on its own instead of discarding the
+                    // whole run. A preset's own spec keeps its lenient rule.
+                    let typed = merge_active && !template.owns_merge_spec(&spec);
+                    let required = if typed { spec_max_index(&spec)? } else { 0 };
+                    let dir = out_root
+                        .clone()
+                        .unwrap_or_else(|| folder.path.clone());
+                    let folder_name = folder.display_name();
+                    for group in group_images(&images) {
+                        let label = format!("{folder_name}/{}", group.name);
+                        if group.images.len() < required {
+                            skipped.push((
+                                label,
+                                format!(
+                                    "合并序号 {spec} 超出该组图片数 {}",
+                                    group.images.len()
+                                ),
+                            ));
+                            continue;
                         }
-                        // A preset's own spec is advisory (a folder with fewer
-                        // images keeps those pages separate); a spec the user
-                        // typed stays strict.
-                        let strict = !template.owns_merge_spec(&spec);
-                        parse_merge_spec(&spec, images.len(), strict)?
-                    } else {
-                        // Unchecked: pair everything sequentially.
-                        sequential_pairs(images.len())
+                        let plans = plan_pages(
+                            group.images.len(),
+                            mode,
+                            use_merge_spec,
+                            &spec,
+                            typed,
+                        )?;
+                        let out_path = output_path_for(&dir, &group.name, &mut used_names);
+                        planned.push(PlannedOutput {
+                            label,
+                            images: group.images,
+                            plans,
+                            out_path,
+                        });
                     }
                 }
-            };
-
-            let out_path = output_path(folder, out_root.as_deref(), &mut used_names);
-            planned.push(PlannedFolder {
-                folder,
-                images,
-                plans,
-                out_path,
-            });
+            }
         }
 
+        let total = planned.len().max(1);
         let names: Vec<PathBuf> = planned.iter().map(|p| p.out_path.clone()).collect();
         let targets = pdf_io::resolve_outputs(&names, req.conflict)?;
 
@@ -401,12 +444,7 @@ impl Tool for FolderToPdf {
             check_cancel(cancel)?;
             progress.report(
                 index as f32 / total as f32,
-                format!(
-                    "处理文件夹 {}/{}：{}",
-                    index + 1,
-                    total,
-                    job.folder.display_name()
-                ),
+                format!("处理 {}/{}：{}", index + 1, total, job.label),
             );
 
             // Built once per folder, then reused by every page.
@@ -440,7 +478,7 @@ impl Tool for FolderToPdf {
                         "ERROR",
                         &format!("生成失败：{}（{err}）", out_path.display()),
                     );
-                    skipped.push((job.folder.display_name(), format!("处理失败：{err}")));
+                    skipped.push((job.label.clone(), format!("处理失败：{err}")));
                     continue;
                 }
             };
@@ -464,7 +502,7 @@ impl Tool for FolderToPdf {
                     "ERROR",
                     &format!("写入输出失败：{}（{err}）", out_path.display()),
                 );
-                skipped.push((job.folder.display_name(), format!("写入失败：{err}")));
+                skipped.push((job.label.clone(), format!("写入失败：{err}")));
                 continue;
             }
 
@@ -495,7 +533,7 @@ impl Tool for FolderToPdf {
                 .join("；");
             return Err(ToolError::UnsupportedFormat {
                 path: None,
-                detail: format!("没有任何文件夹包含可用图片（{detail}）"),
+                detail: format!("没有生成任何 PDF（{detail}）"),
             });
         }
 
@@ -507,6 +545,9 @@ impl Tool for FolderToPdf {
             template.label,
             largest as f64 / (1024.0 * 1024.0)
         );
+        if grouping == BatchGrouping::ByName {
+            summary.push_str("，按文件名分组");
+        }
         if compressed > 0 {
             summary.push_str(&format!("，{compressed} 个超出 20 MB 已重压"));
         }
@@ -533,13 +574,243 @@ impl Tool for FolderToPdf {
     }
 }
 
+// ----------------------------------------------------------------- planning
+
+/// Plan one document's pages from its image count.
+///
+/// `strict_spec` decides whether an index beyond `count` is an error (a spec
+/// the user typed for one folder) or is skipped (a preset's own spec, and every
+/// group when one folder is split by name).
+fn plan_pages(
+    count: usize,
+    mode: BatchPageMode,
+    use_merge_spec: bool,
+    spec: &str,
+    strict_spec: bool,
+) -> Result<Vec<PagePlan>, ToolError> {
+    match mode {
+        BatchPageMode::Single => Ok(single_page_plans(count)),
+        BatchPageMode::TwoPerPage => {
+            if use_merge_spec {
+                // Checked: only the user-listed images merge; an empty spec is
+                // a mistake, not a default.
+                if spec.trim().is_empty() {
+                    return Err(ToolError::InvalidPageRange {
+                        detail: "已勾选合并序号但未输入序号：请填写（如 2-3），或取消勾选以按顺序合并"
+                            .to_string(),
+                    });
+                }
+                parse_merge_spec(spec, count, strict_spec)
+            } else {
+                // Unchecked: pair everything sequentially.
+                Ok(sequential_pairs(count))
+            }
+        }
+    }
+}
+
+/// One output document produced from a folder that is split by file name.
+pub struct ImageGroup {
+    /// Base name, also the PDF stem.
+    pub name: String,
+    /// Images in page order.
+    pub images: Vec<PathBuf>,
+}
+
+/// Split a folder's images by base name, preserving `collect_images` order.
+///
+/// `xxx_1.png` and `xxx_2.png` share the key `xxx`; `1.png` and `2.png` have no
+/// usable base and stay separate, otherwise unrelated scans would be merged.
+pub fn group_images(images: &[PathBuf]) -> Vec<ImageGroup> {
+    let mut groups: Vec<(String, Vec<(u64, PathBuf)>)> = Vec::new();
+    for path in images {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match split_sequence(&stem) {
+            Some((base, number)) => match groups.iter_mut().find(|(key, _)| *key == base) {
+                Some((_, entries)) => entries.push((number, path.clone())),
+                None => groups.push((base, vec![(number, path.clone())])),
+            },
+            // No trailing sequence: this file is a document of its own. It
+            // must not join `cover_1.png` just because both start with
+            // `cover`, nor merge with a same-named `.jpg`.
+            None => groups.push((stem, vec![(0, path.clone())])),
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(name, mut entries)| {
+            // Sequence order within the group; equal numbers fall back to the
+            // file name so the run is deterministic.
+            entries.sort_by_key(|(number, path)| {
+                (
+                    *number,
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            });
+            ImageGroup {
+                name,
+                images: entries.into_iter().map(|(_, path)| path).collect(),
+            }
+        })
+        .collect()
+}
+
+/// One row of the by-name preview: what the run will produce for a group.
+pub struct GroupPreview {
+    pub name: String,
+    /// Number of images in the group.
+    pub images: usize,
+    /// Page count, `None` when the group will be skipped.
+    pub pages: Option<usize>,
+    /// Why the group is skipped, in the same words the run reports.
+    pub skip: Option<String>,
+}
+
+/// Plan the by-name preview without rendering anything.
+///
+/// Shares `group_images`, `spec_max_index` and `preview_page_numbers` with the
+/// run, so a group that would be skipped is shown as skipped instead of
+/// advertising a PDF that never appears.
+pub fn preview_groups(
+    images: &[PathBuf],
+    two_per_page: bool,
+    use_merge_spec: bool,
+    merge_spec: &str,
+    typed_spec: bool,
+) -> Vec<GroupPreview> {
+    let merge_active = two_per_page && use_merge_spec;
+    let required = if merge_active && typed_spec {
+        spec_max_index(merge_spec).unwrap_or(0)
+    } else {
+        0
+    };
+    group_images(images)
+        .into_iter()
+        .map(|group| {
+            if group.images.len() < required {
+                return GroupPreview {
+                    name: group.name,
+                    images: group.images.len(),
+                    pages: None,
+                    skip: Some(format!(
+                        "合并序号 {merge_spec} 超出该组图片数 {}",
+                        group.images.len()
+                    )),
+                };
+            }
+            // `preview_page_numbers` labels every image with its output page;
+            // the largest label is the page count (merges repeat a page).
+            let pages = preview_page_numbers(
+                group.images.len(),
+                two_per_page,
+                use_merge_spec,
+                merge_spec,
+                typed_spec,
+            )
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            GroupPreview {
+                name: group.name,
+                images: group.images.len(),
+                pages: Some(pages),
+                skip: None,
+            }
+        })
+        .collect()
+}
+
+/// Separators allowed in front of a sequence token.
+///
+/// Covers what scanners and phones actually produce: ASCII `_ - . space`,
+/// full-width `＿ － ． 　`, typographic dashes and the middle dot.
+const SEQUENCE_SEPARATORS: [char; 11] = [
+    '_', '-', ' ', '.', '·', '＿', '－', '—', '–', '．', '\u{3000}',
+];
+
+/// Split `<base><separator><token>` into the base and the sequence number.
+///
+/// Only the *last* segment counts: `xxx-1`, `yyy_001`, `zzz_1` and `aaa_p001`
+/// are all sequence 1 with bases `xxx`, `yyy`, `zzz` and `aaa`. The token may
+/// carry a short letter prefix (`p001`); digits earlier in the name are part of
+/// the base (`2025年总结_1` → `2025年总结`). A wrapped token is accepted too:
+/// `报告（2）`, `报告(2)`, `报告[2]`, `报告【2】`. `None` means there is no
+/// trailing sequence, so the file is its own document.
+fn split_sequence(stem: &str) -> Option<(String, u64)> {
+    if let Some((base, token)) = unwrap_token(stem) {
+        if let Some(parsed) = parse_sequence_token(base, token) {
+            return Some(parsed);
+        }
+    }
+
+    let index = stem.rfind(|ch| SEQUENCE_SEPARATORS.contains(&ch))?;
+    // `rfind` yields a byte offset; full-width separators are three bytes, so
+    // `+ 1` would slice inside the character and panic.
+    let separator = stem[index..].chars().next()?;
+    let base = trim_separators(&stem[..index]);
+    let token = &stem[index + separator.len_utf8()..];
+    parse_sequence_token(base, token)
+}
+
+/// Strip a trailing `()`, `（）`, `[]` or `【】` pair and return its inside.
+fn unwrap_token(stem: &str) -> Option<(&str, &str)> {
+    let last = stem.chars().next_back()?;
+    let opener = match last {
+        ')' => '(',
+        '）' => '（',
+        ']' => '[',
+        '】' => '【',
+        _ => return None,
+    };
+    let open = stem.rfind(opener)?;
+    let start = open + opener.len_utf8();
+    let end = stem.len() - last.len_utf8();
+    Some((&stem[..open], &stem[start..end]))
+}
+
+/// `base` + trailing `optional letters + digits` → (base, number).
+fn parse_sequence_token(base: &str, token: &str) -> Option<(String, u64)> {
+    let token = token.trim();
+    let digits = token
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    let split = token.len() - digits;
+    if !token[..split].chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    let number: u64 = token[split..].parse().ok()?;
+    let base = trim_separators(base);
+    if base.is_empty() {
+        return None;
+    }
+    Some((base.to_string(), number))
+}
+
+fn trim_separators(text: &str) -> &str {
+    text.trim_end_matches(|ch| SEQUENCE_SEPARATORS.contains(&ch))
+        .trim()
+}
+
 // ----------------------------------------------------------------- ordering
 
 /// List a folder's JPG / PNG images in page order.
 ///
-/// Files whose name contains a number sort by that number (`1`, `2`, …, `10`),
-/// names without any number keep the system listing order after the numbered
-/// ones (a stable sort with an `Equal` comparison preserves it).
+/// Files sort by the sequence number in their **trailing** segment (`1`, `2`,
+/// …, `10` for `p001`, `p2`, `p010`; also `1.png`, `2.png`); numbers elsewhere
+/// in the name do not count. Files without a trailing number keep the system
+/// listing order after the numbered ones (a stable `Equal` comparison
+/// preserves it). This is the same rule the by-name grouping uses.
 pub fn collect_images(dir: &Path) -> Vec<PathBuf> {
     let mut items: Vec<(Option<u64>, String, PathBuf)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -565,7 +836,7 @@ pub fn collect_images(dir: &Path) -> Vec<PathBuf> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| name.clone());
-        items.push((first_number(&stem), name, path));
+        items.push((sequence_number(&stem), name, path));
     }
     items.sort_by(|a, b| match (&a.0, &b.0) {
         (Some(x), Some(y)) => x.cmp(y).then_with(|| a.1.cmp(&b.1)),
@@ -576,27 +847,20 @@ pub fn collect_images(dir: &Path) -> Vec<PathBuf> {
     items.into_iter().map(|(_, _, path)| path).collect()
 }
 
-/// First run of digits in the stem as a number, ignoring leading zeros.
-fn first_number(stem: &str) -> Option<u64> {
-    let bytes = stem.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            let digits = stem[start..i].trim_start_matches('0');
-            let digits = if digits.is_empty() {
-                "0"
-            } else {
-                // Guard against absurdly long runs overflowing the parse.
-                let take = digits.len().min(18);
-                &digits[..take]
-            };
-            return digits.parse::<u64>().ok();
-        }
-        i += 1;
+/// Sequence number used to order a folder's images.
+///
+/// Only the trailing segment counts (`xxx-1`, `yyy_001`, `aaa_p001`); a stem
+/// that is nothing but digits is itself a sequence (`1`, `001`). Numbers
+/// earlier in the name are part of the base, so `2025年总结_1` orders by 1
+/// rather than by 2025. `None` keeps the file after the numbered ones in
+/// system listing order.
+fn sequence_number(stem: &str) -> Option<u64> {
+    if let Some((_, number)) = split_sequence(stem) {
+        return Some(number);
+    }
+    // Guard against absurdly long digit runs overflowing the parse.
+    if !stem.is_empty() && stem.len() <= 18 && stem.bytes().all(|b| b.is_ascii_digit()) {
+        return stem.parse::<u64>().ok();
     }
     None
 }
@@ -743,9 +1007,7 @@ fn parse_merge_spec(spec: &str, count: usize, strict: bool) -> Result<Vec<PagePl
     Ok(plans)
 }
 
-/// 1-based image number → 0-based index. `Ok(None)` means "beyond `count`"
-/// while `strict` is off.
-fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, ToolError> {
+fn parse_spec_number(raw: &str) -> Result<usize, ToolError> {
     let trimmed = raw.trim();
     let n: usize = trimmed.parse().map_err(|_| ToolError::InvalidPageRange {
         detail: format!("「{trimmed}」不是合法的图片序号"),
@@ -755,6 +1017,44 @@ fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, T
             detail: "图片序号从 1 开始".to_string(),
         });
     }
+    Ok(n)
+}
+
+/// Highest image number a spec refers to.
+///
+/// Used to decide whether a group is long enough before parsing it strictly:
+/// a short group is skipped without turning the whole batch into an error.
+fn spec_max_index(spec: &str) -> Result<usize, ToolError> {
+    let mut max = 0usize;
+    for part in spec.split([',', '，', ' ', ';', '；']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once(['-', '~', '+']) {
+            let x = parse_spec_number(a)?;
+            let y = parse_spec_number(b)?;
+            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+            if hi - lo > 1 {
+                return Err(ToolError::InvalidPageRange {
+                    detail: format!(
+                        "合并序号范围 {lo}-{hi} 包含 {} 张图片，一次只能合并两张",
+                        hi - lo + 1
+                    ),
+                });
+            }
+            max = max.max(hi);
+        } else {
+            max = max.max(parse_spec_number(part)?);
+        }
+    }
+    Ok(max)
+}
+
+/// 1-based image number → 0-based index. `Ok(None)` means "beyond `count`"
+/// while `strict` is off.
+fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, ToolError> {
+    let n = parse_spec_number(raw)?;
     if n > count {
         if strict {
             return Err(ToolError::InvalidPageRange {
@@ -776,7 +1076,7 @@ fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, T
 /// tighter pass only re-renders; it costs seconds and only runs for documents
 /// that would otherwise be uncomfortably large.
 fn render_with_size_guard(
-    job: &PlannedFolder<'_>,
+    job: &PlannedOutput,
     policy: PagePolicy,
     cancel: &CancelFlag,
     progress: &Progress,
@@ -809,7 +1109,7 @@ fn render_with_size_guard(
             index as f32 / total as f32,
             format!(
                 "{} 超过 {} MB，正在压缩（第 {passes} 次）",
-                job.folder.display_name(),
+                job.label,
                 limit / (1024 * 1024)
             ),
         );
@@ -818,7 +1118,7 @@ fn render_with_size_guard(
 
 /// Build one folder's PDF and serialise it.
 fn render_document(
-    job: &PlannedFolder<'_>,
+    job: &PlannedOutput,
     policy: PagePolicy,
     cancel: &CancelFlag,
     progress: &Progress,
@@ -888,7 +1188,7 @@ struct PrepareJob<'a> {
 /// monotonic and each result lands in its slot immediately; prepared payloads
 /// in flight are bounded by the pool's queue, never by the page count.
 fn prepare_pages(
-    job: &PlannedFolder<'_>,
+    job: &PlannedOutput,
     policy: PagePolicy,
     cancel: &CancelFlag,
     progress: &Progress,
@@ -916,7 +1216,7 @@ fn prepare_pages(
 
     let total_images = jobs.len();
     let workers = pool::worker_count(total_images, PREPARE_WORKER_BYTES);
-    let folder_name = job.folder.display_name();
+    let folder_name = job.label.clone();
     let mut prepared: Vec<Option<image_embed::PreparedImage>> = jobs.iter().map(|_| None).collect();
     let mut finished = 0usize;
 
@@ -987,7 +1287,7 @@ fn build_document_skeleton(doc: &mut Document) -> lopdf::ObjectId {
 fn output_path(
     folder: &InputFile,
     out_root: Option<&Path>,
-    used: &mut HashSet<PathBuf>,
+    used: &mut HashSet<String>,
 ) -> PathBuf {
     let name = folder
         .path
@@ -997,14 +1297,31 @@ fn output_path(
     let dir = out_root
         .map(|root| root.to_path_buf())
         .unwrap_or_else(|| folder.path.clone());
+    output_path_for(&dir, &name, used)
+}
 
+/// `<dir>/<name>.pdf`, with `-2`, `-3` … when the name is already taken.
+///
+/// The key folds case on Windows and macOS: `A.pdf` and `a.pdf` are the same
+/// file there, so planning both as separate outputs would silently overwrite
+/// one with the other under `Overwrite`/`Unique`.
+fn output_path_for(dir: &Path, name: &str, used: &mut HashSet<String>) -> PathBuf {
     let mut candidate = dir.join(format!("{name}.pdf"));
     let mut serial = 2;
-    while !used.insert(candidate.clone()) {
+    while !used.insert(output_key(&candidate)) {
         candidate = dir.join(format!("{name}-{serial}.pdf"));
         serial += 1;
     }
     candidate
+}
+
+fn output_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(any(windows, target_os = "macos")) {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -1101,8 +1418,8 @@ mod tests {
         let image_path = noisy_png(&dir, "1.png", 2400, 3400);
 
         let input = InputFile::new(dir.clone());
-        let job = PlannedFolder {
-            folder: &input,
+        let job = PlannedOutput {
+            label: input.display_name(),
             images: vec![image_path],
             plans: vec![PagePlan::One(0)],
             out_path: dir.join("out.pdf"),
