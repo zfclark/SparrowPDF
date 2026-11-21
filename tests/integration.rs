@@ -3303,7 +3303,9 @@ fn renderer_honours_small_horizontal_scaling() {
         &dir.join("tz-small.pdf"),
     );
 
-    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    // Sample well inside the box a 100 % glyph would fill: the right edge at
+    // x=150 would read white either way.
+    let (r, g, b) = pixel_at(&pdf, 300.0, 100.0, 150.0);
     assert!(
         r > 200 && g > 200 && b > 200,
         "a 0.5 % scale must collapse the glyph, got ({r},{g},{b})"
