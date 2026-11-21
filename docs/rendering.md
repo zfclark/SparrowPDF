@@ -33,12 +33,17 @@
 
 字节是编码，不是字符。取字顺序：
 
-1. `/ToUnicode` 反查（CID 字体按两字节码）。`beginbfchar` / `beginbfrange` 前的计数是
+1. `/ToUnicode` 反查（CID 字体按两字节码）。区间形式的映射有跨度上限与总量预算，
+   畸形 CMap 不会把渲染拖进百万次循环。`beginbfchar` / `beginbfrange` 前的计数是
    关键字而不是源码，词法必须把十六进制串与关键字分开，否则整张映射错位一格；
 2. `/Encoding /Differences`（`uniXXXX`、`uXXXX`、单字符名与常用标点名）；
 3. 简单字体按 WinAnsi 解释（含 0x80–0x9F 专用区）；
 4. Type3 字体不看字符：按 `/Encoding` 把码换成 `/CharProcs` 里的字形程序并执行；
 5. 复合字体既无映射又无内嵌程序时不绘制，不以方框代替。
+
+文本矩阵 `Tm` 随每次显示字符串推进，`Tlm` 只由 `Td` / `TD` / `Tm` / `T*` 改变：
+`TJ` 的多段字符串必须接着上一段继续排，否则会全部叠在行首。`Tz` 是水平缩放，
+同时作用于字形轮廓与整个步进（含字距与词距）。
 
 `BT` / `ET` 只重置文本矩阵与行矩阵。字体、字号、字距、行距与渲染模式属于图形状态，
 跨块保留；在 `BT` 上清空它们会让首个 `Tj` 之后的字符串退回 12 pt WinAnsi，表现为
@@ -59,7 +64,8 @@
 
 支持 `DCTDecode`、`FlateDecode`、`LZWDecode`（`/EarlyChange` 两种码宽规则）、
 `CCITTFaxDecode`（K<0 为 G4，K=0 为 G3 一维，K>0 为 G3 二维）与 JBIG2（含
-`/JBIG2Globals` 共享全局段）；支持 `/Predictor` 2（TIFF）与 10–15（PNG）、1/2/4/8/16 位
+`/JBIG2Globals` 共享全局段）；低位深样本按行解包：每行从字节边界开始，行尾填充位不得算作下一行样本；
+支持 `/Predictor` 2（TIFF）与 10–15（PNG）、1/2/4/8/16 位
 采样，`/ImageMask` 按当前填充色绘制。
 
 图像行序自上而下，而单位方格的原点在左下角：采样时必须翻转 `v`，否则用常规

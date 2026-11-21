@@ -407,6 +407,9 @@ struct Type3Font {
     procs: BTreeMap<Vec<u8>, ObjectId>,
     /// Encoding code -> glyph name (`/Encoding /Differences`).
     names: BTreeMap<u8, Vec<u8>>,
+    /// The font's own `/Resources`; a glyph may paint an image declared only
+    /// there, and looking it up on the page would miss it.
+    resources: Option<Resources>,
     /// Parsed procedures, so a repeated glyph is decoded once per page.
     cache: RefCell<BTreeMap<u8, Option<Rc<Type3Glyph>>>>,
 }
@@ -426,22 +429,54 @@ struct Type3Glyph {
 /// colour-uniform (`d1`). A procedure without either operator keeps its content
 /// and reports a zero advance.
 fn split_type3_width(content: &[u8]) -> (Vec<u8>, f32, bool) {
-    let text = String::from_utf8_lossy(content);
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    for (index, token) in tokens.iter().enumerate() {
-        let count = match *token {
-            "d0" => 2,
-            "d1" => 6,
-            _ => continue,
-        };
-        if index < count {
+    // Token boundaries over the original bytes. Comments are skipped so a
+    // `%` line cannot be mistaken for operands, but every byte is preserved:
+    // joining tokens with spaces would swallow the newline after a comment and
+    // make the rest of the procedure part of it, so nothing would be painted.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index < content.len() {
+        let byte = content[index];
+        if byte == b'%' {
+            while index < content.len() && content[index] != b'\n' {
+                index += 1;
+            }
             continue;
         }
-        let width = tokens[index - count].parse::<f32>().unwrap_or(0.0).abs();
-        let mut kept: Vec<&str> = Vec::with_capacity(tokens.len() - count - 1);
-        kept.extend_from_slice(&tokens[..index - count]);
-        kept.extend_from_slice(&tokens[index + 1..]);
-        return (kept.join(" ").into_bytes(), width, *token == "d1");
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < content.len()
+            && !content[index].is_ascii_whitespace()
+            && content[index] != b'%'
+        {
+            index += 1;
+        }
+        spans.push((start, index));
+    }
+
+    for (position, (start, end)) in spans.iter().enumerate() {
+        let token = &content[*start..*end];
+        let operands = match token {
+            b"d0" => 2,
+            b"d1" => 6,
+            _ => continue,
+        };
+        if position < operands {
+            continue;
+        }
+        let (width_start, width_end) = spans[position - operands];
+        let width = std::str::from_utf8(&content[width_start..width_end])
+            .ok()
+            .and_then(|text| text.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .abs();
+        let mut kept = Vec::with_capacity(content.len());
+        kept.extend_from_slice(&content[..width_start]);
+        kept.extend_from_slice(&content[*end..]);
+        return (kept, width, token == b"d1");
     }
     (content.to_vec(), 0.0, false)
 }
@@ -731,6 +766,11 @@ fn parse_type3(dict: &lopdf::Dictionary, doc: &Document, differences: &BTreeMap<
         matrix,
         procs,
         names,
+        resources: dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|o| deref_dict(doc, o))
+            .map(|resources| resources_from(doc, resources)),
         cache: RefCell::new(BTreeMap::new()),
     }
 }
@@ -880,7 +920,15 @@ fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
                     {
                         index += 1;
                     }
-                    out.push(Tok::Word(String::from_utf8_lossy(&cmap[start..index]).into_owned()));
+                    // A stray `>` or `]` would leave `index` untouched and spin
+                    // forever; consume it and keep going.
+                    if index == start {
+                        index += 1;
+                    } else {
+                        out.push(Tok::Word(
+                            String::from_utf8_lossy(&cmap[start..index]).into_owned(),
+                        ));
+                    }
                 }
             }
         }
@@ -985,6 +1033,20 @@ fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
                         continue;
                     };
                     let base = first as u32;
+                    // A malformed range can declare millions of codes; walking
+                    // it would hang the renderer. Legitimate CMaps stay far
+                    // below this, and the per-CMap budget bounds the work even
+                    // across many ranges.
+                    const MAX_RANGE: u32 = 65_535;
+                    const MAX_ENTRIES: usize = 200_000;
+                    if high < low || high - low > MAX_RANGE {
+                        index += 3;
+                        continue;
+                    }
+                    if map.len() + (high - low) as usize > MAX_ENTRIES {
+                        index += 3;
+                        continue;
+                    }
                     for offset in 0..=high.saturating_sub(low) {
                         if let Some(ch) = char::from_u32(base + offset) {
                             map.insert(low + offset, ch);
@@ -1185,13 +1247,14 @@ fn execute(
                 }
             }
             "y" => {
-                if operands.len() >= 6 {
+                // Four operands: the endpoint doubles as the second control
+                // point. Reading six dropped conforming short curves.
+                if operands.len() >= 4 {
                     let n: Vec<f32> = operands.iter().filter_map(number).collect();
-                    if n.len() >= 6 {
+                    if n.len() >= 4 {
                         let c1 = state.ctm.apply((n[0], n[1]));
-                        let c2 = state.ctm.apply((n[2], n[3]));
-                        let end = state.ctm.apply((n[4], n[5]));
-                        state.path.cubic_to(c1, c2, end);
+                        let end = state.ctm.apply((n[2], n[3]));
+                        state.path.cubic_to(c1, end, end);
                     }
                 }
             }
@@ -1258,6 +1321,7 @@ fn execute(
                 // to WinAnsi at 12 pt: characters "disappeared" or turned into
                 // Latin noise.
                 text.line_matrix = Matrix::IDENTITY;
+                text.matrix = Matrix::IDENTITY;
             }
             "ET" => {}
             "Tf" => {
@@ -1273,12 +1337,14 @@ fn execute(
             "Tm" => {
                 if let Some(m) = matrix_from(operands) {
                     text.line_matrix = m;
+                    text.matrix = m;
                 }
             }
             "Td" => {
                 if operands.len() >= 2 {
                     if let (Some(tx), Some(ty)) = (number(&operands[0]), number(&operands[1])) {
                         text.line_matrix = text.line_matrix.mul(&Matrix::translate(tx, ty));
+                        text.matrix = text.line_matrix;
                     }
                 }
             }
@@ -1286,12 +1352,14 @@ fn execute(
                 if operands.len() >= 2 {
                     if let (Some(tx), Some(ty)) = (number(&operands[0]), number(&operands[1])) {
                         text.line_matrix = text.line_matrix.mul(&Matrix::translate(tx, ty));
+                        text.matrix = text.line_matrix;
                         text.leading = -ty;
                     }
                 }
             }
             "T*" => {
                 text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
+                text.matrix = text.line_matrix;
             }
             "TL" => {
                 if let Some(v) = operands.first().and_then(number) {
@@ -1320,13 +1388,14 @@ fn execute(
             }
             "Tj" => {
                 if let Some(Object::String(bytes, _)) = operands.first() {
-                    draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth);
+                    text.matrix = draw_text(doc, pixmap, state, &text, bytes, fonts, resources, text.matrix, depth);
                 }
             }
             "'" => {
                 text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
+                text.matrix = text.line_matrix;
                 if let Some(Object::String(bytes, _)) = operands.first() {
-                    draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth);
+                    text.matrix = draw_text(doc, pixmap, state, &text, bytes, fonts, resources, text.matrix, depth);
                 }
             }
             "\"" => {
@@ -1336,8 +1405,9 @@ fn execute(
                         text.char_spacing = ac;
                     }
                     text.line_matrix = text.line_matrix.mul(&Matrix::translate(0.0, -text.leading));
+                    text.matrix = text.line_matrix;
                     if let Object::String(bytes, _) = &operands[2] {
-                        draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth);
+                        text.matrix = draw_text(doc, pixmap, state, &text, bytes, fonts, resources, text.matrix, depth);
                     }
                 }
             }
@@ -1346,14 +1416,24 @@ fn execute(
                     for item in items {
                         match item {
                             Object::String(bytes, _) => {
-                                draw_text(doc, pixmap, state, &text, bytes, fonts, resources, depth)
+                                text.matrix = draw_text(
+                                    doc,
+                                    pixmap,
+                                    state,
+                                    &text,
+                                    bytes,
+                                    fonts,
+                                    resources,
+                                    text.matrix,
+                                    depth,
+                                );
                             }
                             other => {
                                 if let Some(k) = number(other) {
                                     // Negative k in TJ moves text forward.
                                     let tx = -k / 1000.0 * text.size * text.h_scale;
-                                    text.line_matrix =
-                                        text.line_matrix.mul(&Matrix::translate(tx, 0.0));
+                                    text.matrix =
+                                        text.matrix.mul(&Matrix::translate(tx, 0.0));
                                 }
                             }
                         }
@@ -1496,6 +1576,10 @@ fn draw_xobject(
 struct TextState {
     font: Option<Vec<u8>>,
     size: f32,
+    /// Text matrix `Tm`: where the next glyph is placed. It advances with every
+    /// shown string, which is what keeps `[(A) 0 (B)] TJ` from piling up.
+    matrix: Matrix,
+    /// Line matrix `Tlm`: the start of the current line, used by `T*`, `'`, `"`.
     line_matrix: Matrix,
     leading: f32,
     char_spacing: f32,
@@ -1511,6 +1595,7 @@ impl Default for TextState {
         Self {
             font: None,
             size: 0.0,
+            matrix: Matrix::IDENTITY,
             line_matrix: Matrix::IDENTITY,
             leading: 0.0,
             char_spacing: 0.0,
@@ -1540,19 +1625,15 @@ fn draw_text(
     bytes: &[u8],
     fonts: &FontSet,
     resources: &Resources,
+    matrix: Matrix,
     depth: u8,
-) {
+) -> Matrix {
     let resource = text
         .font
         .as_ref()
         .and_then(|name| resources.fonts.get(name));
-    // A document that carries its own glyph program is drawn from it; the
-    // system font is only a stand-in for fonts the file does not embed.
     let embedded = resource.and_then(|r| r.embedded.as_deref());
     let type3 = resource.and_then(|r| r.type3.as_ref());
-    if embedded.is_none() && type3.is_none() && fonts.is_empty() {
-        return;
-    }
     let preferred = fonts.pick(resource.map(|r| r.base.as_str()).unwrap_or_default());
     let size = if text.size.abs() < 0.01 {
         12.0
@@ -1591,44 +1672,45 @@ fn draw_text(
             .collect(),
     };
 
-    // Pen position in text space; the outline is scaled by size/upem.
-    let mut pen = text.line_matrix;
+    // The pen starts where the text matrix points and is written back at the
+    // end: `TJ` shows several strings in a row, and each one must continue from
+    // the previous advance instead of restarting at `Tm`.
+    let mut pen = matrix;
 
     for (code, ch, embedded_gid, is_space) in decoded {
-        let mut step = size * 0.5;
+        let mut advance = size * 0.5;
 
-        if let (Some(font), true) = (type3, visible) {
-            // Type3: run the glyph procedure. FontMatrix maps glyph space to
-            // text space, size and Tm then take it to the device.
+        if let Some(font) = type3 {
             if let Ok(byte) = u8::try_from(code) {
                 if let Some(glyph) = font.glyph(doc, byte) {
-                    let mut inner = state.clone();
-                    inner.ctm = state
-                        .ctm
-                        .mul(&pen)
-                        .mul(&Matrix::scale(size, size))
-                        .mul(&font.matrix);
-                    inner.path = Path::new();
-                    inner.uniform_fill = glyph.uniform;
-                    let mut stack: Vec<State> = Vec::new();
-                    execute(
-                        doc,
-                        &glyph.ops,
-                        pixmap,
-                        &mut inner,
-                        &mut stack,
-                        resources,
-                        fonts,
-                        depth + 1,
-                    );
+                    if visible {
+                        let mut inner = state.clone();
+                        // `Tz` squeezes the glyph itself, not just the spacing.
+                        inner.ctm = state
+                            .ctm
+                            .mul(&pen)
+                            .mul(&Matrix::scale(size * h_scale, size))
+                            .mul(&font.matrix);
+                        inner.path = Path::new();
+                        inner.uniform_fill = glyph.uniform;
+                        let mut stack: Vec<State> = Vec::new();
+                        execute(
+                            doc,
+                            &glyph.ops,
+                            pixmap,
+                            &mut inner,
+                            &mut stack,
+                            font.resources.as_ref().unwrap_or(resources),
+                            fonts,
+                            depth + 1,
+                        );
+                    }
                     if glyph.width > 0.0 {
-                        // The advance is reported in glyph space and inherits
-                        // the FontMatrix's horizontal scale.
-                        step = glyph.width * font.matrix.a * size;
+                        advance = glyph.width * font.matrix.a * size;
                     }
                 }
             }
-        } else if visible {
+        } else {
             // The embedded program wins when it has the glyph; otherwise a
             // system face that does. A subset without the character falls back
             // per glyph.
@@ -1638,42 +1720,46 @@ fn draw_text(
             };
             if let Some((font, gid)) = drawn {
                 let upem = font.units_per_em();
-                let to_device = state
-                    .ctm
-                    .mul(&pen)
-                    .mul(&Matrix::scale(size / upem, size / upem));
-                let mut path = Path::new();
-                for contour in font.outline(gid) {
-                    if contour.len() < 2 {
-                        continue;
+                if visible {
+                    let to_device = state.ctm.mul(&pen).mul(&Matrix::scale(
+                        size * h_scale / upem,
+                        size / upem,
+                    ));
+                    let mut path = Path::new();
+                    for contour in font.outline(gid) {
+                        if contour.len() < 2 {
+                            continue;
+                        }
+                        let first = to_device.apply(contour[0]);
+                        path.move_to(first.0, first.1);
+                        for point in contour.iter().skip(1) {
+                            let p = to_device.apply(*point);
+                            path.line_to(p.0, p.1);
+                        }
+                        path.close();
                     }
-                    let first = to_device.apply(contour[0]);
-                    path.move_to(first.0, first.1);
-                    for point in contour.iter().skip(1) {
-                        let p = to_device.apply(*point);
-                        path.line_to(p.0, p.1);
+                    // Modes 1/5 stroke, 2/6 do both, the rest fill.
+                    if matches!(text.render_mode, 0 | 2 | 4 | 6) {
+                        raster::fill(pixmap, &path, state.fill);
                     }
-                    path.close();
+                    if matches!(text.render_mode, 1 | 2 | 5 | 6) {
+                        let width = (state.line_width * state.ctm.stroke_scale()).max(0.4);
+                        raster::stroke(pixmap, &path, state.stroke, width);
+                    }
                 }
-                // Modes 1/5 stroke, 2/6 do both, the rest fill.
-                if matches!(text.render_mode, 0 | 2 | 4 | 6) {
-                    raster::fill(pixmap, &path, state.fill);
-                }
-                if matches!(text.render_mode, 1 | 2 | 5 | 6) {
-                    let width = (state.line_width * state.ctm.stroke_scale()).max(0.4);
-                    raster::stroke(pixmap, &path, state.stroke, width);
-                }
-                step = font.advance(gid) / upem * size;
+                advance = font.advance(gid) / upem * size;
             }
         }
 
-        // Advance: glyph advance in text space, plus spacing, scaled by Tz.
-        step += text.char_spacing * h_scale;
+        // `Tz` scales the whole step: glyph advance, character and word spacing.
+        let mut step = advance + text.char_spacing;
         if is_space {
-            step += text.word_spacing * h_scale;
+            step += text.word_spacing;
         }
-        pen = pen.mul(&Matrix::translate(step, 0.0));
+        pen = pen.mul(&Matrix::translate(step * h_scale, 0.0));
     }
+
+    pen
 }
 
 /// WinAnsi byte -> character.
@@ -2189,8 +2275,7 @@ fn samples_to_rgba(
         hival,
     } = &space
     {
-        let count = width as usize * height as usize;
-        let indices = unpack_indices(plain, count, bits)?;
+        let indices = unpack_indices(plain, width, height, bits)?;
         let per_entry = base.components();
         for index in indices {
             let entry = (index as usize).min(*hival);
@@ -2371,28 +2456,8 @@ fn push_sample(data: &mut Vec<u8>, space: &Space, bytes: &[u8], inverted: bool) 
 }
 
 /// Unpack palette indices without scaling them: index 3 must stay 3.
-fn unpack_indices(plain: &[u8], count: usize, bits: u32) -> Option<Vec<u8>> {
-    if bits == 8 {
-        if plain.len() < count {
-            return None;
-        }
-        return Some(plain[..count].to_vec());
-    }
-    if bits > 8 {
-        return None;
-    }
-    let per_byte = (8 / bits) as usize;
-    let mask = ((1u32 << bits) - 1) as u8;
-    let mut out = Vec::with_capacity(count);
-    'outer: for &byte in plain {
-        for slot in 0..per_byte {
-            out.push((byte >> (8 - bits * (slot as u32 + 1))) & mask);
-            if out.len() == count {
-                break 'outer;
-            }
-        }
-    }
-    (out.len() == count).then_some(out)
+fn unpack_indices(plain: &[u8], width: u32, height: u32, bits: u32) -> Option<Vec<u8>> {
+    unpack_low_bits(plain, width, height, 1, bits)
 }
 
 /// Expand samples of `bits` width into one byte per sample (high bit first).
@@ -2419,20 +2484,59 @@ fn unpack_samples(
         return Some(plain.chunks_exact(2).take(count).map(|c| c[0]).collect());
     }
 
-    let per_byte = (8 / bits) as usize;
+    let raw = unpack_low_bits(plain, width, height, components, bits)?;
     let max = ((1u32 << bits) - 1) as f32;
-    let mut out = Vec::with_capacity(count);
-    'outer: for &byte in plain {
-        for slot in 0..per_byte {
-            let shift = 8 - bits * (slot as u32 + 1);
-            let raw = (byte >> shift) & ((1u32 << bits) - 1) as u8;
-            out.push((raw as f32 / max * 255.0).round() as u8);
-            if out.len() == count {
-                break 'outer;
+    Some(
+        raw.iter()
+            .map(|&value| (value as f32 / max * 255.0).round() as u8)
+            .collect(),
+    )
+}
+
+/// Unpack sub-byte samples row by row.
+///
+/// Each row starts on a byte boundary and its tail padding is not part of the
+/// next row. Reading the buffer as one continuous bit stream shifted every row
+/// that was not a whole number of bytes wide — which is most 1-bit masks and
+/// narrow palette images.
+fn unpack_low_bits(
+    plain: &[u8],
+    width: u32,
+    height: u32,
+    components: usize,
+    bits: u32,
+) -> Option<Vec<u8>> {
+    if bits == 0 || bits > 8 {
+        return None;
+    }
+    let row_samples = width as usize * components;
+    let row_bytes = (row_samples * bits as usize).div_ceil(8);
+    let per_byte = (8 / bits) as usize;
+    let mask = ((1u32 << bits) - 1) as u8;
+    let mut out = Vec::with_capacity(row_samples * height as usize);
+    for row in 0..height as usize {
+        let start = row * row_bytes;
+        if start + row_bytes > plain.len() {
+            return None;
+        }
+        let mut taken = 0usize;
+        for &byte in &plain[start..start + row_bytes] {
+            for slot in 0..per_byte {
+                if taken == row_samples {
+                    break;
+                }
+                out.push((byte >> (8 - bits * (slot as u32 + 1))) & mask);
+                taken += 1;
+            }
+            if taken == row_samples {
+                break;
             }
         }
+        if taken != row_samples {
+            return None;
+        }
     }
-    (out.len() == count).then_some(out)
+    Some(out)
 }
 
 /// Undo a PNG (`10..=15`) or TIFF (`2`) predictor, row by row.
@@ -2560,6 +2664,14 @@ mod tests {
         assert_eq!(map.get(&0x0041), Some(&'中'));
         assert_eq!(map.get(&0x0042), Some(&'丮'));
         assert_eq!(map.get(&0x0043), Some(&'丯'));
+    }
+
+    /// A malformed range may declare billions of codes. Expanding it would
+    /// hang the renderer, so an implausible span is skipped instead.
+    #[test]
+    fn to_unicode_rejects_absurd_ranges() {
+        let cmap = b"1 beginbfrange\n<0000> <FFFFFFFF> <0041>\nendbfrange\n";
+        assert!(parse_to_unicode(cmap).is_empty());
     }
 
     /// The array form of `bfrange` lists destinations explicitly instead of

@@ -82,6 +82,13 @@ impl TrueTypeFont {
         let glyf = *tables.get(b"glyf")?;
         let loca = *tables.get(b"loca")?;
 
+        // The fixed offsets read below assume the declared table length covers
+        // them. A directory entry that lies about its length would otherwise
+        // read past the table (and past the buffer when it sits at the end).
+        if head.1 < 52 || maxp.1 < 6 {
+            return None;
+        }
+
         let units_per_em = u16::from_be_bytes([data[head.0 + 18], data[head.0 + 19]]) as f32;
         let long_loca = i16::from_be_bytes([data[head.0 + 50], data[head.0 + 51]]) == 1;
         let num_glyphs = u16::from_be_bytes([data[maxp.0 + 4], data[maxp.0 + 5]]);
@@ -89,16 +96,19 @@ impl TrueTypeFont {
         // hhea governs the hmtx layout; ascent/descent are not needed here
         // because text is positioned from the content stream, not the font.
         let mut num_h_metrics = 0usize;
-        if let Some(hhea) = tables.get(b"hhea") {
-            num_h_metrics = u16::from_be_bytes([data[hhea.0 + 34], data[hhea.0 + 35]]) as usize;
+        if let Some((offset, length)) = tables.get(b"hhea") {
+            if *length >= 36 && offset + 36 <= data.len() {
+                num_h_metrics = u16::from_be_bytes([data[offset + 34], data[offset + 35]]) as usize;
+            }
         }
 
         let mut advances = vec![0u16; num_glyphs as usize];
-        if let Some(hmtx) = tables.get(b"hmtx") {
+        if let Some((hmtx_offset, hmtx_length)) = tables.get(b"hmtx") {
+            let hmtx_end = hmtx_offset + hmtx_length;
             for (gid, advance) in advances.iter_mut().enumerate() {
                 let index = gid.min(num_h_metrics.saturating_sub(1));
-                let off = hmtx.0 + index * 4;
-                if off + 2 <= data.len() {
+                let off = hmtx_offset + index * 4;
+                if off + 2 <= hmtx_end && off + 2 <= data.len() {
                     *advance = u16::from_be_bytes([data[off], data[off + 1]]);
                 }
             }
@@ -107,13 +117,14 @@ impl TrueTypeFont {
         let mut loca_entries = Vec::with_capacity(num_glyphs as usize + 1);
         for i in 0..=num_glyphs as usize {
             let off = loca.0 + if long_loca { i * 4 } else { i * 2 };
+            let loca_end = loca.0 + loca.1;
             let value = if long_loca {
-                if off + 4 <= data.len() {
+                if off + 4 <= loca_end && off + 4 <= data.len() {
                     u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
                 } else {
                     0
                 }
-            } else if off + 2 <= data.len() {
+            } else if off + 2 <= loca_end && off + 2 <= data.len() {
                 u16::from_be_bytes([data[off], data[off + 1]]) as u32
             } else {
                 0

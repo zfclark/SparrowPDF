@@ -2929,7 +2929,7 @@ fn renderer_honours_short_cubic_operators() {
     let doc = Document::with_version("1.4");
     let pdf = finish_page(
         doc,
-        "0 0 0 rg 10 10 m 190 10 190 190 10 190 y 10 10 l f".to_string(),
+        "0 0 0 rg 10 10 m 190 10 10 190 y 10 10 l f".to_string(),
         dictionary! {},
         200.0,
         200.0,
@@ -3124,6 +3124,162 @@ fn renderer_places_image_rows_top_down() {
     assert!(
         b > 150 && r < 100,
         "the last image row belongs at the bottom of the box, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a Type3 font whose single code (65) runs `procedure` and paints a
+/// square, then return the page `/Resources` dictionary that exposes it.
+fn type3_font(doc: &mut lopdf::Document, procedure: &[u8]) -> lopdf::Dictionary {
+    use lopdf::{dictionary, Object, Stream};
+
+    let proc_id = doc.add_object(Stream::new(Default::default(), procedure.to_vec()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    dictionary! { "Font" => dictionary! { "F1" => font_id } }
+}
+
+/// `TJ` shows its strings one after another. Restarting each string at `Tm`
+/// piled the glyphs on top of each other; only the advance kept them apart.
+#[test]
+fn renderer_continues_tj_strings_from_the_previous_advance() {
+    use lopdf::Document;
+
+    let dir = scratch("render-tj-advance");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(&mut doc, b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f");
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 10 100 Td [(A) 0 (A)] TJ ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("tj.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 60.0, 150.0);
+    assert!(r < 80 && g < 80 && b < 80, "first string must paint, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "second string must continue after the first, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Tz` squeezes the glyph, not just the spacing.
+#[test]
+fn renderer_applies_horizontal_scaling_to_glyphs() {
+    use lopdf::Document;
+
+    let dir = scratch("render-tz");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(&mut doc, b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f");
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 50 Tz 50 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("tz.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 75.0, 150.0);
+    assert!(r < 80 && g < 80 && b < 80, "half-width glyph must paint, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 130.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "the glyph must stop at half width, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sub-byte samples are padded to a byte boundary per row. Reading the buffer
+/// as one bit stream took the padding of row 0 as the first index of row 1.
+#[test]
+fn renderer_unpacks_subbyte_samples_per_row() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-indexed-rows");
+    let mut doc = Document::with_version("1.4");
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 1i64,
+            "Height" => 2i64,
+            "ColorSpace" => vec![
+                Object::Name(b"Indexed".to_vec()),
+                Object::Name(b"DeviceRGB".to_vec()),
+                Object::Integer(1),
+                Object::String(vec![255, 0, 0, 0, 255, 0], lopdf::StringFormat::Literal),
+            ],
+            "BitsPerComponent" => 1i64,
+        },
+        // Row 0: index 0 (red). Row 1: high bit set, index 1 (green).
+        vec![0x00u8, 0x80],
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("indexed-rows.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 250.0);
+    assert!(r > 150 && g < 80, "row 0 must be red, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 50.0);
+    assert!(g > 150 && r < 80, "row 1 must be green, got ({r},{g},{b})");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stripping `d0`/`d1` must not rewrite the rest of the procedure: joining
+/// tokens dropped the newline after a `%` comment and commented out the draw.
+#[test]
+fn renderer_keeps_type3_procedure_after_comment() {
+    use lopdf::Document;
+
+    let dir = scratch("render-type3-comment");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(
+        &mut doc,
+        b"1000 0 0 0 1000 1000 d1 % square\n0 0 1000 1000 re f",
+    );
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 100 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("type3-comment.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "the paint after the comment must still run, got ({r},{g},{b})"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
