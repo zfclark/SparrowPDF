@@ -618,39 +618,115 @@ pub struct ImageGroup {
 /// `xxx_1.png` and `xxx_2.png` share the key `xxx`; `1.png` and `2.png` have no
 /// usable base and stay separate, otherwise unrelated scans would be merged.
 pub fn group_images(images: &[PathBuf]) -> Vec<ImageGroup> {
-    let mut groups: Vec<ImageGroup> = Vec::new();
+    let mut groups: Vec<(String, Vec<(u64, PathBuf)>)> = Vec::new();
     for path in images {
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match base_name(&stem) {
-            Some(key) => match groups.iter_mut().find(|group| group.name == key) {
-                Some(group) => group.images.push(path.clone()),
-                None => groups.push(ImageGroup {
-                    name: key,
-                    images: vec![path.clone()],
-                }),
-            },
-            None => groups.push(ImageGroup {
-                name: stem,
-                images: vec![path.clone()],
-            }),
+        let (name, number) = match split_sequence(&stem) {
+            Some((base, number)) => (base, number),
+            // No trailing sequence: this file is a document of its own.
+            None => (stem, 0),
+        };
+        match groups.iter_mut().find(|(key, _)| *key == name) {
+            Some((_, entries)) => entries.push((number, path.clone())),
+            None => groups.push((name, vec![(number, path.clone())])),
         }
     }
+
     groups
+        .into_iter()
+        .map(|(name, mut entries)| {
+            // Sequence order within the group; equal numbers fall back to the
+            // file name so the run is deterministic.
+            entries.sort_by_key(|(number, path)| {
+                (
+                    *number,
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            });
+            ImageGroup {
+                name,
+                images: entries.into_iter().map(|(_, path)| path).collect(),
+            }
+        })
+        .collect()
 }
 
-/// Base name: every run of ASCII digits removed, then trailing separators.
+/// Separators allowed in front of a sequence token.
 ///
-/// The digits are the sequence numbers `collect_images` already sorts by, so
-/// `xxx_1`/`xxx_2` and `2025年总结_1`/`2025年总结_2` both collapse to one key.
-/// `None` means nothing but digits is left (`1.png`), which must stay its own
-/// document.
-fn base_name(stem: &str) -> Option<String> {
-    let stripped: String = stem.chars().filter(|ch| !ch.is_ascii_digit()).collect();
-    let trimmed = stripped.trim_end_matches(['_', '-', ' ', '·']).trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+/// Covers what scanners and phones actually produce: ASCII `_ - . space`,
+/// full-width `＿ － ． 　`, typographic dashes and the middle dot.
+const SEQUENCE_SEPARATORS: [char; 11] = [
+    '_', '-', ' ', '.', '·', '＿', '－', '—', '–', '．', '\u{3000}',
+];
+
+/// Split `<base><separator><token>` into the base and the sequence number.
+///
+/// Only the *last* segment counts: `xxx-1`, `yyy_001`, `zzz_1` and `aaa_p001`
+/// are all sequence 1 with bases `xxx`, `yyy`, `zzz` and `aaa`. The token may
+/// carry a short letter prefix (`p001`); digits earlier in the name are part of
+/// the base (`2025年总结_1` → `2025年总结`). A wrapped token is accepted too:
+/// `报告（2）`, `报告(2)`, `报告[2]`, `报告【2】`. `None` means there is no
+/// trailing sequence, so the file is its own document.
+fn split_sequence(stem: &str) -> Option<(String, u64)> {
+    if let Some((base, token)) = unwrap_token(stem) {
+        if let Some(parsed) = parse_sequence_token(base, token) {
+            return Some(parsed);
+        }
+    }
+
+    let separator = stem.rfind(|ch| SEQUENCE_SEPARATORS.contains(&ch))?;
+    let base = trim_separators(&stem[..separator]);
+    let token = &stem[separator + 1..];
+    parse_sequence_token(base, token)
+}
+
+/// Strip a trailing `()`, `（）`, `[]` or `【】` pair and return its inside.
+fn unwrap_token(stem: &str) -> Option<(&str, &str)> {
+    let last = stem.chars().next_back()?;
+    let opener = match last {
+        ')' => '(',
+        '）' => '（',
+        ']' => '[',
+        '】' => '【',
+        _ => return None,
+    };
+    let open = stem.rfind(opener)?;
+    let start = open + opener.len_utf8();
+    let end = stem.len() - last.len_utf8();
+    Some((&stem[..open], &stem[start..end]))
+}
+
+/// `base` + trailing `optional letters + digits` → (base, number).
+fn parse_sequence_token(base: &str, token: &str) -> Option<(String, u64)> {
+    let token = token.trim();
+    let digits = token
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    let split = token.len() - digits;
+    if !token[..split].chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    let number: u64 = token[split..].parse().ok()?;
+    let base = trim_separators(base);
+    if base.is_empty() {
+        return None;
+    }
+    Some((base.to_string(), number))
+}
+
+fn trim_separators(text: &str) -> &str {
+    text.trim_end_matches(|ch| SEQUENCE_SEPARATORS.contains(&ch))
+        .trim()
 }
 
 // ----------------------------------------------------------------- ordering

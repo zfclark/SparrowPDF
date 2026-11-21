@@ -3502,7 +3502,7 @@ fn folder_batch_groups_date_prefix_by_sequence() {
 
     let req = batch_by_name(vec![album], out.clone());
     run(ToolId::FolderToPdf, &req).expect("batch succeeds");
-    assert_eq!(pdf_pages(&out.join("年总结.pdf")), 2);
+    assert_eq!(pdf_pages(&out.join("2025年总结.pdf")), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3647,5 +3647,58 @@ fn folder_batch_groups_apply_template_inside_each_group() {
         2,
         "pages 2 and 3 merge into one sheet inside the group"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_recognise_common_sequence_spellings() {
+    let dir = scratch("batch-by-name-spellings");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in [
+        "xxx-1.png",
+        "yyy_001.png",
+        "zzz_1.png",
+        "aaa_p001.png",
+        "bbb（2）.png",
+        "ccc (3).png",
+        "ddd[4].png",
+        "eee【5】.png",
+    ] {
+        make_image(&album, name, 40, 30);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    for stem in ["xxx", "yyy", "zzz", "aaa", "bbb", "ccc", "ddd", "eee"] {
+        assert_eq!(
+            pdf_pages(&out.join(format!("{stem}.pdf"))),
+            1,
+            "expected one-page {stem}.pdf"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_ignore_leading_numbers_in_the_base() {
+    let dir = scratch("batch-by-name-leading");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    // The 2025 prefix is not a sequence: the trailing 1/2 is.
+    for name in ["2025年总结_1.png", "2025年总结_2.png"] {
+        make_image(&album, name, 40, 30);
+    }
+    // No trailing separator + number: stays a document of its own.
+    make_image(&album, "报告2025.png", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert_eq!(pdf_pages(&out.join("2025年总结.pdf")), 2);
+    assert_eq!(pdf_pages(&out.join("报告2025.pdf")), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
