@@ -438,7 +438,12 @@ fn split_type3_width(content: &[u8]) -> (Vec<u8>, f32, bool) {
     while index < content.len() {
         let byte = content[index];
         if byte == b'%' {
-            while index < content.len() && content[index] != b'\n' {
+            // Both CR and LF end a comment; stopping only at LF would swallow
+            // a `d1` that follows a lone CR.
+            while index < content.len()
+                && content[index] != b'\n'
+                && content[index] != b'\r'
+            {
                 index += 1;
             }
             continue;
@@ -588,9 +593,26 @@ fn resources_from(doc: &Document, res: &lopdf::Dictionary) -> Resources {
     }
 }
 
+thread_local! {
+    /// Font-resource nesting depth. A Type3 font whose `/Resources` names the
+    /// same font would otherwise recurse until the thread stack dies.
+    static FONT_DEPTH: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 /// Read the parts of a `/Font` dictionary that affect *which characters* the
 /// byte string stands for.
 fn parse_font(doc: &Document, object: &Object) -> FontResource {
+    const MAX_FONT_DEPTH: u8 = 4;
+    if FONT_DEPTH.with(|depth| depth.get()) >= MAX_FONT_DEPTH {
+        return FontResource::default();
+    }
+    FONT_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let resource = parse_font_inner(doc, object);
+    FONT_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    resource
+}
+
+fn parse_font_inner(doc: &Document, object: &Object) -> FontResource {
     /// A font program bigger than this is not a subset; keeping it would cost
     /// more memory than substituting a system face.
     const MAX_EMBEDDED_FONT: usize = 32 * 1024 * 1024;
@@ -963,6 +985,9 @@ fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
 
     let tokens = tokenize(cmap);
     let mut map = BTreeMap::new();
+    // Counts expanded codes, not surviving keys: several ranges may cover the
+    // same codes and leave `map.len()` unchanged while doing all the work.
+    let mut expanded = 0usize;
     let mut index = 0usize;
     while index < tokens.len() {
         match word(&tokens[index]) {
@@ -1043,10 +1068,12 @@ fn parse_to_unicode(cmap: &[u8]) -> BTreeMap<u32, char> {
                         index += 3;
                         continue;
                     }
-                    if map.len() + (high - low) as usize > MAX_ENTRIES {
+                    let span = (high - low) as usize + 1;
+                    if expanded + span > MAX_ENTRIES {
                         index += 3;
                         continue;
                     }
+                    expanded += span;
                     for offset in 0..=high.saturating_sub(low) {
                         if let Some(ch) = char::from_u32(base + offset) {
                             map.insert(low + offset, ch);
@@ -1640,10 +1667,10 @@ fn draw_text(
     } else {
         text.size.abs()
     };
-    let h_scale = if text.h_scale.abs() < 0.01 {
-        1.0
-    } else {
+    let h_scale = if text.h_scale.is_finite() {
         text.h_scale
+    } else {
+        1.0
     };
     // Modes 3 and 7 render nothing; OCR layers rely on that.
     let visible = !matches!(text.render_mode, 3 | 7);

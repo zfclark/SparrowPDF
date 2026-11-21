@@ -104,6 +104,18 @@ impl TrueTypeFont {
 
         let mut advances = vec![0u16; num_glyphs as usize];
         if let Some((hmtx_offset, hmtx_length)) = tables.get(b"hmtx") {
+            // `hmtx` is `numberOfHMetrics` four-byte records followed by
+            // two-byte bearings for the remaining glyphs. A table shorter than
+            // that leaves trailing glyphs with a zero advance, which overlaps
+            // them; treat the font as unparsable so a substitute is used.
+            if num_h_metrics == 0 {
+                num_h_metrics = num_glyphs as usize;
+            }
+            let tail = (num_glyphs as usize).saturating_sub(num_h_metrics);
+            let required = num_h_metrics * 4 + tail * 2;
+            if *hmtx_length < required {
+                return None;
+            }
             let hmtx_end = hmtx_offset + hmtx_length;
             for (gid, advance) in advances.iter_mut().enumerate() {
                 let index = gid.min(num_h_metrics.saturating_sub(1));
@@ -114,20 +126,21 @@ impl TrueTypeFont {
             }
         }
 
+        // `loca` must hold one entry per glyph plus the final sentinel. A short
+        // table cannot be patched with zeros: the last glyph would lose its
+        // outline while the font still looked usable.
+        let entry_size = if long_loca { 4 } else { 2 };
+        let loca_required = (num_glyphs as usize + 1) * entry_size;
+        if loca.1 < loca_required {
+            return None;
+        }
         let mut loca_entries = Vec::with_capacity(num_glyphs as usize + 1);
         for i in 0..=num_glyphs as usize {
-            let off = loca.0 + if long_loca { i * 4 } else { i * 2 };
-            let loca_end = loca.0 + loca.1;
+            let off = loca.0 + i * entry_size;
             let value = if long_loca {
-                if off + 4 <= loca_end && off + 4 <= data.len() {
-                    u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-                } else {
-                    0
-                }
-            } else if off + 2 <= loca_end && off + 2 <= data.len() {
-                u16::from_be_bytes([data[off], data[off + 1]]) as u32
+                u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
             } else {
-                0
+                u16::from_be_bytes([data[off], data[off + 1]]) as u32
             };
             loca_entries.push(value);
         }

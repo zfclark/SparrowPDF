@@ -3283,3 +3283,116 @@ fn renderer_keeps_type3_procedure_after_comment() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `0.5 Tz` is a legal 0.5 % horizontal scale. It used to be replaced by 100 %
+/// because any value below 0.01 was treated as "unset", so the glyph kept its
+/// full width while `TJ` adjustments used the real scale.
+#[test]
+fn renderer_honours_small_horizontal_scaling() {
+    use lopdf::Document;
+
+    let dir = scratch("render-tz-small");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(&mut doc, b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f");
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 0.5 Tz 50 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("tz-small.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "a 0.5 % scale must collapse the glyph, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A comment can end with a bare CR. Stopping only at LF hid the `d1` that
+/// followed it, losing the advance and the colour-uniform flag.
+#[test]
+fn renderer_ends_type3_comment_at_carriage_return() {
+    use lopdf::Document;
+
+    let dir = scratch("render-type3-cr");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(
+        &mut doc,
+        b"1000 0 0 0 1000 1000 d1 % note\r0 0 1000 1000 re f",
+    );
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 100 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("type3-cr.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "the glyph must still paint after a CR-terminated comment, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Type3 font may list itself in its own `/Resources`. Building those
+/// resources eagerly used to recurse until the thread stack overflowed.
+#[test]
+fn renderer_survives_type3_resource_cycle() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-type3-cycle");
+    let mut doc = Document::with_version("1.4");
+    let proc_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f".to_vec(),
+    ));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    if let Ok(font) = doc.get_object_mut(font_id).and_then(|o| o.as_dict_mut()) {
+        font.set(
+            "Resources",
+            dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        );
+    }
+    let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 100 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("type3-cycle.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "the page must still render, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
