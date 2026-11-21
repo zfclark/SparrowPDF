@@ -3730,3 +3730,115 @@ fn folder_batch_orders_by_trailing_sequence_only() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+#[test]
+fn folder_batch_groups_read_fullwidth_separators() {
+    let dir = scratch("batch-by-name-fullwidth");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    // Full-width underscore and middle dot are three bytes each; slicing them
+    // as one byte used to panic.
+    for name in ["报告＿1.png", "报告·2.png", "封面　3.png"] {
+        make_image(&album, name, 40, 30);
+    }
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert_eq!(pdf_pages(&out.join("报告.pdf")), 2);
+    assert_eq!(pdf_pages(&out.join("封面.pdf")), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_do_not_merge_unnumbered_with_numbered() {
+    let dir = scratch("batch-by-name-standalone");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "cover.png", 40, 30);
+    make_image(&album, "cover_1.png", 40, 30);
+    make_image(&album, "cover.jpg", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    // `cover_1` owns `cover.pdf`; the two standalone files get serials instead
+    // of being swallowed into that group.
+    assert_eq!(pdf_pages(&out.join("cover.pdf")), 1);
+    assert_eq!(pdf_pages(&out.join("cover-2.pdf")), 1);
+    assert_eq!(pdf_pages(&out.join("cover-3.pdf")), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn folder_batch_groups_avoid_case_only_output_collisions() {
+    let dir = scratch("batch-by-name-case");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "A_1.png", 40, 30);
+    make_image(&album, "a_2.png", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let req = batch_by_name(vec![album], out.clone());
+    run(ToolId::FolderToPdf, &req).expect("batch succeeds");
+    assert!(out.join("A.pdf").is_file());
+    assert!(
+        out.join("a-2.pdf").is_file(),
+        "a case-only clash must be serialised, not overwritten"
+    );
+    assert_eq!(pdf_pages(&out.join("A.pdf")), 1);
+    assert_eq!(pdf_pages(&out.join("a-2.pdf")), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folder_batch_groups_ignore_merge_spec_in_single_layout() {
+    let dir = scratch("batch-by-name-single-spec");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).unwrap();
+    make_image(&album, "short_1.png", 40, 30);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let mut req = batch_by_name(vec![album], out.clone());
+    if let ToolOptions::FolderToPdf {
+        use_merge_spec,
+        merge_spec,
+        ..
+    } = &mut req.options
+    {
+        // A spec left over from the two-per-page layout must not reject the
+        // group once the layout is one image per page.
+        *use_merge_spec = true;
+        *merge_spec = "2-3".to_string();
+    }
+    run(ToolId::FolderToPdf, &req).expect("single layout ignores the spec");
+    assert_eq!(pdf_pages(&out.join("short.pdf")), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn group_preview_counts_pages_and_marks_skips() {
+    use sparrowpdf::tools::folder_to_pdf::preview_groups;
+
+    let images: Vec<PathBuf> = ["stu_1.png", "stu_2.png", "stu_3.png"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    // Preset spec (not typed) merges pages 2-3: three images, two pages.
+    let groups = preview_groups(&images, true, true, "2-3", false);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "stu");
+    assert_eq!(groups[0].pages, Some(2), "merged pages must not count twice");
+
+    // A typed spec on a short group is skipped, matching the run.
+    let short: Vec<PathBuf> = [PathBuf::from("short_1.png")].to_vec();
+    let groups = preview_groups(&short, true, true, "2-3", true);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].pages, None);
+    assert!(groups[0].skip.is_some());
+}

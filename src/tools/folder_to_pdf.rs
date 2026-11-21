@@ -348,7 +348,7 @@ impl Tool for FolderToPdf {
         };
 
         let mut outputs: Vec<PathBuf> = Vec::new();
-        let mut used_names: HashSet<PathBuf> = HashSet::new();
+        let mut used_names: HashSet<String> = HashSet::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut total_images = 0usize;
         // Size telemetry for the summary: how big the largest artifact ended
@@ -389,13 +389,16 @@ impl Tool for FolderToPdf {
                 BatchGrouping::ByName => {
                     // Validate the spec once so a typo still aborts before any
                     // rendering.
-                    if use_merge_spec && !spec.trim().is_empty() {
+                    // A leftover spec from the two-per-page layout must not
+                    // reject groups once the layout is one image per page.
+                    let merge_active = mode == BatchPageMode::TwoPerPage && use_merge_spec;
+                    if merge_active && !spec.trim().is_empty() {
                         parse_merge_spec(&spec, 1, false)?;
                     }
                     // A spec the user typed stays strict, but a group that is
                     // too short is skipped on its own instead of discarding the
                     // whole run. A preset's own spec keeps its lenient rule.
-                    let typed = use_merge_spec && !template.owns_merge_spec(&spec);
+                    let typed = merge_active && !template.owns_merge_spec(&spec);
                     let required = if typed { spec_max_index(&spec)? } else { 0 };
                     let dir = out_root
                         .clone()
@@ -625,14 +628,15 @@ pub fn group_images(images: &[PathBuf]) -> Vec<ImageGroup> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (name, number) = match split_sequence(&stem) {
-            Some((base, number)) => (base, number),
-            // No trailing sequence: this file is a document of its own.
-            None => (stem, 0),
-        };
-        match groups.iter_mut().find(|(key, _)| *key == name) {
-            Some((_, entries)) => entries.push((number, path.clone())),
-            None => groups.push((name, vec![(number, path.clone())])),
+        match split_sequence(&stem) {
+            Some((base, number)) => match groups.iter_mut().find(|(key, _)| *key == base) {
+                Some((_, entries)) => entries.push((number, path.clone())),
+                None => groups.push((base, vec![(number, path.clone())])),
+            },
+            // No trailing sequence: this file is a document of its own. It
+            // must not join `cover_1.png` just because both start with
+            // `cover`, nor merge with a same-named `.jpg`.
+            None => groups.push((stem, vec![(0, path.clone())])),
         }
     }
 
@@ -652,6 +656,71 @@ pub fn group_images(images: &[PathBuf]) -> Vec<ImageGroup> {
             ImageGroup {
                 name,
                 images: entries.into_iter().map(|(_, path)| path).collect(),
+            }
+        })
+        .collect()
+}
+
+/// One row of the by-name preview: what the run will produce for a group.
+pub struct GroupPreview {
+    pub name: String,
+    /// Number of images in the group.
+    pub images: usize,
+    /// Page count, `None` when the group will be skipped.
+    pub pages: Option<usize>,
+    /// Why the group is skipped, in the same words the run reports.
+    pub skip: Option<String>,
+}
+
+/// Plan the by-name preview without rendering anything.
+///
+/// Shares `group_images`, `spec_max_index` and `preview_page_numbers` with the
+/// run, so a group that would be skipped is shown as skipped instead of
+/// advertising a PDF that never appears.
+pub fn preview_groups(
+    images: &[PathBuf],
+    two_per_page: bool,
+    use_merge_spec: bool,
+    merge_spec: &str,
+    typed_spec: bool,
+) -> Vec<GroupPreview> {
+    let merge_active = two_per_page && use_merge_spec;
+    let required = if merge_active && typed_spec {
+        spec_max_index(merge_spec).unwrap_or(0)
+    } else {
+        0
+    };
+    group_images(images)
+        .into_iter()
+        .map(|group| {
+            if group.images.len() < required {
+                return GroupPreview {
+                    name: group.name,
+                    images: group.images.len(),
+                    pages: None,
+                    skip: Some(format!(
+                        "合并序号 {merge_spec} 超出该组图片数 {}",
+                        group.images.len()
+                    )),
+                };
+            }
+            // `preview_page_numbers` labels every image with its output page;
+            // the largest label is the page count (merges repeat a page).
+            let pages = preview_page_numbers(
+                group.images.len(),
+                two_per_page,
+                use_merge_spec,
+                merge_spec,
+                typed_spec,
+            )
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            GroupPreview {
+                name: group.name,
+                images: group.images.len(),
+                pages: Some(pages),
+                skip: None,
             }
         })
         .collect()
@@ -680,9 +749,12 @@ fn split_sequence(stem: &str) -> Option<(String, u64)> {
         }
     }
 
-    let separator = stem.rfind(|ch| SEQUENCE_SEPARATORS.contains(&ch))?;
-    let base = trim_separators(&stem[..separator]);
-    let token = &stem[separator + 1..];
+    let index = stem.rfind(|ch| SEQUENCE_SEPARATORS.contains(&ch))?;
+    // `rfind` yields a byte offset; full-width separators are three bytes, so
+    // `+ 1` would slice inside the character and panic.
+    let separator = stem[index..].chars().next()?;
+    let base = trim_separators(&stem[..index]);
+    let token = &stem[index + separator.len_utf8()..];
     parse_sequence_token(base, token)
 }
 
@@ -1215,7 +1287,7 @@ fn build_document_skeleton(doc: &mut Document) -> lopdf::ObjectId {
 fn output_path(
     folder: &InputFile,
     out_root: Option<&Path>,
-    used: &mut HashSet<PathBuf>,
+    used: &mut HashSet<String>,
 ) -> PathBuf {
     let name = folder
         .path
@@ -1229,14 +1301,27 @@ fn output_path(
 }
 
 /// `<dir>/<name>.pdf`, with `-2`, `-3` … when the name is already taken.
-fn output_path_for(dir: &Path, name: &str, used: &mut HashSet<PathBuf>) -> PathBuf {
+///
+/// The key folds case on Windows and macOS: `A.pdf` and `a.pdf` are the same
+/// file there, so planning both as separate outputs would silently overwrite
+/// one with the other under `Overwrite`/`Unique`.
+fn output_path_for(dir: &Path, name: &str, used: &mut HashSet<String>) -> PathBuf {
     let mut candidate = dir.join(format!("{name}.pdf"));
     let mut serial = 2;
-    while !used.insert(candidate.clone()) {
+    while !used.insert(output_key(&candidate)) {
         candidate = dir.join(format!("{name}-{serial}.pdf"));
         serial += 1;
     }
     candidate
+}
+
+fn output_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(any(windows, target_os = "macos")) {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
+    }
 }
 
 #[cfg(test)]

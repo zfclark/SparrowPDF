@@ -7,7 +7,7 @@
 use egui::{RichText, Ui};
 
 use crate::model::ToolId;
-use crate::tools::folder_to_pdf::{collect_images, group_images, preview_page_numbers};
+use crate::tools::folder_to_pdf::{collect_images, preview_groups};
 use crate::tools::{
     BatchGrouping, BatchPageMode, Orientation, PageSize, ScanQuality, ToolOptions, BATCH_TEMPLATES,
 };
@@ -53,10 +53,10 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
             ui,
             match grouping {
                 BatchGrouping::ByFolder => {
-                    "每个文件夹生成一个 PDF。文件名中的数字按数值排序（1、2、…、10），无数字者排在末尾。"
+                    "每个文件夹生成一个 PDF。按文件名末尾的序号排序（1、2、…、10），前面的数字不参与；没有末尾序号的排在末尾。"
                 }
                 BatchGrouping::ByName => {
-                    "同一基名的图片合成一个 PDF（xxx_1、xxx_2 → xxx.pdf），按文件名中的第一个数字排序；同组内请勿重复序号。"
+                    "同一基名的图片合成一个 PDF（xxx_1、xxx_2 → xxx.pdf）。按最后一个分隔符后的序号排序，前面的数字不参与；同组内请勿重复序号。"
                 }
             },
         );
@@ -67,26 +67,26 @@ pub fn show(ui: &mut Ui, form: &mut FormState, preview_state: &mut preview::Prev
     params_card(ui, form, tool);
 
     let folders: Vec<std::path::PathBuf> = form.inputs.iter().map(|f| f.path.clone()).collect();
-    let numbering = match form.options_for(tool) {
+    let (numbering, typed_spec) = match form.options_for(tool) {
         ToolOptions::FolderToPdf {
             template,
             mode,
             use_merge_spec,
             merge_spec,
             ..
-        } => Some(preview::PageNumbering {
-            two_per_page: *mode == BatchPageMode::TwoPerPage,
-            use_merge_spec: *use_merge_spec,
-            merge_spec: merge_spec.clone(),
-            // By-name runs apply a typed spec per group leniently, so the
-            // preview must not claim pages the run will not produce.
-            strict_merge_spec: grouping == BatchGrouping::ByFolder
-                && !template.owns_merge_spec(merge_spec),
-        }),
-        _ => None,
+        } => (
+            Some(preview::PageNumbering {
+                two_per_page: *mode == BatchPageMode::TwoPerPage,
+                use_merge_spec: *use_merge_spec,
+                merge_spec: merge_spec.clone(),
+                strict_merge_spec: !template.owns_merge_spec(merge_spec),
+            }),
+            !template.owns_merge_spec(merge_spec),
+        ),
+        _ => (None, false),
     };
     if grouping == BatchGrouping::ByName {
-        group_preview(ui, &folders, numbering.as_ref());
+        group_preview(ui, &folders, numbering.as_ref(), typed_spec);
     } else {
         preview::show_folders(ui, &folders, numbering.as_ref(), preview_state);
     }
@@ -307,38 +307,54 @@ fn params_card(ui: &mut Ui, form: &mut FormState, tool: ToolId) {
 /// Preview for the by-name mode: one line per output document.
 ///
 /// Thumbnails are keyed by folder, which would mislabel a run that produces
-/// several PDFs from one folder. Page counts are enough to spot a short group.
+/// several PDFs from one folder. Page counts come from the same planner the run
+/// uses, and a group the run would skip is shown as skipped.
 fn group_preview(
     ui: &mut Ui,
     folders: &[std::path::PathBuf],
     numbering: Option<&preview::PageNumbering>,
+    typed_spec: bool,
 ) {
+    let (two_per_page, use_merge_spec, merge_spec) = numbering
+        .map(|n| (n.two_per_page, n.use_merge_spec, n.merge_spec.as_str()))
+        .unwrap_or((false, false, ""));
+
     theme::card(ui, "预览", |ui| {
         let mut total = 0usize;
         let mut shown = 0usize;
-        let mut singles: Vec<String> = Vec::new();
+        let mut singles = 0usize;
+        let mut skipped = 0usize;
         for dir in folders {
-            for group in group_images(&collect_images(dir)) {
+            for group in preview_groups(
+                &collect_images(dir),
+                two_per_page,
+                use_merge_spec,
+                merge_spec,
+                typed_spec,
+            ) {
                 total += 1;
-                if group.images.len() == 1 {
-                    singles.push(group.name.clone());
+                if group.images == 1 {
+                    singles += 1;
+                }
+                if group.pages.is_none() {
+                    skipped += 1;
                 }
                 if shown < 8 {
-                    let pages = numbering
-                        .map(|n| {
-                            preview_page_numbers(
-                                group.images.len(),
-                                n.two_per_page,
-                                n.use_merge_spec,
-                                &n.merge_spec,
-                                false,
-                            )
-                            .len()
-                        })
-                        .unwrap_or(group.images.len());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{}.pdf", group.name)).small());
-                        ui.label(RichText::new(format!("{pages} 页")).small().weak());
+                        match group.pages {
+                            Some(pages) => {
+                                ui.label(RichText::new(format!("{pages} 页")).small().weak());
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("跳过").small().color(theme::danger(ui)),
+                                )
+                                .on_hover_text(
+                                    group.skip.as_deref().unwrap_or("合并序号超出组内图片数"),
+                                );
+                            }
+                        }
                     });
                     shown += 1;
                 }
@@ -353,14 +369,11 @@ fn group_preview(
         } else {
             theme::hint(ui, &format!("按文件名分组：共 {total} 个 PDF"));
         }
-        if !singles.is_empty() {
-            let sample = singles
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("、");
-            theme::hint(ui, &format!("{} 组只有 1 张图：{sample}", singles.len()));
+        if skipped > 0 {
+            theme::hint(ui, &format!("{skipped} 组将跳过：合并序号超出组内图片数"));
+        }
+        if singles > 0 {
+            theme::hint(ui, &format!("{singles} 组只有 1 张图"));
         }
     });
 }
