@@ -3702,3 +3702,31 @@ fn folder_batch_groups_ignore_leading_numbers_in_the_base() {
     assert_eq!(pdf_pages(&out.join("报告2025.pdf")), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn folder_batch_orders_by_trailing_sequence_only() {
+    let dir = scratch("batch-order-trailing");
+    // A leading year is not a sequence: 1 and 2 decide the order.
+    for name in ["报告2026_1.png", "报告2025_2.png"] {
+        make_image(&dir, name, 40, 30);
+    }
+    let images = sparrowpdf::tools::folder_to_pdf::collect_images(&dir);
+    let names: Vec<String> = images
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["报告2026_1.png", "报告2025_2.png"]);
+
+    let dir2 = scratch("batch-order-trailing-ten");
+    for name in ["2025年总结_10.png", "2025年总结_2.png"] {
+        make_image(&dir2, name, 40, 30);
+    }
+    let images = sparrowpdf::tools::folder_to_pdf::collect_images(&dir2);
+    let names: Vec<String> = images
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["2025年总结_2.png", "2025年总结_10.png"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}

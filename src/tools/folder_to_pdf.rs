@@ -1,8 +1,9 @@
 //! Tool: batch conversion — one PDF per input folder.
 //!
-//! * Images inside each folder are ordered by the number in their file name
-//!   (`1.png`, `2.png`, …, `10.png` sorts numerically); names without any
-//!   number keep the system listing order after the numbered ones.
+//! * Images inside each folder are ordered by the number in their trailing
+//!   segment (`1.png`, `2.png`, …, `10.png`, and `xxx_p001` sorts as 1);
+//!   numbers earlier in the name are part of the base. Names without a
+//!   trailing number keep the system listing order after the numbered ones.
 //! * Page layout comes from a preset (`BATCH_TEMPLATES`): paper size, page
 //!   orientation and one-or-two images per page. One image per page, or two
 //!   images sharing one page (`BatchPageMode::TwoPerPage`, landscape = side by
@@ -733,9 +734,11 @@ fn trim_separators(text: &str) -> &str {
 
 /// List a folder's JPG / PNG images in page order.
 ///
-/// Files whose name contains a number sort by that number (`1`, `2`, …, `10`),
-/// names without any number keep the system listing order after the numbered
-/// ones (a stable sort with an `Equal` comparison preserves it).
+/// Files sort by the sequence number in their **trailing** segment (`1`, `2`,
+/// …, `10` for `p001`, `p2`, `p010`; also `1.png`, `2.png`); numbers elsewhere
+/// in the name do not count. Files without a trailing number keep the system
+/// listing order after the numbered ones (a stable `Equal` comparison
+/// preserves it). This is the same rule the by-name grouping uses.
 pub fn collect_images(dir: &Path) -> Vec<PathBuf> {
     let mut items: Vec<(Option<u64>, String, PathBuf)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -761,7 +764,7 @@ pub fn collect_images(dir: &Path) -> Vec<PathBuf> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| name.clone());
-        items.push((first_number(&stem), name, path));
+        items.push((sequence_number(&stem), name, path));
     }
     items.sort_by(|a, b| match (&a.0, &b.0) {
         (Some(x), Some(y)) => x.cmp(y).then_with(|| a.1.cmp(&b.1)),
@@ -772,27 +775,20 @@ pub fn collect_images(dir: &Path) -> Vec<PathBuf> {
     items.into_iter().map(|(_, _, path)| path).collect()
 }
 
-/// First run of digits in the stem as a number, ignoring leading zeros.
-fn first_number(stem: &str) -> Option<u64> {
-    let bytes = stem.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            let digits = stem[start..i].trim_start_matches('0');
-            let digits = if digits.is_empty() {
-                "0"
-            } else {
-                // Guard against absurdly long runs overflowing the parse.
-                let take = digits.len().min(18);
-                &digits[..take]
-            };
-            return digits.parse::<u64>().ok();
-        }
-        i += 1;
+/// Sequence number used to order a folder's images.
+///
+/// Only the trailing segment counts (`xxx-1`, `yyy_001`, `aaa_p001`); a stem
+/// that is nothing but digits is itself a sequence (`1`, `001`). Numbers
+/// earlier in the name are part of the base, so `2025年总结_1` orders by 1
+/// rather than by 2025. `None` keeps the file after the numbered ones in
+/// system listing order.
+fn sequence_number(stem: &str) -> Option<u64> {
+    if let Some((_, number)) = split_sequence(stem) {
+        return Some(number);
+    }
+    // Guard against absurdly long digit runs overflowing the parse.
+    if !stem.is_empty() && stem.len() <= 18 && stem.bytes().all(|b| b.is_ascii_digit()) {
+        return stem.parse::<u64>().ok();
     }
     None
 }
