@@ -424,56 +424,117 @@ pub fn stroke(pixmap: &mut Pixmap, path: &Path, color: [f32; 4], width: f32) {
     fill(pixmap, &out, color);
 }
 
-/// Draw an axis-aligned image into the pixmap, sampling nearest-neighbour.
+/// Draw an image into the pixmap through its unit-square corners.
+///
+/// The mapping is a full inverse affine transform, not a bounding box: an icon
+/// placed with a rotated `cm` used to be skipped entirely (the old axis-aligned
+/// fast path), which read as "the icon is missing". Sampling stays
+/// nearest-neighbour, so a document-sized scan does not pay for bilinear.
 pub fn draw_image(pixmap: &mut Pixmap, image: &ImageRgba, corners: [Point; 4], alpha: f32) {
     if image.width == 0 || image.height == 0 || alpha <= 0.0 {
         return;
     }
-    // Axis-aligned fast path only; rotated images are skipped rather than wrong.
+    let origin = corners[0];
+    let ex = (corners[1].0 - origin.0, corners[1].1 - origin.1);
+    let ey = (corners[3].0 - origin.0, corners[3].1 - origin.1);
+    let det = ex.0 * ey.1 - ex.1 * ey.0;
+    if !det.is_finite() || det.abs() < 1e-6 {
+        return;
+    }
     let xs = [corners[0].0, corners[1].0, corners[2].0, corners[3].0];
     let ys = [corners[0].1, corners[1].1, corners[2].1, corners[3].1];
+    if !xs.iter().chain(ys.iter()).all(|v| v.is_finite()) {
+        return;
+    }
     let min_x = xs.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_x = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let min_y = ys.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_y = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    if !(min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite()) {
-        return;
-    }
-
-    let dw = max_x - min_x;
-    let dh = max_y - min_y;
-    if dw.abs() < 0.5 || dh.abs() < 0.5 {
-        return;
-    }
 
     let x_start = min_x.max(0.0).floor() as i64;
     let x_end = max_x.min(pixmap.width as f32).ceil() as i64;
     let y_start = min_y.max(0.0).floor() as i64;
     let y_end = max_y.min(pixmap.height as f32).ceil() as i64;
+    if x_end <= x_start || y_end <= y_start {
+        return;
+    }
+
+    let inv = 1.0 / det;
+    // Upscaled content (icons, seals, photos on a page-sized box) looks blocky
+    // with nearest sampling; switch to bilinear once a source pixel covers more
+    // than a destination pixel. Downscaled scans keep the cheap path, where the
+    // difference is invisible anyway.
+    let scale = (ex.0.hypot(ex.1) / image.width as f32)
+        .max(ey.0.hypot(ey.1) / image.height as f32);
+    let smooth = scale > 1.25;
 
     for py in y_start..y_end {
+        let dy = py as f32 + 0.5 - origin.1;
         for px in x_start..x_end {
-            if px < 0 || py < 0 || px >= pixmap.width as i64 || py >= pixmap.height as i64 {
+            let dx = px as f32 + 0.5 - origin.0;
+            let u = (dx * ey.1 - dy * ey.0) * inv;
+            let v = (ex.0 * dy - ex.1 * dx) * inv;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
             }
-            let u = ((px as f32 + 0.5 - min_x) / dw).clamp(0.0, 0.999);
-            let v = ((py as f32 + 0.5 - min_y) / dh).clamp(0.0, 0.999);
-            let sx = (u * image.width as f32) as u32;
-            let sy = (v * image.height as f32) as u32;
-            let idx = ((sy as usize) * image.width as usize + sx as usize) * 4;
-            if idx + 3 >= image.data.len() {
+            let color = if smooth {
+                sample_bilinear(image, u * image.width as f32 - 0.5, (1.0 - v) * image.height as f32 - 0.5)
+            } else {
+                let sx = (u * image.width as f32) as u32;
+                // Image space starts at the top-left while the unit square
+                // starts at the bottom-left; without the flip every image
+                // placed with the usual `w 0 0 h` matrix came out mirrored.
+                let sy = ((1.0 - v) * image.height as f32) as u32;
+                let idx = ((sy as usize) * image.width as usize + sx as usize) * 4;
+                if idx + 3 >= image.data.len() {
+                    continue;
+                }
+                [
+                    image.data[idx] as f32 / 255.0,
+                    image.data[idx + 1] as f32 / 255.0,
+                    image.data[idx + 2] as f32 / 255.0,
+                    image.data[idx + 3] as f32 / 255.0,
+                ]
+            };
+            let a = color[3] * alpha;
+            if a <= 0.0 {
                 continue;
             }
-            let a = image.data[idx + 3] as f32 / 255.0 * alpha;
-            let color = [
-                image.data[idx] as f32 / 255.0,
-                image.data[idx + 1] as f32 / 255.0,
-                image.data[idx + 2] as f32 / 255.0,
-                a,
-            ];
-            pixmap.blend(px as u32, py as u32, color, 1.0);
+            pixmap.blend(px as u32, py as u32, [color[0], color[1], color[2], a], 1.0);
         }
     }
+}
+
+/// Bilinear sample in top-down image coordinates (pixel centres at `x + 0.5`).
+fn sample_bilinear(image: &ImageRgba, tx: f32, ty: f32) -> [f32; 4] {
+    let max_x = image.width.saturating_sub(1) as f32;
+    let max_y = image.height.saturating_sub(1) as f32;
+    let x = tx.clamp(0.0, max_x);
+    let y = ty.clamp(0.0, max_y);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(image.width - 1);
+    let y1 = (y0 + 1).min(image.height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let at = |px: u32, py: u32| -> [f32; 4] {
+        let i = ((py as usize) * image.width as usize + px as usize) * 4;
+        [
+            image.data[i] as f32,
+            image.data[i + 1] as f32,
+            image.data[i + 2] as f32,
+            image.data[i + 3] as f32,
+        ]
+    };
+    let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+    let mut out = [0.0f32; 4];
+    for channel in 0..4 {
+        let top = a[channel] + (b[channel] - a[channel]) * fx;
+        let bottom = c[channel] + (d[channel] - c[channel]) * fx;
+        out[channel] = (top + (bottom - top) * fy) / 255.0;
+    }
+    out
 }
 
 /// Decoded RGBA image ready for drawing.

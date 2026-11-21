@@ -17,7 +17,7 @@ pub const CORE: &str = env!("CARGO_PKG_VERSION");
 /// 日期位（`YYYYMMDD`），记录本次改动的日期。
 ///
 /// 发布当天由开发人员更新为当天日期；与 tag 的日期段不一致时 CI 会拦下。
-pub const DATE: &str = "20261116";
+pub const DATE: &str = "20261121";
 
 /// 展示用完整版本，如 `V0.6.0.20261114`。
 ///

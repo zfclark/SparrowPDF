@@ -25,9 +25,14 @@ pub enum ToolId {
 
 impl ToolId {
     /// Registry order, grouped the same way the sidebar renders them.
+    ///
+    /// Tools of one group are contiguous: the sidebar walks `ALL` and filters
+    /// by group, so a stray member at the end would be listed under the first
+    /// group but after every other group's rows.
     pub const ALL: [ToolId; 12] = [
         ToolId::ImageToPdf,
         ToolId::FolderToPdf,
+        ToolId::PdfToImage,
         ToolId::Merge,
         ToolId::Split,
         ToolId::Rotate,
@@ -37,12 +42,11 @@ impl ToolId {
         ToolId::TextWatermark,
         ToolId::ImageWatermark,
         ToolId::Encrypt,
-        ToolId::PdfToImage,
     ];
 
     pub fn group(self) -> ToolGroup {
         match self {
-            ToolId::ImageToPdf | ToolId::FolderToPdf => ToolGroup::Generate,
+            ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage => ToolGroup::Generate,
             ToolId::Merge
             | ToolId::Split
             | ToolId::Rotate
@@ -51,7 +55,6 @@ impl ToolId {
             | ToolId::Extract => ToolGroup::Structure,
             ToolId::TextWatermark | ToolId::ImageWatermark => ToolGroup::PageEdit,
             ToolId::Encrypt => ToolGroup::Security,
-            ToolId::PdfToImage => ToolGroup::Convert,
         }
     }
 
@@ -126,29 +129,28 @@ impl fmt::Display for ToolId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolGroup {
+    /// Named 转换 rather than 生成: it holds the two image → PDF tools and
+    /// PDF → image, which are all conversions.
     Generate,
     Structure,
     PageEdit,
     Security,
-    Convert,
 }
 
 impl ToolGroup {
-    pub const ALL: [ToolGroup; 5] = [
+    pub const ALL: [ToolGroup; 4] = [
         ToolGroup::Generate,
         ToolGroup::Structure,
         ToolGroup::PageEdit,
         ToolGroup::Security,
-        ToolGroup::Convert,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            ToolGroup::Generate => "生成",
+            ToolGroup::Generate => "转换",
             ToolGroup::Structure => "结构操作",
             ToolGroup::PageEdit => "页面编辑",
             ToolGroup::Security => "安全",
-            ToolGroup::Convert => "转换",
         }
     }
 

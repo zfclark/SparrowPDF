@@ -1,4 +1,4 @@
-//! Left sidebar: the 12 tools, grouped.
+//! Left sidebar: the 12 tools in four groups (转换 / 结构操作 / 页面编辑 / 安全).
 //!
 //! Selection crossfades between rows instead of snapping, so switching tools
 //! reads as motion rather than a jump.
@@ -55,9 +55,10 @@ pub fn show(
 
             // Tight vertical rhythm. With the 6 pt default gap the list needed
             // ~700 pt and only 10 of the 12 tools fit at the default 900x650
-            // window: 安全 (加密与解密) and 转换 (PDF 转图片) sat below the fold
-            // with no visible scroll bar, so the app looked like it shipped ten
-            // tools. Every row and caption now fits at the default size.
+            // window: 安全 (加密与解密) and the old 转换 group (PDF 转图片) sat
+            // below the fold with no visible scroll bar, so the app looked like
+            // it shipped ten tools. Every row and caption now fits at the
+            // default size.
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 egui::ScrollArea::vertical()

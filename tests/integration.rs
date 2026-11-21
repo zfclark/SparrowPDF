@@ -2629,3 +2629,772 @@ fn pdf_to_image_reports_the_page_that_cannot_be_written() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+// ---------------------------------------------------------------------------
+// Renderer: text and icon fidelity
+// ---------------------------------------------------------------------------
+
+/// Finish a one-page document whose single page already has its objects.
+fn finish_page(
+    mut doc: lopdf::Document,
+    content: String,
+    resources: lopdf::Dictionary,
+    width: f32,
+    height: f32,
+    path: &Path,
+) -> PathBuf {
+    use lopdf::{dictionary, Object, Stream};
+
+    let content_id = doc.add_object(Stream::new(Default::default(), content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "MediaBox" => vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(width),
+            Object::Real(height),
+        ],
+        "Contents" => content_id,
+        "Resources" => resources,
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => 1i64,
+        "Kids" => vec![page_id.into()],
+    });
+    if let Ok(dict) = doc.get_object_mut(page_id).unwrap().as_dict_mut() {
+        dict.set("Parent", pages_id);
+    }
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    doc.save(path).expect("save fixture");
+    path.to_path_buf()
+}
+
+/// Render at 72 DPI so one point is one pixel, then read the pixel under a
+/// user-space coordinate (`y` grows upward in PDF space).
+fn pixel_at(pdf: &Path, page_pt: f32, x: f32, y: f32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let pages = render::render_page_thumbnails(pdf, None, &[1], page_pt, &fonts)
+        .expect("render fixture page");
+    let pixmap = &pages[0].1;
+    let px = x.floor().clamp(0.0, pixmap.width as f32 - 1.0) as usize;
+    let py = (page_pt - y).floor().clamp(0.0, pixmap.height as f32 - 1.0) as usize;
+    let index = (py * pixmap.width as usize + px) * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// One-page PDF using a Type3 font whose single glyph (`A`) is a filled square.
+fn make_type3_pdf(dir: &Path, name: &str, render_mode: u8) -> PathBuf {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.4");
+    let proc_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f".to_vec(),
+    ));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let content = format!("BT /F1 100 Tf {render_mode} Tr 100 100 Td (A) Tj ET");
+    finish_page(doc, content, resources, 300.0, 300.0, &dir.join(name))
+}
+
+/// Type3 text used to disappear completely: the font has no outline to draw and
+/// its glyphs live in `/CharProcs`. The same mechanism draws icon fonts.
+#[test]
+fn renderer_draws_type3_glyph_procedures() {
+    let dir = scratch("render-type3");
+    let pdf = make_type3_pdf(&dir, "type3.pdf", 0);
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "Type3 glyph must paint its square, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 40.0, 260.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "outside the glyph must stay white, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Tr 3` marks text as invisible (OCR layers); painting it doubles the page.
+#[test]
+fn renderer_skips_invisible_text() {
+    let dir = scratch("render-type3-hidden");
+    let pdf = make_type3_pdf(&dir, "type3-hidden.pdf", 3);
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "invisible text must not be painted, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 4x4 green image whose `/SMask` clears the left half.
+fn make_smask_pdf(dir: &Path, name: &str) -> PathBuf {
+    use lopdf::{dictionary, Document, Stream};
+
+    let mut doc = Document::with_version("1.4");
+    let rgb: Vec<u8> = (0..16).flat_map(|_| [0u8, 180, 0]).collect();
+    let mask: Vec<u8> = (0..4)
+        .flat_map(|_| [0u8, 0, 255, 255])
+        .collect();
+    let mask_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8i64,
+        },
+        mask,
+    ));
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+            "SMask" => mask_id,
+        },
+        rgb,
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    finish_page(
+        doc,
+        "q 200 0 0 200 50 50 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join(name),
+    )
+}
+
+/// Without `/SMask` a transparent icon is painted as a solid rectangle.
+#[test]
+fn renderer_applies_image_soft_mask() {
+    let dir = scratch("render-smask");
+    let pdf = make_smask_pdf(&dir, "smask.pdf");
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 150.0);
+    assert!(
+        g > 120 && r < 80 && b < 80,
+        "opaque half must show the green image, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 100.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "masked half must stay page white, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 4x4 image using an `Indexed` palette (entry 0 red, entry 1 green); every
+/// sample is 1, so the page must be green.
+#[test]
+fn renderer_decodes_indexed_colour_images() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-indexed");
+    let mut doc = Document::with_version("1.4");
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => vec![
+                Object::Name(b"Indexed".to_vec()),
+                Object::Name(b"DeviceRGB".to_vec()),
+                Object::Integer(1),
+                Object::String(vec![255, 0, 0, 0, 255, 0], lopdf::StringFormat::Literal),
+            ],
+            "BitsPerComponent" => 8i64,
+        },
+        vec![1u8; 16],
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("indexed.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        g > 150 && r < 80 && b < 80,
+        "index 1 must resolve to the green palette entry, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A wide image (left half red, right half blue) placed with a `cm` that turns
+/// it 90°. Sampling the bounding box instead of the affine map painted the
+/// wrong half on each side — the "icon looks broken" report.
+#[test]
+fn renderer_places_rotated_images_through_the_affine_map() {
+    use lopdf::{dictionary, Document, Stream};
+
+    let dir = scratch("render-rotated-image");
+    let mut doc = Document::with_version("1.4");
+    let mut pixels: Vec<u8> = Vec::new();
+    for _ in 0..4 {
+        for x in 0..8 {
+            pixels.extend_from_slice(if x < 4 { &[255, 0, 0] } else { &[0, 0, 255] });
+        }
+    }
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 8i64,
+            "Height" => 4i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+        },
+        pixels,
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        // Unit square -> 200 pt tall, 100 pt wide, rotated a quarter turn.
+        "q 0 200 -100 0 250 50 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("rotated.pdf"),
+    );
+
+    // `pixel_at` takes user space (y up): the bottom of the strip is y=80.
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 80.0);
+    assert!(
+        r > 150 && g < 80 && b < 80,
+        "bottom of the rotated strip must be the red half, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 220.0);
+    assert!(
+        b > 150 && r < 80 && g < 80,
+        "top of the rotated strip must be the blue half, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `y` is a cubic with two control points and a distinct end point. Reading it
+/// as `v` ended the edge at the first control point, so the filled region lost
+/// its bottom-left corner (rounded icon corners came out squared off wrong).
+#[test]
+fn renderer_honours_short_cubic_operators() {
+    use lopdf::{dictionary, Document};
+
+    let dir = scratch("render-short-cubic");
+    let doc = Document::with_version("1.4");
+    let pdf = finish_page(
+        doc,
+        "0 0 0 rg 10 10 m 190 10 10 190 y 10 10 l f".to_string(),
+        dictionary! {},
+        200.0,
+        200.0,
+        &dir.join("curve.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 200.0, 13.0, 178.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "region left of the curve must be filled, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The sidebar is generated from the registry, so the grouping contract lives
+/// in `model.rs`: four groups, "转换" first, PDF 转图片 inside it, and every
+/// group's tools contiguous in `ToolId::ALL` (otherwise a member is listed
+/// under the wrong caption).
+#[test]
+fn sidebar_groups_merge_pdf_to_image_into_convert() {
+    use sparrowpdf::model::ToolGroup;
+
+    let labels: Vec<&str> = ToolGroup::ALL.iter().map(|group| group.label()).collect();
+    assert_eq!(labels, vec!["转换", "结构操作", "页面编辑", "安全"]);
+
+    let convert = ToolGroup::Generate.tools();
+    assert_eq!(convert.len(), 3, "图片合并、批量转换、PDF 转图片");
+    assert!(convert.contains(&ToolId::PdfToImage));
+    assert!(convert.contains(&ToolId::ImageToPdf));
+    assert!(convert.contains(&ToolId::FolderToPdf));
+
+    let total: usize = ToolGroup::ALL
+        .iter()
+        .map(|group| group.tools().len())
+        .sum();
+    assert_eq!(total, ToolId::ALL.len(), "每个工具只属于一个分组");
+
+    for group in ToolGroup::ALL {
+        let rows: Vec<usize> = ToolId::ALL
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| tool.group() == group)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            rows.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "{:?} 的工具在注册表里不连续：{rows:?}",
+            group
+        );
+    }
+}
+
+/// `ICCBased` keeps its component count on a *stream* dictionary. Resolving it
+/// through `get_dictionary` alone treated the image as having no colour space,
+/// so profile-tagged images were skipped as blank.
+#[test]
+fn renderer_reads_iccbased_images() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-iccbased");
+    let mut doc = Document::with_version("1.4");
+    let profile_id = doc.add_object(Stream::new(dictionary! { "N" => 3i64 }, Vec::new()));
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 4i64,
+            "ColorSpace" => vec![
+                Object::Name(b"ICCBased".to_vec()),
+                Object::Reference(profile_id),
+            ],
+            "BitsPerComponent" => 8i64,
+        },
+        (0..16).flat_map(|_| [0u8, 0, 200]).collect(),
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("iccbased.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        b > 150 && r < 80 && g < 80,
+        "ICCBased RGB image must paint its samples, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `BT` resets the text and line matrices only. Clearing font and size there
+/// dropped the font for every `Tj` after the first block — a layout most CJK
+/// producers emit — and the run collapsed into WinAnsi noise at 12 pt.
+#[test]
+fn renderer_keeps_text_state_across_bt_blocks() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-bt-state");
+    let mut doc = Document::with_version("1.4");
+    let proc_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f".to_vec(),
+    ));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let pdf = finish_page(
+        doc,
+        // The second block has no `Tf`: it must inherit font and size.
+        "BT /F1 100 Tf 50 200 Td (A) Tj ET BT 150 200 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("bt-state.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 100.0, 250.0);
+    assert!(r < 80 && g < 80 && b < 80, "first block must paint, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 250.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "second block must inherit the font, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Image space is top-down while the unit square is bottom-up. Sampling the
+/// square top-down mirrored every image placed with the usual `w 0 0 h` matrix,
+/// which is exactly how the bundled image tools write their pages.
+#[test]
+fn renderer_places_image_rows_top_down() {
+    use lopdf::{dictionary, Document, Stream};
+
+    let dir = scratch("render-image-orientation");
+    let mut doc = Document::with_version("1.4");
+    let mut pixels: Vec<u8> = Vec::new();
+    for y in 0..8 {
+        for _ in 0..4 {
+            pixels.extend_from_slice(if y < 4 { &[220, 20, 20] } else { &[20, 20, 220] });
+        }
+    }
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 4i64,
+            "Height" => 8i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+        },
+        pixels,
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("image-row-order.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 250.0);
+    assert!(
+        r > 150 && b < 100,
+        "the first image row belongs at the top of the box, got ({r},{g},{b})"
+    );
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 50.0);
+    assert!(
+        b > 150 && r < 100,
+        "the last image row belongs at the bottom of the box, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a Type3 font whose single code (65) runs `procedure` and paints a
+/// square, then return the page `/Resources` dictionary that exposes it.
+fn type3_font(doc: &mut lopdf::Document, procedure: &[u8]) -> lopdf::Dictionary {
+    use lopdf::{dictionary, Object, Stream};
+
+    let proc_id = doc.add_object(Stream::new(Default::default(), procedure.to_vec()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    dictionary! { "Font" => dictionary! { "F1" => font_id } }
+}
+
+/// `TJ` shows its strings one after another. Restarting each string at `Tm`
+/// piled the glyphs on top of each other; only the advance kept them apart.
+#[test]
+fn renderer_continues_tj_strings_from_the_previous_advance() {
+    use lopdf::Document;
+
+    let dir = scratch("render-tj-advance");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(&mut doc, b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f");
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 10 100 Td [(A) 0 (A)] TJ ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("tj.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 60.0, 150.0);
+    assert!(r < 80 && g < 80 && b < 80, "first string must paint, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 200.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "second string must continue after the first, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Tz` squeezes the glyph, not just the spacing.
+#[test]
+fn renderer_applies_horizontal_scaling_to_glyphs() {
+    use lopdf::Document;
+
+    let dir = scratch("render-tz");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(&mut doc, b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f");
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 50 Tz 50 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("tz.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 75.0, 150.0);
+    assert!(r < 80 && g < 80 && b < 80, "half-width glyph must paint, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 130.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "the glyph must stop at half width, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sub-byte samples are padded to a byte boundary per row. Reading the buffer
+/// as one bit stream took the padding of row 0 as the first index of row 1.
+#[test]
+fn renderer_unpacks_subbyte_samples_per_row() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-indexed-rows");
+    let mut doc = Document::with_version("1.4");
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 1i64,
+            "Height" => 2i64,
+            "ColorSpace" => vec![
+                Object::Name(b"Indexed".to_vec()),
+                Object::Name(b"DeviceRGB".to_vec()),
+                Object::Integer(1),
+                Object::String(vec![255, 0, 0, 0, 255, 0], lopdf::StringFormat::Literal),
+            ],
+            "BitsPerComponent" => 1i64,
+        },
+        // Row 0: index 0 (red). Row 1: high bit set, index 1 (green).
+        vec![0x00u8, 0x80],
+    ));
+    let resources = dictionary! { "XObject" => dictionary! { "Im1" => image_id } };
+    let pdf = finish_page(
+        doc,
+        "q 300 0 0 300 0 0 cm /Im1 Do Q".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("indexed-rows.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 250.0);
+    assert!(r > 150 && g < 80, "row 0 must be red, got ({r},{g},{b})");
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 50.0);
+    assert!(g > 150 && r < 80, "row 1 must be green, got ({r},{g},{b})");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stripping `d0`/`d1` must not rewrite the rest of the procedure: joining
+/// tokens dropped the newline after a `%` comment and commented out the draw.
+#[test]
+fn renderer_keeps_type3_procedure_after_comment() {
+    use lopdf::Document;
+
+    let dir = scratch("render-type3-comment");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(
+        &mut doc,
+        b"1000 0 0 0 1000 1000 d1 % square\n0 0 1000 1000 re f",
+    );
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 100 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("type3-comment.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "the paint after the comment must still run, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `0.5 Tz` is a legal 0.5 % horizontal scale. It used to be replaced by 100 %
+/// because any value below 0.01 was treated as "unset", so the glyph kept its
+/// full width while `TJ` adjustments used the real scale.
+#[test]
+fn renderer_honours_small_horizontal_scaling() {
+    use lopdf::Document;
+
+    let dir = scratch("render-tz-small");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(&mut doc, b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f");
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 0.5 Tz 50 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("tz-small.pdf"),
+    );
+
+    // Sample well inside the box a 100 % glyph would fill: the right edge at
+    // x=150 would read white either way.
+    let (r, g, b) = pixel_at(&pdf, 300.0, 100.0, 150.0);
+    assert!(
+        r > 200 && g > 200 && b > 200,
+        "a 0.5 % scale must collapse the glyph, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A comment can end with a bare CR. Stopping only at LF hid the `d1` that
+/// followed it, losing the advance and the colour-uniform flag.
+#[test]
+fn renderer_ends_type3_comment_at_carriage_return() {
+    use lopdf::Document;
+
+    let dir = scratch("render-type3-cr");
+    let mut doc = Document::with_version("1.4");
+    let resources = type3_font(
+        &mut doc,
+        b"1000 0 0 0 1000 1000 d1 % note\r0 0 1000 1000 re f",
+    );
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 100 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("type3-cr.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "the glyph must still paint after a CR-terminated comment, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Type3 font may list itself in its own `/Resources`. Building those
+/// resources eagerly used to recurse until the thread stack overflowed.
+#[test]
+fn renderer_survives_type3_resource_cycle() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("render-type3-cycle");
+    let mut doc = Document::with_version("1.4");
+    let proc_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f".to_vec(),
+    ));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type3",
+        "FontBBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(1000), Object::Integer(1000)],
+        "FontMatrix" => vec![
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.001),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ],
+        "CharProcs" => dictionary! { "square" => proc_id },
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"square".to_vec())],
+        },
+        "FirstChar" => 65i64,
+        "LastChar" => 65i64,
+        "Widths" => vec![Object::Integer(1000)],
+    });
+    if let Ok(font) = doc.get_object_mut(font_id).and_then(|o| o.as_dict_mut()) {
+        font.set(
+            "Resources",
+            dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        );
+    }
+    let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let pdf = finish_page(
+        doc,
+        "BT /F1 100 Tf 100 100 Td (A) Tj ET".to_string(),
+        resources,
+        300.0,
+        300.0,
+        &dir.join("type3-cycle.pdf"),
+    );
+
+    let (r, g, b) = pixel_at(&pdf, 300.0, 150.0, 150.0);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "the page must still render, got ({r},{g},{b})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
