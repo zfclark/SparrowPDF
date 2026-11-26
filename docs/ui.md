@@ -70,6 +70,8 @@ Idle → Ready → Running{fraction, message} → Done{summary, outputs, note} |
 - 拖放按当前工具接受的文件类型过滤；拖入顺序会被整理（PDF 自动排到第一槽）。
 - 缩略图逐帧限流渲染，密码变更时清缓存重开重渲染（详见 [rendering.md](./rendering.md) 第 7 节）。
 - 空输入不渲染空卡片；页码标签与悬停提示区分「图片 N」与「页 P」（两图一页时二者不同）。
+- 页面替换的预览按输出页序排列，映射取自工具用的同一个 planner（`replace_pages::plan`），
+  被替换页带「替换」角标；页码规格非法时在预览卡内就地说明，不渲染错误的页序。
 
 ## 7. 批量转换的模板面板
 

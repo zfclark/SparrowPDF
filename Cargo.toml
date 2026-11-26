@@ -36,6 +36,12 @@ weezl = "0.2"
 # zlib decode for /FlateDecode; already in the tree via `image`, declared
 # explicitly because the rasterizer calls it directly.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Raw JPEG component access for Adobe YCCK scans (APP14 transform 2): `image`
+# collapses CMYK flavours to RGB, which renders Photoshop-exported scans as
+# ink maps (white paper decodes as black). Both crates are already in the tree
+# through `image`, so this adds no new code, only direct API access.
+zune-jpeg = "0.5.15"
+zune-core = { version = "0.5.3", default-features = false }
 hayro-ccitt = "0.5"
 # hayro-jbig2 0.4 depends on hayro-ccitt 0.5, so the two must be bumped together:
 # leaving this one on 0.4 puts two copies of the fax decoder in the binary.

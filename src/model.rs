@@ -19,6 +19,7 @@ pub enum ToolId {
     Extract,
     TextWatermark,
     ImageWatermark,
+    ReplacePages,
     Encrypt,
     PdfToImage,
 }
@@ -29,7 +30,7 @@ impl ToolId {
     /// Tools of one group are contiguous: the sidebar walks `ALL` and filters
     /// by group, so a stray member at the end would be listed under the first
     /// group but after every other group's rows.
-    pub const ALL: [ToolId; 12] = [
+    pub const ALL: [ToolId; 13] = [
         ToolId::ImageToPdf,
         ToolId::FolderToPdf,
         ToolId::PdfToImage,
@@ -41,6 +42,7 @@ impl ToolId {
         ToolId::Extract,
         ToolId::TextWatermark,
         ToolId::ImageWatermark,
+        ToolId::ReplacePages,
         ToolId::Encrypt,
     ];
 
@@ -53,7 +55,9 @@ impl ToolId {
             | ToolId::DeletePages
             | ToolId::Reorder
             | ToolId::Extract => ToolGroup::Structure,
-            ToolId::TextWatermark | ToolId::ImageWatermark => ToolGroup::PageEdit,
+            ToolId::TextWatermark | ToolId::ImageWatermark | ToolId::ReplacePages => {
+                ToolGroup::PageEdit
+            }
             ToolId::Encrypt => ToolGroup::Security,
         }
     }
@@ -70,6 +74,7 @@ impl ToolId {
             ToolId::Extract => "页面提取",
             ToolId::TextWatermark => "文本水印",
             ToolId::ImageWatermark => "图片水印",
+            ToolId::ReplacePages => "页面替换",
             ToolId::Encrypt => "加密与解密",
             ToolId::PdfToImage => "PDF 转图片",
         }
@@ -88,6 +93,7 @@ impl ToolId {
             ToolId::Extract => "将指定页面另存为新的 PDF",
             ToolId::TextWatermark => "在页面上叠加文字水印，可设置字号、颜色、透明度与角度",
             ToolId::ImageWatermark => "将图片作为水印叠加到每一页",
+            ToolId::ReplacePages => "用 PDF 页面或照片替换指定页面，可保持原页尺寸或跟随来源",
             ToolId::Encrypt => "AES-256 加密，或移除已有密码",
             ToolId::PdfToImage => "逐页渲染为 PNG / JPEG，支持 36–600 DPI 与多文件批量导出",
         }
@@ -98,6 +104,8 @@ impl ToolId {
         match self {
             ToolId::ImageToPdf | ToolId::FolderToPdf => &["jpg", "jpeg", "png"],
             ToolId::ImageWatermark => &["pdf", "jpg", "jpeg", "png"],
+            // Slot 1 is the PDF being replaced, slot 2 the source page or photo.
+            ToolId::ReplacePages => &["pdf", "jpg", "jpeg", "png"],
             ToolId::PdfToImage => &["pdf"],
             _ => &["pdf"],
         }
@@ -107,7 +115,7 @@ impl ToolId {
     pub fn max_inputs(self) -> Option<usize> {
         match self {
             ToolId::Merge | ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage => None,
-            ToolId::ImageWatermark => Some(2),
+            ToolId::ImageWatermark | ToolId::ReplacePages => Some(2),
             _ => Some(1),
         }
     }

@@ -337,7 +337,7 @@ fn log_lines_are_appended_to_the_log_file() {
 #[test]
 fn tool_ids_are_unique_and_complete() {
     let all = ToolId::ALL;
-    assert_eq!(all.len(), 12, "registry fixes exactly 12 tools");
+    assert_eq!(all.len(), 13, "registry fixes exactly 13 tools");
     for i in 0..all.len() {
         for j in (i + 1)..all.len() {
             assert_ne!(all[i], all[j]);
@@ -3841,4 +3841,774 @@ fn group_preview_counts_pages_and_marks_skips() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].pages, None);
     assert!(groups[0].skip.is_some());
+}
+
+// ------------------------------------------------------ page replacement
+
+/// A one-colour PDF: every page is filled with `rgb` (each channel 0..=1).
+fn make_solid_pdf(
+    dir: &Path,
+    name: &str,
+    pages: u32,
+    w: f32,
+    h: f32,
+    rgb: [f32; 3],
+) -> PathBuf {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => pages as i64,
+        "Kids" => Object::Array(Vec::new()),
+    });
+    let mut kids = Vec::new();
+    for _ in 0..pages {
+        let content = format!(
+            "q {} {} {} rg 0 0 {w} {h} re f Q",
+            rgb[0], rgb[1], rgb[2]
+        );
+        let content_id = doc.add_object(Stream::new(Default::default(), content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(w),
+                Object::Real(h),
+            ],
+            "Contents" => content_id,
+            "Resources" => dictionary! {},
+        });
+        kids.push(page_id.into());
+    }
+    if let Object::Dictionary(d) = &mut doc.objects.get_mut(&pages_id).unwrap() {
+        d.set("Kids", Object::Array(kids));
+    }
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+
+    let path = dir.join(name);
+    doc.save(&path).expect("save fixture");
+    path
+}
+
+/// A solid-colour photo fixture.
+fn make_solid_image(dir: &Path, name: &str, w: u32, h: u32, rgb: [u8; 3]) -> PathBuf {
+    let path = dir.join(name);
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+    img.save_with_format(&path, image::ImageFormat::Jpeg)
+        .expect("write jpeg fixture");
+    path
+}
+
+/// RGB of the pixel at the centre of a rendered page.
+fn page_centre(path: &Path, page: u32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[page], 160.0, &fonts)
+        .expect("render page");
+    let pixmap = &rendered[0].1;
+    let index = ((pixmap.height / 2) * pixmap.width + pixmap.width / 2) as usize * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// RGB at `(fx, fy)` (fractions of the page) of the first rendered page.
+fn page_pixel_at(path: &Path, fx: f32, fy: f32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[1], 240.0, &fonts)
+        .expect("render page");
+    let pixmap = &rendered[0].1;
+    let x = ((pixmap.width as f32 * fx) as u32).min(pixmap.width - 1);
+    // Rendering puts y=0 at the top, so flip the fraction.
+    let y = ((pixmap.height as f32 * (1.0 - fy)) as u32).min(pixmap.height - 1);
+    let index = (y * pixmap.width + x) as usize * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// Rendered RGBA of one page, for "this page did not change" checks.
+fn page_pixels(path: &Path, page: u32) -> Vec<u8> {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[page], 160.0, &fonts)
+        .expect("render page");
+    rendered[0].1.data.clone()
+}
+
+/// Number of image XObjects in the file.
+fn image_xobject_count(path: &Path) -> usize {
+    let doc = lopdf::Document::load(path).expect("load output");
+    doc.objects
+        .values()
+        .filter(|object| {
+            object
+                .as_stream()
+                .is_ok_and(|stream| {
+                    matches!(
+                        stream.dict.get(b"Subtype"),
+                        Ok(lopdf::Object::Name(name)) if name.as_slice() == b"Image"
+                    )
+                })
+        })
+        .count()
+}
+
+/// Options helper for the replacement tool.
+fn replace_options(pages: &str, source_pages: &str) -> ToolOptions {
+    ToolOptions::ReplacePages {
+        pages: pages.to_string(),
+        source_pages: source_pages.to_string(),
+        fit: sparrowpdf::tools::ReplaceFit::Contain,
+        geometry: sparrowpdf::tools::ReplaceGeometry::KeepTarget,
+    }
+}
+
+/// The printed page is the one that gets replaced: the target keeps its size,
+/// unaffected pages stay byte-identical, and the imported page carries the
+/// source's content (vector import, not a screenshot of it).
+#[test]
+fn replace_pages_imports_a_pdf_page_and_keeps_the_target_sheet() {
+    let dir = scratch("replace-keep");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    let source = make_solid_pdf(&dir, "source.pdf", 1, 300.0, 400.0, [1.0, 0.0, 0.0]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("2", "");
+
+    let outcome = run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+    assert_eq!(outcome.outputs.len(), 1);
+    assert!(outcome.summary.contains("第 2 页"), "{}", outcome.summary);
+
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 3, "page count kept");
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[1][2] - 612.0).abs() < 0.6 && (boxes[1][3] - 792.0).abs() < 0.6,
+        "replaced page keeps the target sheet, got {:?}",
+        boxes[1]
+    );
+
+    // The imported page shows the source's red fill.
+    let (r, g, b) = page_centre(&out, 2);
+    assert!(r > 180 && g < 80 && b < 80, "page 2 must be red, got ({r},{g},{b})");
+
+    // Pages that were not selected are copied verbatim.
+    for page in [1u32, 3u32] {
+        assert_eq!(
+            page_pixels(&target, page),
+            page_pixels(&out, page),
+            "page {page} must be unchanged"
+        );
+    }
+
+    // The source file is only read.
+    let source_boxes = page_media_boxes(&source);
+    assert_eq!(pdf_io::page_count_of(&source, None).unwrap(), 1);
+    assert!((source_boxes[0][2] - 300.0).abs() < 0.6, "source untouched");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "Follow the source page size" turns the replaced page into the source sheet,
+/// while every other page keeps the target's own size.
+#[test]
+fn replace_pages_can_take_the_source_page_size() {
+    let dir = scratch("replace-follow");
+    let target = make_marked_pdf(&dir, "target.pdf", 2);
+    let source = make_solid_pdf(&dir, "source.pdf", 1, 300.0, 400.0, [0.0, 0.0, 1.0]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    if let ToolOptions::ReplacePages { geometry, .. } = &mut req.options {
+        *geometry = sparrowpdf::tools::ReplaceGeometry::FollowSource;
+    }
+    let outcome = run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+    assert!(
+        outcome.summary.contains("跟随来源"),
+        "the summary must say the paper changed: {}",
+        outcome.summary
+    );
+
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[0][2] - 300.0).abs() < 0.6 && (boxes[0][3] - 400.0).abs() < 0.6,
+        "page 1 takes the source sheet, got {:?}",
+        boxes[0]
+    );
+    assert!(
+        (boxes[1][2] - 612.0).abs() < 0.6 && (boxes[1][3] - 792.0).abs() < 0.6,
+        "page 2 keeps the target sheet, got {:?}",
+        boxes[1]
+    );
+    let (r, g, b) = page_centre(&out, 1);
+    assert!(b > 180 && r < 80 && g < 80, "page 1 must be blue, got ({r},{g},{b})");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A photo source fills the target sheet, and the pixels are embedded once even
+/// when several pages are replaced with it.
+#[test]
+fn replace_pages_photo_covers_every_replaced_page_with_one_copy() {
+    let dir = scratch("replace-photo");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    let photo = make_solid_image(&dir, "photo.jpg", 800, 400, [30, 90, 200]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), photo.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1-2", "");
+    if let ToolOptions::ReplacePages { fit, .. } = &mut req.options {
+        *fit = sparrowpdf::tools::ReplaceFit::Cover;
+    }
+    run(ToolId::ReplacePages, &req).expect("photo replacement succeeds");
+
+    let boxes = page_media_boxes(&out);
+    for (index, box4) in boxes.iter().enumerate().take(2) {
+        assert!(
+            (box4[2] - 612.0).abs() < 0.6 && (box4[3] - 792.0).abs() < 0.6,
+            "page {} keeps the target sheet, got {:?}",
+            index + 1,
+            box4
+        );
+    }
+    for page in [1u32, 2u32] {
+        let (r, g, b) = page_centre(&out, page);
+        assert!(
+            b > 150 && r < 90 && g < 130,
+            "page {page} must show the photo, got ({r},{g},{b})"
+        );
+    }
+    assert_eq!(
+        image_xobject_count(&out),
+        1,
+        "the photo must be stored once, not once per page"
+    );
+    assert_eq!(
+        page_pixels(&target, 3),
+        page_pixels(&out, 3),
+        "page 3 is not part of the range"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression guard for the rotation algebra: a source page stored sideways with
+/// `/Rotate 90` must land upright, with its content where a reader would see it.
+#[test]
+fn replace_pages_uprights_a_rotated_source_page() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("replace-rotate");
+    // Source: 600 x 800 stored, /Rotate 90 -> displayed 800 x 600, with a black
+    // bar along the stored top edge (which a reader sees on the right).
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {});
+    let content_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"q 1 1 1 rg 0 0 600 800 re f Q q 0 0 0 rg 0 700 600 100 re f Q".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+        "Rotate" => 90i64,
+        "Contents" => content_id,
+        "Resources" => dictionary! {},
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => vec![page_id.into()],
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let source = dir.join("sideways.pdf");
+    doc.save(&source).expect("save fixture");
+
+    let target = make_solid_pdf(&dir, "target.pdf", 1, 800.0, 600.0, [1.0, 1.0, 1.0]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[0][2] - 800.0).abs() < 0.6 && (boxes[0][3] - 600.0).abs() < 0.6,
+        "the page keeps the target sheet, got {:?}",
+        boxes[0]
+    );
+
+    // The bar is on the right, exactly where the rotated source shows it.
+    let (right_r, right_g, right_b) = page_pixel_at(&out, 0.95, 0.5);
+    assert!(
+        right_r < 90 && right_g < 90 && right_b < 90,
+        "the bar belongs on the right edge, got ({right_r},{right_g},{right_b})"
+    );
+    let (left_r, left_g, left_b) = page_pixel_at(&out, 0.05, 0.5);
+    assert!(
+        left_r > 180 && left_g > 180 && left_b > 180,
+        "the left edge stays white, got ({left_r},{left_g},{left_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A page that inherits `/Resources` and `/MediaBox` from its `/Pages` node must
+/// survive the rebuild: the tool copies pages into a brand-new document, so
+/// without materialising the inherited entries the kept pages would come out
+/// blank and unsized.
+#[test]
+fn replace_pages_keeps_pages_that_inherit_their_resources() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("replace-inherit");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let (w, h) = (8u32, 8u32);
+    let pixels: Vec<u8> = (0..(w * h)).flat_map(|_| [220u8, 40, 40]).collect();
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+        },
+        pixels,
+    ));
+    let mut kids = Vec::new();
+    for _ in 0..2 {
+        let content_id = doc.add_object(Stream::new(
+            Default::default(),
+            b"q 612 0 0 792 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        // No /Resources and no /MediaBox: both live on the /Pages node.
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        kids.push(page_id.into());
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => Object::Array(kids),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im1" => image_id },
+            },
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let target = dir.join("inherited.pdf");
+    doc.save(&target).expect("save fixture");
+
+    let photo = make_solid_image(&dir, "photo.jpg", 200, 200, [30, 90, 200]);
+    let out = dir.join("replaced.pdf");
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), photo.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 2);
+    // Page 2 was kept: its inherited image resource and size must have survived.
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[1][2] - 612.0).abs() < 0.6 && (boxes[1][3] - 792.0).abs() < 0.6,
+        "the kept page keeps its inherited size, got {:?}",
+        boxes[1]
+    );
+    let (r, g, b) = page_centre(&out, 2);
+    assert!(
+        r > 150 && g < 110 && b < 110,
+        "the kept page must still draw its inherited image, got ({r},{g},{b})"
+    );
+    // Page 1 is the photo.
+    let (r, g, b) = page_centre(&out, 1);
+    assert!(b > 150 && r < 90, "page 1 is the photo, got ({r},{g},{b})");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Page specs are validated before anything is written, and a photo cannot
+/// "follow the source size" — it has none.
+#[test]
+fn replace_pages_rejects_bad_requests() {
+    let dir = scratch("replace-errors");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    let source = make_solid_pdf(&dir, "source.pdf", 2, 300.0, 400.0, [1.0, 0.0, 0.0]);
+    let photo = make_solid_image(&dir, "photo.jpg", 80, 80, [10, 120, 40]);
+    let out = dir.join("replaced.pdf");
+    let tool = sparrowpdf::tools::tool_for(ToolId::ReplacePages);
+
+    // Empty page spec is caught by the cheap pre-flight.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("", "");
+    match tool.validate(&req) {
+        Err(ToolError::InvalidPageRange { .. }) => {}
+        other => panic!("expected InvalidPageRange, got {other:?}"),
+    }
+
+    // A photo has no page box.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), photo.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    if let ToolOptions::ReplacePages { geometry, .. } = &mut req.options {
+        *geometry = sparrowpdf::tools::ReplaceGeometry::FollowSource;
+    }
+    match tool.validate(&req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("保持原页尺寸"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+
+    // Only PDF / JPG / PNG are accepted in the source slot.
+    let notes = dir.join("notes.txt");
+    std::fs::write(&notes, b"not a page").unwrap();
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), notes],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    match tool.validate(&req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("JPG"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+
+    // Out-of-range target pages fail on the run, not silently.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("9", "");
+    match run(ToolId::ReplacePages, &req) {
+        Err(ToolError::InvalidPageRange { .. }) => {}
+        other => panic!("expected InvalidPageRange, got {other:?}"),
+    }
+
+    // A multi-page source spec must match the number of target pages.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1-3", "1-2");
+    match run(ToolId::ReplacePages, &req) {
+        Err(ToolError::InvalidPageRange { detail }) => {
+            assert!(detail.contains("数量"), "detail was {detail}")
+        }
+        other => panic!("expected InvalidPageRange, got {other:?}"),
+    }
+
+    assert!(!out.exists(), "a rejected request writes nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One source page is reused for every target page, and the mapping is what the
+/// preview shows.
+#[test]
+fn replace_pages_repeats_one_source_page_and_maps_several() {
+    use lopdf::dictionary;
+    use sparrowpdf::tools::replace_pages::{output_pages, plan, OutputPage};
+
+    let dir = scratch("replace-map");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    // Page 1 red, page 2 blue.
+    let mut doc = lopdf::Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => 2i64,
+        "Kids" => lopdf::Object::Array(Vec::new()),
+    });
+    let mut kids = Vec::new();
+    for rgb in [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]] {
+        let content = format!(
+            "q {} {} {} rg 0 0 300 400 re f Q",
+            rgb[0], rgb[1], rgb[2]
+        );
+        let content_id = doc.add_object(lopdf::Stream::new(Default::default(), content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 400.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! {},
+        });
+        kids.push(page_id.into());
+    }
+    if let lopdf::Object::Dictionary(d) = &mut doc.objects.get_mut(&pages_id).unwrap() {
+        d.set("Kids", lopdf::Object::Array(kids));
+    }
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let source = dir.join("two-colours.pdf");
+    doc.save(&source).expect("save fixture");
+
+    let out = dir.join("replaced.pdf");
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    // Source page 2 (blue) repeated over target pages 1 and 3.
+    req.options = replace_options("1,3", "2");
+    run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+
+    for page in [1u32, 3u32] {
+        let (r, g, b) = page_centre(&out, page);
+        assert!(b > 180 && r < 80, "page {page} must be blue, got ({r},{g},{b})");
+    }
+    // Page 2 was not selected and keeps the target's own content.
+    assert_eq!(page_pixels(&target, 2), page_pixels(&out, 2));
+
+    // The preview and the run share one planner.
+    let planned = plan(3, Some(2), "1,3", "2").expect("plan");
+    assert_eq!(planned.targets, vec![1, 3]);
+    assert_eq!(planned.source_pages, vec![2, 2]);
+    assert_eq!(
+        output_pages(3, &planned),
+        vec![OutputPage::FromPdf(2), OutputPage::Kept(2), OutputPage::FromPdf(2)]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------ Adobe CMYK JPEG 预览
+
+/// White paper with a solid-K black bar, encoded as Adobe CMYK (transform 0).
+fn make_cmyk_jpeg(dir: &Path, name: &str, w: u16, h: u16) -> PathBuf {
+    let mut data = Vec::with_capacity(w as usize * h as usize * 4);
+    for row in 0..h {
+        for _column in 0..w {
+            // No ink = white paper; the middle third carries full K ink.
+            let ink: [u8; 4] = if row >= h / 3 && row < h * 2 / 3 {
+                [0, 0, 0, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+            data.extend_from_slice(&ink);
+        }
+    }
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, 92)
+        .encode(&data, w, h, jpeg_encoder::ColorType::Cmyk)
+        .expect("encode CMYK jpeg");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write fixture");
+    path
+}
+
+/// A one-page PDF drawing `jpeg` as a DeviceCMYK DCTDecode image, full page.
+fn make_jpeg_page_pdf(dir: &Path, name: &str, jpeg: &Path, w: u16, h: u16) -> PathBuf {
+    use lopdf::{dictionary, Document, Stream};
+
+    let bytes = std::fs::read(jpeg).expect("read jpeg fixture");
+    let mut doc = Document::with_version("1.5");
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceCMYK",
+            "BitsPerComponent" => 8i64,
+            "Filter" => "DCTDecode",
+        },
+        bytes,
+    ));
+    let content_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "MediaBox" => vec![0.into(), 0.into(), 400.into(), 400.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => 1i64,
+        "Kids" => vec![page_id.into()],
+    });
+    if let Ok(dict) = doc.get_object_mut(page_id).unwrap().as_dict_mut() {
+        dict.set("Parent", pages_id);
+    }
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let path = dir.join(name);
+    doc.save(&path).expect("save fixture");
+    path
+}
+
+/// Adobe YCCK written with the *conformant* component convention (the one
+/// Photoshop uses): the first three components are YCbCr of the inverted CMY
+/// and K is stored as-is. `jpeg_encoder`'s own `CmykAsYcck` maps CMY directly
+/// and inverts K, which is not what the APP14 transform byte promises, so the
+/// fixture implements the buffer itself.
+struct AdobeYcckFixture {
+    width: u16,
+    height: u16,
+}
+
+impl jpeg_encoder::ImageBuffer for AdobeYcckFixture {
+    fn get_jpeg_color_type(&self) -> jpeg_encoder::JpegColorType {
+        jpeg_encoder::JpegColorType::Ycck
+    }
+    fn width(&self) -> u16 {
+        self.width
+    }
+    fn height(&self) -> u16 {
+        self.height
+    }
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        for _column in 0..self.width {
+            // Both rows carry no CMY ink, so the YCC part is white (the scan's
+            // paper); the middle third is black through the K channel alone.
+            buffers[0].push(255);
+            buffers[1].push(128);
+            buffers[2].push(128);
+            buffers[3].push(if y >= self.height / 3 && y < self.height * 2 / 3 {
+                255
+            } else {
+                0
+            });
+        }
+    }
+}
+
+fn make_ycck_jpeg(dir: &Path, name: &str, w: u16, h: u16) -> PathBuf {
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, 92)
+        .encode_image(AdobeYcckFixture { width: w, height: h })
+        .expect("encode YCCK jpeg");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write fixture");
+    path
+}
+
+/// Render one page and read the RGB at a fraction of the page.
+fn jpeg_page_pixel(path: &Path, fx: f32, fy: f32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[1], 192.0, &fonts)
+        .expect("render jpeg page");
+    let pixmap = &rendered[0].1;
+    let x = ((pixmap.width as f32 * fx) as u32).min(pixmap.width - 1) as usize;
+    let y = ((pixmap.height as f32 * fy) as u32).min(pixmap.height - 1) as usize;
+    let index = (y * pixmap.width as usize + x) * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// CMYK scans must render as the reader sees them: white paper, dark ink.
+/// Covers the Adobe transform-0 flavour (inverted CMYK storage), which the
+/// image-crate decode handles correctly.
+#[test]
+fn renderer_decodes_adobe_cmyk_jpeg_right_way_up() {
+    let dir = scratch("cmyk-jpeg");
+    let jpeg = make_cmyk_jpeg(&dir, "photo.jpg", 64, 96);
+    let pdf = make_jpeg_page_pdf(&dir, "page.pdf", &jpeg, 64, 96);
+
+    let (paper_r, paper_g, paper_b) = jpeg_page_pixel(&pdf, 0.5, 0.10);
+    assert!(
+        paper_r > 200 && paper_g > 200 && paper_b > 200,
+        "paper must be white, got ({paper_r},{paper_g},{paper_b})"
+    );
+    let (bar_r, bar_g, bar_b) = jpeg_page_pixel(&pdf, 0.5, 0.50);
+    assert!(
+        bar_r < 80 && bar_g < 80 && bar_b < 80,
+        "the full-K bar must be black, got ({bar_r},{bar_g},{bar_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: Adobe YCCK scans (APP14 transform 2, Photoshop exports) used to
+/// render as the photometric inverse — black paper, white text — because the
+/// general decoder collapses the colour space onto the ink map.
+#[test]
+fn renderer_decodes_adobe_ycck_jpeg_right_way_up() {
+    let dir = scratch("ycck-jpeg");
+    let jpeg = make_ycck_jpeg(&dir, "scan.jpg", 64, 96);
+    let pdf = make_jpeg_page_pdf(&dir, "page.pdf", &jpeg, 64, 96);
+
+    let (paper_r, paper_g, paper_b) = jpeg_page_pixel(&pdf, 0.5, 0.10);
+    assert!(
+        paper_r > 200 && paper_g > 200 && paper_b > 200,
+        "paper must be white, got ({paper_r},{paper_g},{paper_b})"
+    );
+    let (bar_r, bar_g, bar_b) = jpeg_page_pixel(&pdf, 0.5, 0.50);
+    assert!(
+        bar_r < 80 && bar_g < 80 && bar_b < 80,
+        "the full-K bar must be black, got ({bar_r},{bar_g},{bar_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1865,6 +1865,106 @@ fn apply_soft_mask(doc: &Document, stream: &lopdf::Stream, image: &mut ImageRgba
     }
 }
 
+/// Whether the JPEG carries an Adobe APP14 marker with transform 2 (YCCK).
+///
+/// Walking the marker segments by length keeps fill bytes (`FF 00`) and stand-
+/// alone markers from derailing the scan; the segment search stops at the first
+/// scan (`SOS`) because APP14 always precedes the entropy-coded data.
+fn jpeg_adobe_ycck(data: &[u8]) -> bool {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return false;
+    }
+    let mut index = 2;
+    while index + 4 <= data.len() {
+        if data[index] != 0xFF {
+            return false;
+        }
+        let marker = data[index + 1];
+        if marker == 0xFF || marker == 0x00 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+            // Fill bytes and stand-alone markers carry no length.
+            index += 2;
+            continue;
+        }
+        if marker == 0xDA {
+            return false;
+        }
+        let length = usize::from(data[index + 2]) << 8 | usize::from(data[index + 3]);
+        if length < 2 || index + 2 + length > data.len() {
+            return false;
+        }
+        if marker == 0xEE {
+            let segment = &data[index + 4..index + 2 + length];
+            return segment.len() >= 12 && &segment[..5] == b"Adobe" && segment[11] == 2;
+        }
+        index += 2 + length;
+    }
+    false
+}
+
+/// Decode an Adobe YCCK JPEG (APP14 transform 2) into RGBA.
+///
+/// Every general-purpose Rust decoder turns these into the photometric
+/// inverse: it multiplies the YCC-decoded channels by the *stored* K, which
+/// for Adobe's convention (the first three components are YCbCr of the
+/// inverted CMY, K stored as-is) yields the ink coverage, so a scanned page
+/// comes out black with white text. Photoshop / InDesign / Distiller all write
+/// this flavour, and it is common enough in scanned PDFs to deserve its own
+/// path.
+///
+/// The raw four components are decoded (output colourspace YCCK, no colour
+/// conversion) and composed the way libjpeg-turbo plus the Adobe inversion do:
+/// the YCC-decoded channels darken by the ink level, `rgb * (255 - K) / 255`.
+fn decode_adobe_ycck(data: &[u8]) -> Option<ImageRgba> {
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::YCCK)
+        .set_strict_mode(false);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
+        zune_core::bytestream::ZCursor::new(data),
+        options,
+    );
+    decoder.decode_headers().ok()?;
+    // Trust the marker only when the stream agrees.
+    if decoder.input_colorspace()? != ColorSpace::YCCK {
+        return None;
+    }
+    let (width, height) = decoder.dimensions()?;
+    // JPEG dimensions fit u16, so the u32 cast cannot truncate.
+    let (width, height) = (width as u32, height as u32);
+    if width == 0 || height == 0 || width > 8000 || height > 8000 {
+        return None;
+    }
+    let raw = decoder.decode().ok()?;
+    if raw.len() < (width * height * 4) as usize {
+        return None;
+    }
+
+    let mut image = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in raw.chunks_exact(4) {
+        let [y, cb, cr, ink] = [pixel[0] as i32, pixel[1] as i32, pixel[2] as i32, pixel[3] as i32];
+        // JFIF fixed-point YCbCr → RGB (the constants libjpeg-turbo uses).
+        let r = y + ((91_881 * (cr - 128)) >> 16);
+        let g = y - ((22_554 * (cb - 128)) >> 16) - ((46_802 * (cr - 128)) >> 16);
+        let b = y + ((116_130 * (cb - 128)) >> 16);
+        // K is stored as-is (not inverted), so the toner level is its
+        // complement; the YCC-decoded channels darken by it.
+        let keep = 255 - ink;
+        let clamp = |value: i32| value.clamp(0, 255) as u8;
+        image.push(clamp((r * keep) / 255));
+        image.push(clamp((g * keep) / 255));
+        image.push(clamp((b * keep) / 255));
+        image.push(255);
+    }
+
+    Some(ImageRgba {
+        width,
+        height,
+        data: image,
+    })
+}
+
 /// Decode the pixels of an image XObject, without its soft mask.
 fn decode_image_pixels(
     doc: &Document,
@@ -1889,8 +1989,12 @@ fn decode_image_pixels(
         inverted: decode_inverted(stream),
     };
 
-    // JPEG: hand the original bytes to the decoder, no re-encoding anywhere.
+    // JPEG: hand the original bytes to the decoder, no re-encoding anywhere —
+    // except Adobe YCCK, which needs its raw components (see `decode_jpeg`).
     if filters.iter().any(|f| f == b"DCTDecode" || f == b"DCT") {
+        if jpeg_adobe_ycck(&stream.content) {
+            return decode_adobe_ycck(&stream.content);
+        }
         let image = image::load_from_memory(&stream.content).ok()?;
         let rgba = image.to_rgba8();
         return Some(ImageRgba {
@@ -2670,7 +2774,36 @@ fn lzw_decode(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_to_unicode;
+    use super::{jpeg_adobe_ycck, parse_to_unicode};
+
+    /// Marker walk: an Adobe APP14 with transform 2 is YCCK, transform 0 is
+    /// plain CMYK, and a file without the marker is neither.
+    #[test]
+    fn adobe_ycck_marker_is_detected_by_transform() {
+        let app14 = |transform: u8| {
+            let mut data = vec![0xFF, 0xD8];
+            // SOI, then APP14: FF EE <len=14> "Adobe" ver(2) flags(4) transform.
+            data.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+            data.extend_from_slice(b"Adobe");
+            data.extend_from_slice(&[0x64, 0x00, 0x00, 0x00, 0x00, 0x00, transform]);
+            // A scan header and some payload, so the walk has somewhere to go.
+            data.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x00]);
+            data
+        };
+        assert!(jpeg_adobe_ycck(&app14(2)));
+        assert!(!jpeg_adobe_ycck(&app14(0)));
+        assert!(!jpeg_adobe_ycck(&app14(1)));
+
+        // No APP14 at all.
+        let plain = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0x00];
+        assert!(!jpeg_adobe_ycck(&plain));
+        // Fill bytes inside the marker stream must not derail the walk.
+        let mut padded = vec![0xFF, 0xD8, 0xFF, 0x00, 0xFF, 0x00];
+        padded.extend_from_slice(&app14(2)[2..]);
+        assert!(jpeg_adobe_ycck(&padded));
+        // Not a JPEG at all.
+        assert!(!jpeg_adobe_ycck(b"not a jpeg"));
+    }
 
     /// The count in front of `beginbfchar` / `beginbfrange` is a word, not a
     /// source code. Reading it as one shifted every pair by a token, so codes

@@ -583,6 +583,7 @@ impl SparrowApp {
             ToolId::Extract => panels::extract::show(ui, form, preview),
             ToolId::TextWatermark => panels::text_watermark::show(ui, form),
             ToolId::ImageWatermark => panels::image_watermark::show(ui, form),
+            ToolId::ReplacePages => panels::replace_pages::show(ui, form, preview),
             ToolId::Encrypt => panels::encrypt::show(ui, form),
             ToolId::PdfToImage => panels::pdf_to_image::show(ui, form, preview),
         }
@@ -724,6 +725,7 @@ fn output_suffix(tool_id: ToolId) -> &'static str {
         ToolId::Reorder => "_reordered",
         ToolId::Extract => "_extracted",
         ToolId::TextWatermark | ToolId::ImageWatermark => "_watermarked",
+        ToolId::ReplacePages => "_replaced",
         ToolId::Encrypt => "_secured",
         _ => "_out",
     }

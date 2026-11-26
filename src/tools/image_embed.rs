@@ -89,6 +89,9 @@ pub(crate) enum Sheet {
     },
     /// The page follows the image: one image on a sheet in its own direction.
     Follow { page_size: PageSize, margin: f32 },
+    /// Page box fixed, image scaled until it covers the box; the overflow is
+    /// cut by the page box itself (PDF viewers clip content to the MediaBox).
+    Cover { page: (f32, f32) },
 }
 
 /// An image whose pixels have already been decoded, scaled and encoded.
@@ -178,7 +181,7 @@ pub(crate) fn prepare_image(
     };
     let image_is_landscape = eff_w > eff_h;
 
-    let (page, fit, center, rotate) = match sheet {
+    let (page, fit, center, rotate, cover) = match sheet {
         Sheet::Fixed {
             page,
             fit,
@@ -190,6 +193,7 @@ pub(crate) fn prepare_image(
             fit,
             center,
             auto_rotate && image_is_landscape != landscape,
+            false,
         ),
         Sheet::Follow { page_size, margin } => {
             let page = page_size.page(if image_is_landscape {
@@ -204,8 +208,16 @@ pub(crate) fn prepare_image(
                 (page.0 - margin * 2.0, page.1 - margin * 2.0),
                 (page.0 / 2.0, page.1 / 2.0),
                 false,
+                false,
             )
         }
+        Sheet::Cover { page } => (
+            page,
+            page,
+            (page.0 / 2.0, page.1 / 2.0),
+            false,
+            true,
+        ),
     };
 
     let (fit_w, fit_h) = if rotate {
@@ -213,7 +225,13 @@ pub(crate) fn prepare_image(
     } else {
         (eff_w, eff_h)
     };
-    let scale = (fit.0 / fit_w).min(fit.1 / fit_h);
+    // Cover fills the box and lets the page box clip the overflow; contain
+    // keeps the whole image visible.
+    let scale = if cover {
+        (fit.0 / fit_w).max(fit.1 / fit_h)
+    } else {
+        (fit.0 / fit_w).min(fit.1 / fit_h)
+    };
     let draw_w = fit_w * scale;
     let draw_h = fit_h * scale;
     let x0 = center.0 - draw_w / 2.0;
@@ -587,6 +605,41 @@ pub(crate) fn add_page(
         draws.push((name, prepared.matrix));
     }
     write_content_stream(doc, page_id, &draws)
+}
+
+/// Write one image XObject and hand back its id together with the placement
+/// matrix that was computed for it.
+///
+/// Splitting embed from page creation lets a caller that replaces several pages
+/// with the same photo store the pixels once and draw them on every page.
+pub(crate) fn embed_image(
+    doc: &mut Document,
+    prepared: PreparedImage,
+) -> Result<(ObjectId, [f32; 6]), ToolError> {
+    let PreparedImage {
+        object, matrix, ..
+    } = prepared;
+    Ok((add_xobject(doc, object)?, matrix))
+}
+
+/// Append a page drawing one already-embedded image XObject.
+pub(crate) fn add_drawn_page(
+    doc: &mut Document,
+    pages_id: ObjectId,
+    page: (f32, f32),
+    name: &str,
+    xobject: ObjectId,
+    matrix: [f32; 6],
+) -> Result<ObjectId, ToolError> {
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "MediaBox" => vec![0.into(), 0.into(), page.0.into(), page.1.into()],
+        "Resources" => dictionary! {},
+    });
+    attach_page(doc, pages_id, page_id)?;
+    register_xobject(doc, page_id, name, xobject)?;
+    write_content_stream(doc, page_id, &[(name.to_string(), matrix)])?;
+    Ok(page_id)
 }
 
 /// Write one image XObject.

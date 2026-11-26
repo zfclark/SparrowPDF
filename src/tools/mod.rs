@@ -14,6 +14,7 @@ pub mod image_watermark;
 pub mod merge;
 pub mod pdf_to_image;
 pub mod reorder;
+pub mod replace_pages;
 pub mod rotate;
 pub mod split;
 pub mod text_watermark;
@@ -117,6 +118,18 @@ pub enum ToolOptions {
         opacity: f32,
         position: WatermarkPlacement,
     },
+    /// Replace the content of the listed pages with a PDF page or a photo.
+    ReplacePages {
+        /// Target pages, e.g. `3` or `2-4,7` (1-based).
+        pages: String,
+        /// Source PDF pages. Empty — or a single page — repeats that page for
+        /// every target page; otherwise the count must match `pages`.
+        source_pages: String,
+        /// How the source content is fitted into the page box.
+        fit: ReplaceFit,
+        /// Whether a replaced page keeps the target's paper size.
+        geometry: ReplaceGeometry,
+    },
     Encrypt {
         /// `true` encrypts, `false` removes existing encryption.
         encrypt: bool,
@@ -190,6 +203,12 @@ impl ToolOptions {
                 opacity: 0.4,
                 position: WatermarkPlacement::Center,
             },
+            ToolId::ReplacePages => ToolOptions::ReplacePages {
+                pages: String::new(),
+                source_pages: String::new(),
+                fit: ReplaceFit::Contain,
+                geometry: ReplaceGeometry::KeepTarget,
+            },
             ToolId::Encrypt => ToolOptions::Encrypt {
                 encrypt: true,
                 user_password: String::new(),
@@ -210,6 +229,56 @@ impl ToolOptions {
 pub enum Orientation {
     Portrait,
     Landscape,
+}
+
+/// How replacement content is fitted into the page it lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplaceFit {
+    /// Scale until the whole source fits, leaving margins on the short side.
+    #[default]
+    Contain,
+    /// Scale until the page is covered; the overflow is clipped by the page box.
+    Cover,
+}
+
+impl ReplaceFit {
+    pub const ALL: [ReplaceFit; 2] = [ReplaceFit::Contain, ReplaceFit::Cover];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReplaceFit::Contain => "等比完整显示（留白）",
+            ReplaceFit::Cover => "铺满页面（裁切超出部分）",
+        }
+    }
+
+    /// Whether the kept axis is the tighter one.
+    pub(crate) fn scale(self, fit_scale: f32, cover_scale: f32) -> f32 {
+        match self {
+            ReplaceFit::Contain => fit_scale,
+            ReplaceFit::Cover => cover_scale,
+        }
+    }
+}
+
+/// What a replaced page's paper becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplaceGeometry {
+    /// Keep the target page's displayed size and orientation; the source
+    /// content is fitted inside it (replace the content, not the sheet).
+    #[default]
+    KeepTarget,
+    /// Take the source page's size and rotation (replace the whole page).
+    /// PDF sources only — a photo carries no page size.
+    FollowSource,
+}
+
+impl ReplaceGeometry {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReplaceGeometry::KeepTarget => "保持原页尺寸（推荐）",
+            ReplaceGeometry::FollowSource => "跟随来源页面尺寸",
+        }
+    }
 }
 
 /// Page layout for the folder batch tool.
@@ -665,6 +734,7 @@ pub fn tool_for(id: ToolId) -> Box<dyn Tool> {
         ToolId::Extract => Box::new(extract::Extract),
         ToolId::TextWatermark => Box::new(text_watermark::TextWatermark),
         ToolId::ImageWatermark => Box::new(image_watermark::ImageWatermark),
+        ToolId::ReplacePages => Box::new(replace_pages::ReplacePages),
         ToolId::Encrypt => Box::new(encrypt::Encrypt),
         ToolId::PdfToImage => Box::new(pdf_to_image::PdfToImage),
     }

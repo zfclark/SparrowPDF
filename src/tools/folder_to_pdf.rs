@@ -1374,6 +1374,7 @@ mod tests {
     fn center(sheet: &Sheet) -> (f32, f32) {
         match sheet {
             Sheet::Fixed { center, .. } => *center,
+            Sheet::Cover { page } => (page.0 / 2.0, page.1 / 2.0),
             Sheet::Follow { .. } => panic!("a two-image page always has fixed slots"),
         }
     }

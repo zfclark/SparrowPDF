@@ -92,6 +92,38 @@ pub fn assert_rotations(path: &Path, expected: &[(u32, u32)]) -> Result<(), Tool
     Ok(())
 }
 
+/// Assert the `/MediaBox` of the listed pages.
+///
+/// `expected` holds `(1-based page number, [x0, y0, x1, y1])`. Page replacement
+/// decides each output page's geometry from the target page and the chosen fit,
+/// so a mismatch means the transform and the box drifted apart — the page would
+/// be cropped or padded without the user seeing why.
+pub fn assert_page_boxes(path: &Path, expected: &[(u32, [f32; 4])]) -> Result<(), ToolError> {
+    let doc = reopen(path)?;
+    let pages = doc.get_pages();
+    for (page_num, want) in expected {
+        let Some(page_id) = pages.get(page_num).copied() else {
+            return fail(path, format!("第 {page_num} 页不存在"));
+        };
+        let got = pdf_io::page_media_box(&doc, page_id);
+        let close = |a: f32, b: f32| (a - b).abs() <= 0.6;
+        if !(close(got[0], want[0])
+            && close(got[1], want[1])
+            && close(got[2], want[2])
+            && close(got[3], want[3]))
+        {
+            return fail(
+                path,
+                format!(
+                    "第 {page_num} 页页面尺寸不符：期望 {:?}，实际 {:?}",
+                    want, got
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Assert the document is encrypted (i.e. still carries an `/Encrypt` entry).
 pub fn assert_encrypted(path: &Path) -> Result<(), ToolError> {
     let doc = reopen(path)?;

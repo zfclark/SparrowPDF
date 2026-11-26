@@ -333,6 +333,92 @@ pub fn page_rotation(doc: &Document, page_id: lopdf::ObjectId) -> u32 {
     medpdf::get_page_rotation(doc, page_id)
 }
 
+/// Size of a page as the reader sees it, `/Rotate` applied.
+///
+/// A page stored as 595 x 842 with `/Rotate 90` is displayed 842 x 595, so
+/// every "which way is this page" decision must go through here rather than
+/// through the raw MediaBox.
+pub fn displayed_page_size(doc: &Document, page_id: lopdf::ObjectId) -> (f32, f32) {
+    let [x0, y0, x1, y1] = page_media_box(doc, page_id);
+    let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
+    match page_rotation(doc, page_id) {
+        90 | 270 => (h, w),
+        _ => (w, h),
+    }
+}
+
+/// Copy inheritable page attributes from the page-tree ancestors onto the page
+/// dictionary itself.
+///
+/// PDF lets `/Resources`, `/MediaBox`, `/CropBox` and `/Rotate` live on an
+/// ancestor `/Pages` node. `copy_page_with_cache` (and every other page-copy
+/// helper in `medpdf`) copies the page dictionary verbatim, so such a page
+/// arrives in the target document without its resources (fonts and images gone,
+/// the page renders blank) and without its size. Calling this before a copy
+/// materialises the inherited values as ordinary entries; only keys the page
+/// does not already own are filled in, so nothing is overridden.
+///
+/// The caller passes its *in-memory* document: the copy is never saved back, so
+/// the user's file keeps its compact page tree.
+pub fn inherit_page_attributes(
+    doc: &mut Document,
+    page_id: lopdf::ObjectId,
+) -> Result<(), ToolError> {
+    const KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+
+    let page = doc
+        .get_object(page_id)
+        .and_then(|o| o.as_dict())
+        .map_err(|e| ToolError::Internal {
+            detail: format!("页面对象损坏：{e}"),
+        })?;
+    let missing: Vec<&[u8]> = KEYS.iter().copied().filter(|k| page.get(k).is_err()).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut parent = page
+        .get(b"Parent")
+        .ok()
+        .and_then(|o| o.as_reference().ok());
+
+    // Walk up until every missing key is found or the tree ends.
+    let mut found: Vec<(&[u8], lopdf::Object)> = Vec::with_capacity(missing.len());
+    let mut depth = 0;
+    while let Some(id) = parent {
+        depth += 1;
+        // A cyclic /Parent chain would otherwise loop forever.
+        if depth > 64 {
+            break;
+        }
+        let Some(dict) = doc.get_object(id).ok().and_then(|o| o.as_dict().ok()) else {
+            break;
+        };
+        for key in &missing {
+            if found.iter().any(|(known, _)| known == key) {
+                continue;
+            }
+            if let Ok(value) = dict.get(key) {
+                found.push((*key, value.clone()));
+            }
+        }
+        if found.len() == missing.len() {
+            break;
+        }
+        parent = dict.get(b"Parent").ok().and_then(|o| o.as_reference().ok());
+    }
+
+    let page = doc
+        .get_object_mut(page_id)
+        .and_then(|o| o.as_dict_mut())
+        .map_err(|e| ToolError::Internal {
+            detail: format!("页面对象损坏：{e}"),
+        })?;
+    for (key, value) in found {
+        page.set(key.to_vec(), value);
+    }
+    Ok(())
+}
+
 /// Media box of a page as `[x0, y0, x1, y1]`, defaulting to A4.
 pub fn page_media_box(doc: &Document, page_id: lopdf::ObjectId) -> [f32; 4] {
     medpdf::get_page_media_box(doc, page_id).unwrap_or([0.0, 0.0, 595.0, 842.0])
@@ -463,13 +549,27 @@ pub fn copy_pages(dest: &mut Document, source: &Document, pages: &[u32]) -> Resu
     let mut cache: std::collections::BTreeMap<lopdf::ObjectId, lopdf::ObjectId> =
         std::collections::BTreeMap::new();
     for page in pages {
-        medpdf::copy_page_with_cache(dest, source, *page, &mut cache).map_err(|e| {
-            ToolError::Internal {
-                detail: format!("复制第 {page} 页失败：{e}"),
-            }
-        })?;
+        copy_page(dest, source, *page, &mut cache)?;
     }
     Ok(())
+}
+
+/// Copy one page, reusing a caller-held object cache.
+///
+/// Callers that interleave copies from several documents (page replacement
+/// copies kept pages from one file and imported pages from another) keep one
+/// cache per source so shared fonts and images are still deduplicated.
+pub fn copy_page(
+    dest: &mut Document,
+    source: &Document,
+    page: u32,
+    cache: &mut std::collections::BTreeMap<lopdf::ObjectId, lopdf::ObjectId>,
+) -> Result<lopdf::ObjectId, ToolError> {
+    medpdf::copy_page_with_cache(dest, source, page, cache).map_err(|e| {
+        ToolError::Internal {
+            detail: format!("复制第 {page} 页失败：{e}"),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -546,5 +646,61 @@ mod tests {
         assert!(matches!(err, ToolError::OutputExists { .. }), "{err:?}");
         assert_eq!(fs::read(&target).unwrap(), b"old");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A page that inherits its size and resources from the `/Pages` node must
+    /// carry them itself once materialised: copying the page dictionary alone
+    /// (what every page-copy helper does) would otherwise produce a page with
+    /// no size and no fonts.
+    #[test]
+    fn inherited_page_attributes_are_materialised_on_the_page() {
+        use lopdf::{dictionary, Document, Object};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let content_id = doc.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf 72 720 Td (x) Tj ET".to_vec(),
+        ));
+        // Nothing but /Parent on the page itself.
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Count" => 1i64,
+                "Kids" => vec![page_id.into()],
+                "MediaBox" => vec![0.into(), 0.into(), 300.into(), 400.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            }),
+        );
+
+        inherit_page_attributes(&mut doc, page_id).expect("materialise");
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        assert!(page.get(b"MediaBox").is_ok(), "size is copied down");
+        assert!(page.get(b"Resources").is_ok(), "resources are copied down");
+        // The page's own /Contents must survive untouched.
+        assert!(page.get(b"Contents").is_ok());
+
+        // Idempotent: a second pass must not disturb the page.
+        inherit_page_attributes(&mut doc, page_id).expect("second pass");
+        assert!(
+            doc.get_object(page_id)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Count")
+                .is_err(),
+            "only page keys are touched"
+        );
     }
 }

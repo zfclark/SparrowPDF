@@ -73,6 +73,8 @@ struct Item {
     /// this number, and it differs from the page label whenever two images
     /// share a page, so both must be shown.
     image: Option<usize>,
+    /// Short corner badge (page replacement marks the imported pages).
+    tag: Option<&'static str>,
 }
 
 impl Item {
@@ -81,6 +83,7 @@ impl Item {
             key,
             page,
             image: None,
+            tag: None,
         }
     }
 }
@@ -193,6 +196,7 @@ pub fn show_files(ui: &mut Ui, files: &[PathBuf], state: &mut PreviewState) {
             key: PageKey::Image(path.clone()),
             page: i + 1,
             image: Some(i + 1),
+            tag: None,
         })
         .collect();
     show_sections(
@@ -273,6 +277,7 @@ pub fn show_folders(
                             key: PageKey::Image(path),
                             page,
                             image: Some(index + 1),
+                            tag: None,
                         })
                         .collect(),
                 }
@@ -484,6 +489,134 @@ pub fn show_page_order(
     });
 }
 
+/// Preview of the page-replacement result: the output document's pages in
+/// order, with every replaced page taken from the source file and tagged.
+///
+/// The mapping comes from [`crate::tools::replace_pages::plan`] — the same
+/// planner the run uses — so the strip cannot show a different replacement than
+/// the one that gets written.
+pub fn show_replacement(
+    ui: &mut Ui,
+    target: Option<&Path>,
+    source: Option<&Path>,
+    pages_spec: &str,
+    source_spec: &str,
+    password: Option<&str>,
+    state: &mut PreviewState,
+) {
+    use crate::tools::replace_pages::{self, OutputPage};
+
+    state.frame += 1;
+    theme::card(ui, "替换预览", |ui| {
+        ui.horizontal(|ui| {
+            let toggle = if state.open {
+                "收起预览"
+            } else {
+                "展开预览"
+            };
+            if theme::small_button(ui, toggle).clicked() {
+                state.open = !state.open;
+            }
+            if state.open && theme::small_button(ui, "刷新").clicked() {
+                state.clear();
+            }
+            theme::hint(ui, "标签为输出页码；标记「替换」的页来自来源文件");
+        });
+
+        if !state.open {
+            return;
+        }
+        let Some(target) = target else {
+            theme::hint(ui, "选择目标 PDF 后显示替换结果预览");
+            return;
+        };
+
+        let total = match state.page_total(target, password) {
+            Ok(0) => {
+                theme::hint(ui, "目标文件没有页面");
+                return;
+            }
+            Ok(total) => total,
+            Err(err) => {
+                theme::hint(ui, &format!("无法预览：{err}"));
+                return;
+            }
+        };
+
+        // A photo source is a single page; a PDF source needs its own count.
+        let source_pdf = source.filter(|path| replace_pages::is_pdf(path));
+        let source_total = match source_pdf {
+            Some(path) => match state.page_total(path, password) {
+                Ok(total) => Some(total),
+                Err(err) => {
+                    theme::hint(ui, &format!("无法读取来源 PDF：{err}"));
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        let plan = match replace_pages::plan(total, source_total, pages_spec, source_spec) {
+            Ok(plan) => plan,
+            Err(err) => {
+                // The reason belongs next to the page fields the user edits.
+                theme::hint(ui, &format!("预览未更新：{err}"));
+                return;
+            }
+        };
+
+        let mut items: Vec<Item> = Vec::with_capacity(total as usize);
+        for (index, slot) in replace_pages::output_pages(total, &plan).iter().enumerate() {
+            let page = index + 1;
+            let item = match slot {
+                OutputPage::Kept(source_page) => {
+                    Item::page(PageKey::PdfPage(target.to_path_buf(), *source_page), page)
+                }
+                OutputPage::FromPdf(source_page) => {
+                    let Some(path) = source_pdf else {
+                        continue;
+                    };
+                    Item {
+                        key: PageKey::PdfPage(path.to_path_buf(), *source_page),
+                        page,
+                        image: None,
+                        tag: Some("替换"),
+                    }
+                }
+                OutputPage::FromImage => {
+                    let Some(path) = source else {
+                        continue;
+                    };
+                    Item {
+                        key: PageKey::Image(path.to_path_buf()),
+                        page,
+                        image: None,
+                        tag: Some("替换"),
+                    }
+                }
+            };
+            items.push(item);
+        }
+
+        for item in &items {
+            if let PageKey::PdfPage(path, page) = &item.key {
+                queue_missing_pages(state, path, &[*page]);
+            }
+        }
+        decode_pending_images(ui.ctx(), state);
+        draw_section(
+            ui,
+            &Section {
+                title: String::new(),
+                note: None,
+                items,
+            },
+            state,
+        );
+        render_pending_pdf_pages(ui.ctx().clone(), state);
+    });
+}
+
 /// Queue PDF pages that have neither a texture nor a pending slot yet.
 fn queue_missing_pages(state: &mut PreviewState, path: &Path, pages: &[u32]) {
     for page in pages {
@@ -547,30 +680,37 @@ fn show_sections(ui: &mut Ui, sections: Vec<Section>, state: &mut PreviewState) 
                 }
             }
         }
-        let ctx = ui.ctx().clone();
-        let mut budget = IMAGE_BUDGET;
-        let mut still_pending = Vec::new();
-        for key in state.pending.drain(..) {
-            if state.textures.contains_key(&key) {
-                continue;
-            }
-            if budget > 0 {
-                let thumb = match &key {
-                    PageKey::Image(path) => decode_thumb(&ctx, path),
-                    PageKey::PdfPage(..) => Thumb::Failed,
-                };
-                state.textures.insert(key, thumb);
-                budget -= 1;
-            } else {
-                still_pending.push(key);
-            }
-        }
-        state.pending = still_pending;
+        decode_pending_images(ui.ctx(), state);
 
         for section in &sections {
             draw_section(ui, section, state);
         }
     });
+}
+
+/// Decode up to [`IMAGE_BUDGET`] queued image thumbnails this frame.
+///
+/// Shared by the image strips and the replacement preview so a large photo set
+/// fills in at the same pace in both.
+fn decode_pending_images(ctx: &egui::Context, state: &mut PreviewState) {
+    let mut budget = IMAGE_BUDGET;
+    let mut still_pending = Vec::new();
+    for key in state.pending.drain(..) {
+        if state.textures.contains_key(&key) {
+            continue;
+        }
+        if budget > 0 {
+            let thumb = match &key {
+                PageKey::Image(path) => decode_thumb(ctx, path),
+                PageKey::PdfPage(..) => Thumb::Failed,
+            };
+            state.textures.insert(key, thumb);
+            budget -= 1;
+        } else {
+            still_pending.push(key);
+        }
+    }
+    state.pending = still_pending;
 }
 
 fn draw_section(ui: &mut Ui, section: &Section, state: &PreviewState) {
@@ -645,6 +785,20 @@ fn draw_thumbnail(ui: &mut Ui, item: &Item, state: &PreviewState) {
         egui::FontId::new(11.5, egui::FontFamily::Proportional),
         ui.visuals().text_color(),
     );
+
+    // Corner badge: page replacement marks the pages that come from the source
+    // file, so "what replaced what" reads at a glance.
+    if let Some(tag) = item.tag {
+        let galley = painter.layout_no_wrap(
+            tag.to_string(),
+            egui::FontId::new(10.0, egui::FontFamily::Proportional),
+            Color32::WHITE,
+        );
+        let origin = rect.left_top() + egui::vec2(4.0, 4.0);
+        let badge = egui::Rect::from_min_size(origin, galley.size() + egui::vec2(6.0, 2.0));
+        painter.rect_filled(badge, 3.0, theme::accent(ui));
+        painter.galley(badge.min + egui::vec2(3.0, 1.0), galley, Color32::WHITE);
+    }
 
     // Image number and page number are two different things as soon as two
     // images share a page; the merge spec refers to the *image* number, so the
