@@ -31,38 +31,44 @@ impl ToolId {
     /// Tools of one group are contiguous: the sidebar walks `ALL` and filters
     /// by group, so a stray member at the end would be listed under the first
     /// group but after every other group's rows.
+    ///
+    /// Order inside a group runs from the everyday task to the rare one; the
+    /// groups themselves run from "get a PDF at all" to "adjust a file you
+    /// already have".
     pub const ALL: [ToolId; 14] = [
         ToolId::ImageToPdf,
         ToolId::FolderToPdf,
         ToolId::PdfToImage,
-        ToolId::Compress,
         ToolId::Merge,
         ToolId::Split,
-        ToolId::Rotate,
+        ToolId::Extract,
         ToolId::DeletePages,
         ToolId::Reorder,
-        ToolId::Extract,
+        ToolId::Rotate,
+        ToolId::ReplacePages,
         ToolId::TextWatermark,
         ToolId::ImageWatermark,
-        ToolId::ReplacePages,
+        ToolId::Compress,
         ToolId::Encrypt,
     ];
 
     pub fn group(self) -> ToolGroup {
         match self {
-            ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage | ToolId::Compress => {
-                ToolGroup::Generate
-            }
+            // 换格式：图片进来、PDF 出去，或反过来。
+            ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage => ToolGroup::Convert,
+            // 改页面的组成与顺序。
             ToolId::Merge
             | ToolId::Split
-            | ToolId::Rotate
+            | ToolId::Extract
             | ToolId::DeletePages
-            | ToolId::Reorder
-            | ToolId::Extract => ToolGroup::Structure,
-            ToolId::TextWatermark | ToolId::ImageWatermark | ToolId::ReplacePages => {
-                ToolGroup::PageEdit
-            }
-            ToolId::Encrypt => ToolGroup::Security,
+            | ToolId::Reorder => ToolGroup::Structure,
+            // 改单页的外观与内容。
+            ToolId::Rotate
+            | ToolId::ReplacePages
+            | ToolId::TextWatermark
+            | ToolId::ImageWatermark => ToolGroup::PageEdit,
+            // 整份文件的体积与权限，页面内容一个字不动。
+            ToolId::Compress | ToolId::Encrypt => ToolGroup::File,
         }
     }
 
@@ -143,28 +149,30 @@ impl fmt::Display for ToolId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolGroup {
-    /// Named 转换 rather than 生成: it holds the two image → PDF tools and
-    /// PDF → image, which are all conversions.
-    Generate,
+    /// 换的是文件格式：图片 → PDF、PDF → 图片。
+    Convert,
+    /// 改的是页面的组成与顺序：合并、拆分、提取、删除、重排。
     Structure,
+    /// 改的是单页的外观与内容：旋转、替换、水印。
     PageEdit,
-    Security,
+    /// 整份文件的体积与权限：压缩、加密解密；页面内容不动。
+    File,
 }
 
 impl ToolGroup {
     pub const ALL: [ToolGroup; 4] = [
-        ToolGroup::Generate,
+        ToolGroup::Convert,
         ToolGroup::Structure,
         ToolGroup::PageEdit,
-        ToolGroup::Security,
+        ToolGroup::File,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            ToolGroup::Generate => "转换",
-            ToolGroup::Structure => "结构操作",
+            ToolGroup::Convert => "格式转换",
+            ToolGroup::Structure => "文档结构",
             ToolGroup::PageEdit => "页面编辑",
-            ToolGroup::Security => "安全",
+            ToolGroup::File => "文件处理",
         }
     }
 

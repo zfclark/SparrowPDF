@@ -828,36 +828,112 @@ fn folder_batch_two_per_page_merges_specified_pairs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Image paths that only carry names: `preview_page_numbers` reads file names,
+/// never file contents, so these need no fixture on disk.
+fn named_images(names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| PathBuf::from(format!("{name}.jpg")))
+        .collect()
+}
+
 #[test]
 fn preview_page_numbers_renumber_by_output_page() {
     use sparrowpdf::tools::folder_to_pdf::preview_page_numbers;
+    let five = named_images(&["1", "2", "3", "4", "5"]);
     // Spec "2-3" with 5 images: pages [1], [2+3], [4], [5] — inline order,
     // continuous page numbers, merged images share one label.
     assert_eq!(
-        preview_page_numbers(5, true, true, "2-3", true),
+        preview_page_numbers(&five, true, true, "2-3", true),
         vec![1, 2, 2, 3, 4]
     );
-    // Advisory spec (a preset's own): images beyond the folder are skipped, so
-    // a two-image folder previews as two pages — exactly what the run writes.
+    // Advisory spec (a preset's own): numbers the folder does not contain are
+    // skipped, so a two-image folder previews as two pages — exactly what the
+    // run writes.
     assert_eq!(
-        preview_page_numbers(2, true, true, "2-3", false),
+        preview_page_numbers(&five[..2], true, true, "2-3", false),
         vec![1, 2]
     );
     // Unchecked: sequential pairs over everything.
     assert_eq!(
-        preview_page_numbers(5, true, false, "9-9", true),
+        preview_page_numbers(&five, true, false, "9-9", true),
         vec![1, 1, 2, 2, 3]
     );
     // Single mode: every image its own page, spec ignored.
     assert_eq!(
-        preview_page_numbers(3, false, true, "1-2", true),
+        preview_page_numbers(&named_images(&["1", "2", "3"]), false, true, "1-2", true),
         vec![1, 2, 3]
     );
     // Invalid spec: the preview falls back to sequential pairing.
     assert_eq!(
-        preview_page_numbers(4, true, true, "9", true),
+        preview_page_numbers(&named_images(&["1", "2", "3", "4"]), true, true, "9", true),
         vec![1, 1, 2, 2]
     );
+}
+
+#[test]
+fn merge_spec_follows_the_images_own_numbers() {
+    use sparrowpdf::tools::folder_to_pdf::{
+        image_numbers, merge_spec_gaps, preview_page_numbers,
+    };
+
+    // 扫描件缺第 3 张（文件名为 1、2、4、5）：模板的 2-3 不能借用第 3 个位置，
+    // 否则第 2 张会和第 4 张挤在一页、整份文档少一页。
+    let gapped = named_images(&["form-1", "form-2", "form-4", "form-5"]);
+    assert_eq!(image_numbers(&gapped), vec![1, 2, 4, 5]);
+    assert_eq!(
+        preview_page_numbers(&gapped, true, true, "2-3", false),
+        vec![1, 2, 3, 4],
+        "编号 3 不存在，四张各占一页"
+    );
+    assert_eq!(merge_spec_gaps(&gapped, "2-3"), vec![3]);
+    // 严格语义（用户手填）不能静默换成别的图片：越界即报错，预览退回顺序配对。
+    assert_eq!(
+        preview_page_numbers(&gapped, true, true, "2-3", true),
+        vec![1, 1, 2, 2]
+    );
+
+    // 编号连续但起点不是 1（接着上一批扫的 11–20）：按偏移匹配，行为不变。
+    let shifted = named_images(&["scan-11", "scan-12", "scan-13", "scan-14"]);
+    assert_eq!(image_numbers(&shifted), vec![11, 12, 13, 14]);
+    assert_eq!(
+        preview_page_numbers(&shifted, true, true, "2-3", false),
+        vec![1, 2, 2, 3]
+    );
+    assert!(merge_spec_gaps(&shifted, "2-3").is_empty());
+
+    // 文件名没有末尾序号：退回顺序号。
+    let plain = named_images(&["cover", "back"]);
+    assert_eq!(image_numbers(&plain), vec![1, 2]);
+    assert_eq!(
+        preview_page_numbers(&plain, true, true, "1-2", false),
+        vec![1, 1]
+    );
+}
+
+#[test]
+fn youth_league_preset_keeps_a_gapped_folder_on_single_pages() {
+    let dir = scratch("folder-gap-preset");
+    let album = dir.join("gapped");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["form-1.jpg", "form-2.jpg", "form-4.jpg", "form-5.jpg"] {
+        make_image(&album, name, 60, 90);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    let template = batch_template_by_key("youth-league-form").expect("preset exists");
+    req.options.apply_batch_template(template);
+    let outcome = run(ToolId::FolderToPdf, &req).expect("gapped folder converts");
+
+    assert_eq!(outcome.outputs.len(), 1);
+    let count = pdf_io::page_count_of(&outcome.outputs[0], None).unwrap();
+    assert_eq!(
+        count, 4,
+        "编号 3 缺失时 2-3 不合并：四张图四页，不能少一页"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2945,22 +3021,39 @@ fn renderer_honours_short_cubic_operators() {
 }
 
 /// The sidebar is generated from the registry, so the grouping contract lives
-/// in `model.rs`: four groups, "转换" first, PDF 转图片 inside it, and every
-/// group's tools contiguous in `ToolId::ALL` (otherwise a member is listed
-/// under the wrong caption).
+/// in `model.rs`: four groups, one caption per task stage, and every group's
+/// tools contiguous in `ToolId::ALL` (otherwise a member is listed under the
+/// wrong caption).
 #[test]
-fn sidebar_groups_merge_pdf_to_image_into_convert() {
+fn sidebar_groups_follow_task_stage() {
     use sparrowpdf::model::ToolGroup;
 
     let labels: Vec<&str> = ToolGroup::ALL.iter().map(|group| group.label()).collect();
-    assert_eq!(labels, vec!["转换", "结构操作", "页面编辑", "安全"]);
+    assert_eq!(labels, vec!["格式转换", "文档结构", "页面编辑", "文件处理"]);
 
-    let convert = ToolGroup::Generate.tools();
-    assert_eq!(convert.len(), 4, "图片合并、批量转换、PDF 转图片、PDF 压缩");
+    // 格式转换只留真正换格式的三项：压缩是「整份文件」的事，不属于转换。
+    let convert = ToolGroup::Convert.tools();
+    assert_eq!(convert.len(), 3, "图片合并、批量转换、PDF 转图片");
     assert!(convert.contains(&ToolId::PdfToImage));
     assert!(convert.contains(&ToolId::ImageToPdf));
     assert!(convert.contains(&ToolId::FolderToPdf));
-    assert!(convert.contains(&ToolId::Compress));
+    assert!(!convert.contains(&ToolId::Compress));
+
+    // 旋转改的是页面本身，归页面编辑；合并与拆分是文档结构。
+    assert!(ToolGroup::PageEdit.tools().contains(&ToolId::Rotate));
+    assert!(ToolGroup::Structure.tools().contains(&ToolId::Merge));
+    assert!(ToolGroup::File.tools().contains(&ToolId::Compress));
+    assert!(ToolGroup::File.tools().contains(&ToolId::Encrypt));
+
+    // 每组的行数落在 2–5 之间：不再出现六行大组，也不留只有一个工具的分组。
+    for group in ToolGroup::ALL {
+        let rows = group.tools().len();
+        assert!(
+            (2..=5).contains(&rows),
+            "{:?} 有 {rows} 项，分组失衡",
+            group
+        );
+    }
 
     let total: usize = ToolGroup::ALL
         .iter()
@@ -4707,6 +4800,12 @@ fn compress_shrinks_a_jpeg_pdf_and_keeps_page_order() {
     assert!(
         outcome.summary.contains("已压缩"),
         "summary must report the size comparison: {}",
+        outcome.summary
+    );
+    // 页数必须在摘要里给出：只报图片张数时，一页多图的文档会被读成页数不对。
+    assert!(
+        outcome.summary.contains("2 页"),
+        "summary must state the page count: {}",
         outcome.summary
     );
     let compressed_len = std::fs::metadata(&out).unwrap().len();
