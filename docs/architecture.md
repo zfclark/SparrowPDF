@@ -20,7 +20,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    ├── tools/     业务层：把一次请求变成产物
    │    ├── mod.rs        Tool trait、ToolOptions、Progress、CancelFlag、tool_for
    │    ├── image_embed.rs 图片页嵌入与排版（被图片类工具共享）
-   │    └── <tool>.rs     12 个工具实现
+   │    └── <tool>.rs     14 个工具实现
    │
    ├── engine/    基础设施层：不含业务语义
    │    ├── pdf_io.rs   打开/保存/原子写/可写性探测/错误文案
