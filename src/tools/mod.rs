@@ -260,11 +260,16 @@ impl ReplaceFit {
         }
     }
 
-    /// Whether the kept axis is the tighter one.
-    pub(crate) fn scale(self, fit_scale: f32, cover_scale: f32) -> f32 {
+    /// Scale that fits or covers the target, from the two axis ratios.
+    ///
+    /// Contain must keep the whole source visible, so it takes the smaller
+    /// ratio; Cover has to reach both edges, so it takes the larger one. Picking
+    /// a fixed axis instead would crop a "fit" page and letterbox a "fill" one
+    /// whenever the source is wider (or taller) than the target.
+    pub(crate) fn scale(self, width_ratio: f32, height_ratio: f32) -> f32 {
         match self {
-            ReplaceFit::Contain => fit_scale,
-            ReplaceFit::Cover => cover_scale,
+            ReplaceFit::Contain => width_ratio.min(height_ratio),
+            ReplaceFit::Cover => width_ratio.max(height_ratio),
         }
     }
 }

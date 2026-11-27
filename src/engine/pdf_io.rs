@@ -463,6 +463,53 @@ pub fn resolve_output(path: &Path, policy: ConflictPolicy) -> Result<PathBuf, To
     Ok(resolved.remove(0))
 }
 
+/// Refuse an output path that is one of this run's inputs.
+///
+/// Tools name their result `<原名>_replaced.pdf` / `_compressed.pdf` next to
+/// the source, and the panel lets the user pick any path — including the input
+/// itself. With `Overwrite` (or a session-wide overwrite policy) that would
+/// replace the original bytes with the derived file, silently destroying the
+/// only copy of the source. Called after [`resolve_output`] so a `Unique`
+/// rename is already accounted for.
+pub fn ensure_output_is_not_input(out: &Path, inputs: &[&Path]) -> Result<(), ToolError> {
+    let clash = inputs.iter().find(|input| same_file(out, input));
+    if let Some(input) = clash {
+        return Err(ToolError::WriteFailed {
+            path: out.to_path_buf(),
+            detail: format!(
+                "输出路径与输入文件相同（{}），继续会覆盖原件；请另选输出位置或文件名",
+                input.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Whether two paths name the same file.
+///
+/// The output usually does not exist yet, so both sides fall back to
+/// "canonical parent + file name"; Windows and macOS fold the name's case,
+/// because that is how their filesystems compare it.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(x), Ok(y)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        return x == y;
+    }
+    let key = |path: &Path| -> Option<String> {
+        let parent = fs::canonicalize(path.parent().unwrap_or_else(|| Path::new("."))).ok()?;
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let joined = parent.join(name).to_string_lossy().into_owned();
+        Some(if cfg!(any(windows, target_os = "macos")) {
+            joined.to_lowercase()
+        } else {
+            joined
+        })
+    };
+    match (key(a), key(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// First free `<stem>-N.<ext>` next to `path`.
 ///
 /// Running out of serials is an error, not a fallback: returning the original

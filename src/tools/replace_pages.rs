@@ -261,6 +261,10 @@ impl Tool for ReplacePages {
 
         // Plan the single output path before any rendering (AGENTS 3.2).
         let out = pdf_io::resolve_output(&req.output, req.conflict)?;
+        // …and never let it land on one of the inputs: the default output sits
+        // right next to the source, and picking the source itself under
+        // 「覆盖」 would erase the only copy of it.
+        pdf_io::ensure_output_is_not_input(&out, &[target_path, &source_path])?;
 
         let mut target_doc = pdf_io::open_for_edit(target_path, req.password.as_deref())?;
         let total = pdf_io::page_count(&target_doc);
@@ -339,7 +343,7 @@ impl Tool for ReplacePages {
                     // that no longer exists on this page.
                     drop_annotations(&mut out_doc, new_id)?;
                     if geometry == ReplaceGeometry::KeepTarget {
-                        let box4 = pdf_io::page_media_box(&out_doc, new_id);
+                        let box4 = visible_box(&out_doc, new_id);
                         let rotation = pdf_io::page_rotation(&out_doc, new_id);
                         let prefix = content_prefix(box4, rotation, target_size, fit)?;
                         set_page_box(&mut out_doc, new_id, target_size)?;
@@ -419,6 +423,56 @@ fn image_sheet(page: (f32, f32), fit: ReplaceFit) -> Sheet {
     }
 }
 
+/// Visible area of a page: `/CropBox` when it has one, else `/MediaBox`.
+///
+/// Fitting the full MediaBox would bring back the edges the source page
+/// deliberately cropped away, because the output's own `/CropBox` is reset to
+/// the whole sheet by [`set_page_box`].
+fn visible_box(doc: &Document, page_id: ObjectId) -> [f32; 4] {
+    let media = pdf_io::page_media_box(doc, page_id);
+    doc.get_object(page_id)
+        .ok()
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|dict| dict.get(b"CropBox").ok())
+        .and_then(|object| box_array(doc, object))
+        .map(normalize_box)
+        .unwrap_or_else(|| normalize_box(media))
+}
+
+/// `[x0 y0 x1 y1]` of a page-box value, following one indirection.
+fn box_array(doc: &Document, object: &Object) -> Option<[f32; 4]> {
+    let resolved = match object {
+        Object::Reference(id) => doc.get_object(*id).ok()?,
+        other => other,
+    };
+    let items = resolved.as_array().ok()?;
+    if items.len() != 4 {
+        return None;
+    }
+    let mut corners = [0f32; 4];
+    for (slot, item) in corners.iter_mut().zip(items) {
+        *slot = item
+            .as_float()
+            .ok()
+            .or_else(|| item.as_i64().ok().map(|value| value as f32))?;
+    }
+    Some(corners)
+}
+
+/// Both axes sorted low → high.
+///
+/// PDF lets a box be written as either pair of opposite corners; `[600 800 0 0]`
+/// has the same size but would be read as "corner at (600, 800)" and push the
+/// content off the sheet.
+fn normalize_box(box4: [f32; 4]) -> [f32; 4] {
+    [
+        box4[0].min(box4[2]),
+        box4[1].min(box4[3]),
+        box4[0].max(box4[2]),
+        box4[1].max(box4[3]),
+    ]
+}
+
 /// Transform that maps a page's stored user space into its displayed space.
 ///
 /// PDF matrices are `[a b c d e f]` with `x' = ax + cy + e`, `y' = bx + dy + f`.
@@ -446,6 +500,7 @@ fn content_prefix(
     target: (f32, f32),
     fit: ReplaceFit,
 ) -> Result<String, ToolError> {
+    let box4 = normalize_box(box4);
     let (stored_w, stored_h) = ((box4[2] - box4[0]).abs(), (box4[3] - box4[1]).abs());
     let (display_w, display_h) = match rotation {
         90 | 270 => (stored_h, stored_w),
@@ -518,7 +573,14 @@ fn wrap_content(doc: &mut Document, page_id: ObjectId, prefix: String) -> Result
 
     let mut streams: Vec<Object> = Vec::new();
     match existing {
-        Ok(Object::Reference(id)) => streams.push(Object::Reference(id)),
+        // `/Contents` may point at a *stream* or at an array of streams.
+        // Pushing the array reference into the new array would nest an array
+        // where a stream belongs — page count and boxes still validate, but
+        // readers skip the page's only content.
+        Ok(Object::Reference(id)) => match doc.get_object(id) {
+            Ok(Object::Array(items)) => streams.extend(items.iter().cloned()),
+            _ => streams.push(Object::Reference(id)),
+        },
         Ok(Object::Array(items)) => streams.extend(items),
         Ok(other) => {
             return Err(ToolError::Internal {
@@ -572,6 +634,46 @@ mod tests {
         assert_eq!(format_ranges(&[2, 3, 4, 7]), "2-4,7");
         assert_eq!(format_ranges(&[1, 2, 5, 6, 9]), "1-2,5-6,9");
         assert_eq!(format_ranges(&[]), "");
+    }
+
+    /// 600×800 的来源放进 600×400 的页：宽度比例 1、高度比例 0.5。
+    ///
+    /// 「等比完整显示」必须留白（取较小的 0.5），「铺满页面」必须撑满（取较大
+    /// 的 1）；按固定轴取比例会把留白版裁掉、把铺满版留白。
+    #[test]
+    fn fit_takes_the_smaller_ratio_to_contain_and_the_larger_to_cover() {
+        let contain = content_prefix(
+            [0.0, 0.0, 600.0, 800.0],
+            0,
+            (600.0, 400.0),
+            ReplaceFit::Contain,
+        )
+        .expect("contain prefix");
+        assert_eq!(contain, "q\n1 0 0 1 0 0 cm\n0.5 0 0 0.5 150 0 cm\n");
+        let cover =
+            content_prefix([0.0, 0.0, 600.0, 800.0], 0, (600.0, 400.0), ReplaceFit::Cover)
+                .expect("cover prefix");
+        assert_eq!(cover, "q\n1 0 0 1 0 0 cm\n1 0 0 1 0 -200 cm\n");
+    }
+
+    /// 角点可以按任一对对角写；`[600 800 0 0]` 与 `[0 0 600 800]` 是同一张纸。
+    #[test]
+    fn box_corners_are_normalized_before_the_transform() {
+        let straight = content_prefix(
+            [0.0, 0.0, 600.0, 800.0],
+            0,
+            (600.0, 800.0),
+            ReplaceFit::Contain,
+        )
+        .expect("straight box");
+        let reversed = content_prefix(
+            [600.0, 800.0, 0.0, 0.0],
+            0,
+            (600.0, 800.0),
+            ReplaceFit::Contain,
+        )
+        .expect("reversed box");
+        assert_eq!(straight, reversed, "角点顺序不应改变变换");
     }
 
     #[test]

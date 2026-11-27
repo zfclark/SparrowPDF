@@ -4458,6 +4458,107 @@ fn replace_pages_rejects_bad_requests() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tool must never write its result over one of its own inputs: with
+/// 「覆盖」 that would replace the original bytes and lose the only copy.
+#[test]
+fn replace_pages_refuses_to_write_over_its_input() {
+    let dir = scratch("replace-input-as-output");
+    let target = make_pdf(&dir, "target.pdf", 2, 0);
+    let source = make_pdf(&dir, "source.pdf", 1, 0);
+
+    // 输出刻意指向目标文件本身，冲突策略设为覆盖（用户真会这样选）。
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source],
+        target.clone(),
+    );
+    req.options = replace_options("1", "1");
+    req.conflict = ConflictPolicy::Overwrite;
+    let err = run(ToolId::ReplacePages, &req).expect_err("输出不得覆盖输入");
+    match err {
+        ToolError::WriteFailed { path, detail } => {
+            assert_eq!(path, target, "报错要指出被覆盖的那个输入");
+            assert!(detail.contains("输入文件相同"), "{detail}");
+        }
+        other => panic!("应为 WriteFailed，实际 {other:?}"),
+    }
+    assert_eq!(
+        pdf_io::page_count_of(&target, None).unwrap(),
+        2,
+        "原件必须完好"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/Contents` may point at an *array object*; copying that reference into the
+/// new contents array would nest an array where a stream belongs, and readers
+/// then skip the page's only content.
+#[test]
+fn replace_pages_flattens_an_indirect_contents_array() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("replace-contents-array");
+    let target = make_pdf(&dir, "target.pdf", 2, 0);
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let red = doc.add_object(Stream::new(
+        Default::default(),
+        b"1 0 0 rg 0 0 300 300 re f".to_vec(),
+    ));
+    let green = doc.add_object(Stream::new(
+        Default::default(),
+        b"0 1 0 rg 300 0 300 300 re f".to_vec(),
+    ));
+    // 间接数组：页面只引用这个数组对象，流在数组里。
+    let contents_array = doc.add_object(Object::Array(vec![red.into(), green.into()]));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 600.into(), 600.into()],
+        "Contents" => Object::Reference(contents_array),
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => vec![page_id.into()],
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    doc.max_id = doc.objects.len() as u32;
+    let source = dir.join("source.pdf");
+    doc.save(&source).expect("save source");
+
+    let out = dir.join("out.pdf");
+    let mut req = request(ToolId::ReplacePages, vec![target, source], out.clone());
+    req.options = replace_options("1", "1");
+    run(ToolId::ReplacePages, &req).expect("替换成功");
+
+    let doc = pdf_io::open_document(&out, None).unwrap();
+    let page_id = *doc.get_pages().values().next().unwrap();
+    let contents = doc
+        .get_object(page_id)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Contents")
+        .unwrap()
+        .as_array()
+        .expect("输出的 /Contents 必须是数组");
+    for item in contents {
+        let id = item.as_reference().expect("数组项必须是流引用，不能是数组");
+        assert!(
+            doc.get_object(id).unwrap().as_stream().is_ok(),
+            "数组项必须是流"
+        );
+    }
+    assert_eq!(contents.len(), 4, "前缀 + 两个来源流 + 后缀：{contents:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One source page is reused for every target page, and the mapping is what the
 /// preview shows.
 #[test]
