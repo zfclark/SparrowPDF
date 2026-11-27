@@ -8,6 +8,7 @@
 //! The sticky chrome (result area, action bar) is owned by the shell, not by
 //! panels; each panel reports through [`PanelView`] whether it can run.
 
+pub mod compress;
 pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
@@ -17,6 +18,7 @@ pub mod image_watermark;
 pub mod merge;
 pub mod pdf_to_image;
 pub mod reorder;
+pub mod replace_pages;
 pub mod rotate;
 pub mod split;
 pub mod text_watermark;
@@ -139,6 +141,20 @@ pub fn panel_view(tool: ToolId, form: &FormState, reorder: &ReorderState) -> Pan
         ToolId::ImageWatermark => {
             PanelView::new(form.inputs.len() >= 2, "需要 1 个 PDF 和 1 张图片。")
         }
+        ToolId::ReplacePages => {
+            // The page range is part of "ready": a filled slot count alone
+            // cannot be replaced, so the button must not invite a run that can
+            // only fail on an empty range.
+            let has_pages = matches!(
+                form.options_for(tool),
+                ToolOptions::ReplacePages { pages, .. } if !pages.trim().is_empty()
+            );
+            PanelView::new(
+                form.inputs.len() >= 2 && has_pages,
+                "需要 1 个目标 PDF、1 个来源，并填写要替换的页码。",
+            )
+        }
+        ToolId::Compress => PanelView::new(has_input, "请先选择一个 PDF 文件。"),
         _ => PanelView::new(has_input, "请先选择一个 PDF 文件。"),
     }
 }
@@ -190,6 +206,17 @@ pub fn append_inputs(tool: ToolId, form: &mut FormState, paths: Vec<PathBuf>) {
         // confusing "需要 PDF 文件" error instead of just working.
         form.inputs.sort_by_key(|f| !is_pdf(&f.path));
     }
+    if tool == ToolId::ReplacePages {
+        // Slot 1 is the target PDF. Dropping only a photo first, then the PDF,
+        // would otherwise leave the photo in the target slot; with exactly one
+        // PDF in the list the roles are unambiguous, so put it first. Two PDFs
+        // keep their order (the panel offers a swap button).
+        if form.inputs.len() > 1 && !is_pdf(&form.inputs[0].path) {
+            if let Some(index) = form.inputs.iter().position(|f| is_pdf(&f.path)) {
+                form.inputs.swap(0, index);
+            }
+        }
+    }
 }
 
 fn is_pdf(path: &std::path::Path) -> bool {
@@ -204,6 +231,7 @@ fn pick_files(tool: ToolId) -> Option<Vec<PathBuf>> {
     let filter_name = match tool {
         ToolId::ImageToPdf => "图片",
         ToolId::ImageWatermark => "PDF 与图片",
+        ToolId::ReplacePages => "PDF 与图片",
         _ => "PDF",
     };
 

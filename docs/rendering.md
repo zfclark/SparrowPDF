@@ -83,6 +83,11 @@
 - CCITT 的 `/BlackIs1` 描述采样打包方式，不影响画面；适配器一律输出「0 = 深色」的亮度栅格。
 - 解码失败只跳过该图像，不得按原样当像素画（会得到噪点），也不得 panic。
 - `Indexed` 的样本是调色板下标，不能套用「低位数缩放到 255」的路径，否则图标会变成随机色块。
+- **Adobe YCCK JPEG**（APP14 transform 2，Photoshop / InDesign / Distiller 导出的 CMYK
+  扫描件）：通用解码器会把它折算成「油墨图」（白纸解码成黑底白字）。这类文件走
+  `decode_adobe_ycck` 专用路径：以原始分量解码（zune-jpeg，输出色域 YCCK）后按
+  libjpeg-turbo + Adobe 反相链路合成——YCC 解码出的通道乘 `(255 − K) / 255`。
+  transform 0（反相存储的 CMYK）由通用路径正确处理，不需要修正。
 
 ## 6. 矩阵与表单
 

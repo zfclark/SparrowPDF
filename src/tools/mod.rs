@@ -4,6 +4,7 @@
 //! `model`; it never touches `lopdf`, `medpdf`, `medpdf_image`, `image` or
 //! `kamadak_exif` directly.
 
+pub mod compress;
 pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
@@ -14,6 +15,7 @@ pub mod image_watermark;
 pub mod merge;
 pub mod pdf_to_image;
 pub mod reorder;
+pub mod replace_pages;
 pub mod rotate;
 pub mod split;
 pub mod text_watermark;
@@ -117,6 +119,18 @@ pub enum ToolOptions {
         opacity: f32,
         position: WatermarkPlacement,
     },
+    /// Replace the content of the listed pages with a PDF page or a photo.
+    ReplacePages {
+        /// Target pages, e.g. `3` or `2-4,7` (1-based).
+        pages: String,
+        /// Source PDF pages. Empty — or a single page — repeats that page for
+        /// every target page; otherwise the count must match `pages`.
+        source_pages: String,
+        /// How the source content is fitted into the page box.
+        fit: ReplaceFit,
+        /// Whether a replaced page keeps the target's paper size.
+        geometry: ReplaceGeometry,
+    },
     Encrypt {
         /// `true` encrypts, `false` removes existing encryption.
         encrypt: bool,
@@ -125,6 +139,11 @@ pub enum ToolOptions {
         allow_print: bool,
         allow_copy: bool,
         allow_modify: bool,
+    },
+    /// Re-encode the document's images to a strength-selected quality/DPI
+    /// budget and drop objects nothing references.
+    Compress {
+        level: CompressLevel,
     },
     PdfToImage {
         dpi: u32,
@@ -190,6 +209,12 @@ impl ToolOptions {
                 opacity: 0.4,
                 position: WatermarkPlacement::Center,
             },
+            ToolId::ReplacePages => ToolOptions::ReplacePages {
+                pages: String::new(),
+                source_pages: String::new(),
+                fit: ReplaceFit::Contain,
+                geometry: ReplaceGeometry::KeepTarget,
+            },
             ToolId::Encrypt => ToolOptions::Encrypt {
                 encrypt: true,
                 user_password: String::new(),
@@ -197,6 +222,9 @@ impl ToolOptions {
                 allow_print: true,
                 allow_copy: true,
                 allow_modify: true,
+            },
+            ToolId::Compress => ToolOptions::Compress {
+                level: CompressLevel::Standard,
             },
             ToolId::PdfToImage => ToolOptions::PdfToImage {
                 dpi: 300,
@@ -210,6 +238,60 @@ impl ToolOptions {
 pub enum Orientation {
     Portrait,
     Landscape,
+}
+
+/// How replacement content is fitted into the page it lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplaceFit {
+    /// Scale until the whole source fits, leaving margins on the short side.
+    #[default]
+    Contain,
+    /// Scale until the page is covered; the overflow is clipped by the page box.
+    Cover,
+}
+
+impl ReplaceFit {
+    pub const ALL: [ReplaceFit; 2] = [ReplaceFit::Contain, ReplaceFit::Cover];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReplaceFit::Contain => "等比完整显示（留白）",
+            ReplaceFit::Cover => "铺满页面（裁切超出部分）",
+        }
+    }
+
+    /// Scale that fits or covers the target, from the two axis ratios.
+    ///
+    /// Contain must keep the whole source visible, so it takes the smaller
+    /// ratio; Cover has to reach both edges, so it takes the larger one. Picking
+    /// a fixed axis instead would crop a "fit" page and letterbox a "fill" one
+    /// whenever the source is wider (or taller) than the target.
+    pub(crate) fn scale(self, width_ratio: f32, height_ratio: f32) -> f32 {
+        match self {
+            ReplaceFit::Contain => width_ratio.min(height_ratio),
+            ReplaceFit::Cover => width_ratio.max(height_ratio),
+        }
+    }
+}
+
+/// What a replaced page's paper becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplaceGeometry {    /// Keep the target page's displayed size and orientation; the source
+    /// content is fitted inside it (replace the content, not the sheet).
+    #[default]
+    KeepTarget,
+    /// Take the source page's size and rotation (replace the whole page).
+    /// PDF sources only — a photo carries no page size.
+    FollowSource,
+}
+
+impl ReplaceGeometry {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReplaceGeometry::KeepTarget => "保持原页尺寸（推荐）",
+            ReplaceGeometry::FollowSource => "跟随来源页面尺寸",
+        }
+    }
 }
 
 /// Page layout for the folder batch tool.
@@ -259,6 +341,66 @@ pub enum ScanQuality {
 /// Output size above which a batch PDF is re-rendered with a tighter scan
 /// budget: 20 MiB.
 pub const SCAN_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// User-facing strength levels for PDF compression.
+///
+/// Each level pairs a JPEG re-encode quality with a display-resolution cap:
+/// images are only resampled when they are stored at a higher effective DPI
+/// than the page can use, so a level never throws away pixels a printer would
+/// have needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressLevel {
+    /// Highest fidelity: quality 80, only downsampling above 300 DPI.
+    Light,
+    /// The everyday pick: quality 65, 200 DPI cap.
+    #[default]
+    Standard,
+    /// Smallest file: quality 45, 120 DPI cap.
+    Strong,
+}
+
+impl CompressLevel {
+    pub const ALL: [CompressLevel; 3] = [
+        CompressLevel::Light,
+        CompressLevel::Standard,
+        CompressLevel::Strong,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CompressLevel::Light => "轻（画质优先）",
+            CompressLevel::Standard => "标准（推荐）",
+            CompressLevel::Strong => "强力（体积优先）",
+        }
+    }
+
+    /// JPEG re-encode quality.
+    pub fn quality(self) -> u8 {
+        match self {
+            CompressLevel::Light => 80,
+            CompressLevel::Standard => 65,
+            CompressLevel::Strong => 45,
+        }
+    }
+
+    /// Display-resolution cap in DPI.
+    pub fn max_dpi(self) -> f32 {
+        match self {
+            CompressLevel::Light => 300.0,
+            CompressLevel::Standard => 200.0,
+            CompressLevel::Strong => 120.0,
+        }
+    }
+
+    /// One-line explanation shown under the strength choice.
+    pub fn detail(self) -> &'static str {
+        match self {
+            CompressLevel::Light => "质量 80，超过 300 DPI 的图片降采样",
+            CompressLevel::Standard => "质量 65，超过 200 DPI 的图片降采样",
+            CompressLevel::Strong => "质量 45，超过 120 DPI 的图片降采样",
+        }
+    }
+}
 
 impl ScanQuality {
     pub const ALL: [ScanQuality; 3] = [
@@ -354,8 +496,9 @@ pub struct BatchPreset {
     pub pair_orientation: Orientation,
     /// Two images share one page.
     pub two_per_page: bool,
-    /// Merge only the listed images (1-based, e.g. `2-3`); `None` pairs every
-    /// image sequentially when `two_per_page` is set.
+    /// Merge only the listed images (1-based image numbers, e.g. `2-3`); `None`
+    /// pairs every image sequentially when `two_per_page` is set. A number is
+    /// the file name's trailing number, so `2-3` means the images named 2 and 3.
     pub merge_spec: Option<&'static str>,
     /// Fixed slot size in points (card-size copies such as 身份证). `None`
     /// gives each image half of the page.
@@ -429,9 +572,10 @@ pub struct BatchTemplate {
 impl BatchTemplate {
     /// Whether the preset's own merge spec is the one currently in use.
     ///
-    /// A template's spec is advisory: a folder with fewer images keeps those
-    /// pages separate instead of failing the whole batch. A spec the user
-    /// typed is strict — a typo must not silently change the layout.
+    /// A template's spec is advisory: a folder that has no image with one of
+    /// those numbers (fewer images, or a scan set that skips a page) keeps those
+    /// pages separate instead of failing the whole batch. A spec the user typed
+    /// is strict — a typo must not silently change the layout.
     pub fn owns_merge_spec(&self, spec: &str) -> bool {
         self.preset.merge_spec == Some(spec.trim())
     }
@@ -665,7 +809,9 @@ pub fn tool_for(id: ToolId) -> Box<dyn Tool> {
         ToolId::Extract => Box::new(extract::Extract),
         ToolId::TextWatermark => Box::new(text_watermark::TextWatermark),
         ToolId::ImageWatermark => Box::new(image_watermark::ImageWatermark),
+        ToolId::ReplacePages => Box::new(replace_pages::ReplacePages),
         ToolId::Encrypt => Box::new(encrypt::Encrypt),
+        ToolId::Compress => Box::new(compress::Compress),
         ToolId::PdfToImage => Box::new(pdf_to_image::PdfToImage),
     }
 }

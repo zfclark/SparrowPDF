@@ -41,7 +41,7 @@
 | 语言 | Rust，edition 2021，MSRV 1.95（CI 固定 1.97.1） |
 | 界面 | egui / eframe 0.37，Glow 后端，无 WebView |
 | 数据流 | **纯本地**：不联网、不上传、无遥测、无账号体系 |
-| 工具数 | 12 项，分组：转换 3 / 结构操作 6 / 页面编辑 2 / 安全 1 |
+| 工具数 | 14 项，分组：格式转换 3 / 文档结构 5 / 页面编辑 4 / 文件处理 2 |
 | 安装形态 | 绿色 exe（Windows x64 / arm64）、`.app` 打包为 DMG（macOS 通用版） |
 
 破坏性约束（任何改动都不得违反）：
@@ -64,6 +64,7 @@
 | `image` 0.25（jpeg, png） | 图片解码、PNG 编码 |
 | `fast_image_resize` 6.1（std） | 图片重采样（AVX2 / NEON 运行时派发，Lanczos-3） |
 | `jpeg-encoder` 0.7（simd） | JPEG 编码（4:4:4、优化霍夫曼表；熵编码源自 IJG） |
+| `zune-jpeg` / `zune-core` 0.5 | JPEG 解码的原始分量访问（Adobe YCCK 扫描件专用路径）。两者已经由 `image` 在依赖树中，声明为直接依赖只为调用 API，不新增代码 |
 | `allsorts` 0.16（flate2_rust） | 系统 TrueType 字体解析（用于内置光栅器与中文水印） |
 | `weezl` 0.2 | LZW 解码（图像 `/LZWDecode`） |
 | `hayro-ccitt` 0.5 | CCITT G3/G4 传真解码（`/CCITTFaxDecode`）。**与 `hayro-jbig2` 同批升级**：jbig2 0.4 自身依赖 ccitt 0.5，两者错开会在锁文件里留下两份传真解码器（CI 的「直接依赖版本唯一性」会拦下）；0.5 的解码回调整行交给 `push_row`，不再逐像素 |
@@ -118,7 +119,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    ├── tools/     业务层：把一次请求变成产物
    │    ├── mod.rs        Tool trait、ToolOptions、Progress、CancelFlag、tool_for
    │    ├── image_embed.rs 图片页嵌入与排版（被图片类工具共享）
-   │    └── <tool>.rs     12 个工具实现（image_to_pdf、folder_to_pdf、merge、…）
+   │    └── <tool>.rs     14 个工具实现（image_to_pdf、folder_to_pdf、merge、…）
    │
    ├── engine/    基础设施层：不含业务语义
    │    ├── pdf_io.rs   打开/保存/原子写/可写性探测/错误文案
@@ -164,18 +165,20 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 
 | 分组 | 工具 | 输入 | 产物 |
 | --- | --- | --- | --- |
-| 转换 | 图片合并为 PDF | 多张 JPG/PNG | 单个 PDF |
-| 转换 | 批量转换 | 多个文件夹 | 每个文件夹一个 PDF |
-| 结构操作 | PDF 合并 | ≥2 个 PDF | 单个 PDF |
-| 结构操作 | PDF 拆分 | 1 个 PDF | 按页码范围 / 每 N 页 / 逐页输出 |
-| 结构操作 | 页面旋转 | 1 个 PDF | 旋转后的 PDF |
-| 结构操作 | 删除页面 | 1 个 PDF | 删页后的 PDF |
-| 结构操作 | 页面重排 | 1 个 PDF | 重排后的 PDF |
-| 结构操作 | 提取页面 | 1 个 PDF | 抽取页组成的新 PDF |
+| 格式转换 | 图片合并为 PDF | 多张 JPG/PNG | 单个 PDF |
+| 格式转换 | 批量转换 | 多个文件夹 | 每个文件夹一个 PDF |
+| 格式转换 | PDF 转图片 | 1 个或多个 PDF | 每页 PNG/JPEG |
+| 文档结构 | PDF 合并 | ≥2 个 PDF | 单个 PDF |
+| 文档结构 | PDF 拆分 | 1 个 PDF | 按页码范围 / 每 N 页 / 逐页输出 |
+| 文档结构 | 提取页面 | 1 个 PDF | 抽取页组成的新 PDF |
+| 文档结构 | 删除页面 | 1 个 PDF | 删页后的 PDF |
+| 文档结构 | 页面重排 | 1 个 PDF | 重排后的 PDF |
+| 页面编辑 | 页面旋转 | 1 个 PDF | 旋转后的 PDF |
+| 页面编辑 | 页面替换 | 1 个目标 PDF + 1 个来源（PDF 或 JPG/PNG） | 指定页被来源内容替换的 PDF |
 | 页面编辑 | 文本水印 | 1 个 PDF | 叠加文字水印的 PDF |
 | 页面编辑 | 图片水印 | 1 个 PDF + 1 图 | 叠加图片水印的 PDF |
-| 安全 | 加密 / 解密 | 1 个 PDF | AES-256 加密或移除密码 |
-| 转换 | PDF 转图片 | 1 个或多个 PDF | 每页 PNG/JPEG |
+| 文件处理 | PDF 压缩 | 1 个 PDF | 重编码图片并清理未引用对象的 PDF |
+| 文件处理 | 加密 / 解密 | 1 个 PDF | AES-256 加密或移除密码 |
 
 ### 3.2 统一契约
 

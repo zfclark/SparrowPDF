@@ -351,6 +351,10 @@ impl Tool for FolderToPdf {
         let mut used_names: HashSet<String> = HashSet::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         let mut total_images = 0usize;
+        // Pages the run actually wrote: a merged folder has fewer pages than
+        // images, and the summary used to show only the image count, which read
+        // like a wrong page count.
+        let mut total_pages = 0usize;
         // Size telemetry for the summary: how big the largest artifact ended
         // up, and how many folders needed the 20 MB guard.
         let mut largest = 0u64;
@@ -373,11 +377,11 @@ impl Tool for FolderToPdf {
 
             match grouping {
                 BatchGrouping::ByFolder => {
-                    // A preset's own spec is advisory (a folder with fewer
-                    // images keeps those pages separate); a spec the user
-                    // typed stays strict.
+                    // A preset's own spec is advisory (a folder with no image
+                    // carrying one of those numbers keeps those pages
+                    // separate); a spec the user typed stays strict.
                     let strict = !template.owns_merge_spec(&spec);
-                    let plans = plan_pages(images.len(), mode, use_merge_spec, &spec, strict)?;
+                    let plans = plan_pages(&images, mode, use_merge_spec, &spec, strict)?;
                     let out_path = output_path(folder, out_root.as_deref(), &mut used_names);
                     planned.push(PlannedOutput {
                         label: folder.display_name(),
@@ -393,31 +397,44 @@ impl Tool for FolderToPdf {
                     // reject groups once the layout is one image per page.
                     let merge_active = mode == BatchPageMode::TwoPerPage && use_merge_spec;
                     if merge_active && !spec.trim().is_empty() {
-                        parse_merge_spec(&spec, 1, false)?;
+                        parse_merge_spec(&spec, 1, None, false)?;
                     }
-                    // A spec the user typed stays strict, but a group that is
-                    // too short is skipped on its own instead of discarding the
-                    // whole run. A preset's own spec keeps its lenient rule.
+                    // A spec the user typed stays strict, but a group whose
+                    // numbering cannot cover it is skipped on its own instead
+                    // of discarding the whole run. A preset's own spec keeps
+                    // its lenient rule.
                     let typed = merge_active && !template.owns_merge_spec(&spec);
-                    let required = if typed { spec_max_index(&spec)? } else { 0 };
+                    if typed {
+                        // Shape only (a malformed token, or a range wider than
+                        // two images): that is a typo and aborts the batch.
+                        spec_max_index(&spec)?;
+                    }
                     let dir = out_root
                         .clone()
                         .unwrap_or_else(|| folder.path.clone());
                     let folder_name = folder.display_name();
                     for group in group_images(&images) {
                         let label = format!("{folder_name}/{}", group.name);
-                        if group.images.len() < required {
+                        // Checked against this group's own numbering, so a
+                        // group numbered 11–20 still satisfies "18-19".
+                        let missing = if typed {
+                            merge_spec_gaps(&group.images, &spec)
+                        } else {
+                            Vec::new()
+                        };
+                        if !missing.is_empty() {
                             skipped.push((
                                 label,
                                 format!(
-                                    "合并序号 {spec} 超出该组图片数 {}",
+                                    "合并序号 {} 在该组图片中不存在（共 {} 张）",
+                                    format_numbers(&missing),
                                     group.images.len()
                                 ),
                             ));
                             continue;
                         }
                         let plans = plan_pages(
-                            group.images.len(),
+                            &group.images,
                             mode,
                             use_merge_spec,
                             &spec,
@@ -523,6 +540,7 @@ impl Tool for FolderToPdf {
             largest = largest.max(bytes.len() as u64);
             outputs.push(out_path);
             total_images += job.images.len();
+            total_pages += job.plans.len();
         }
 
         if outputs.is_empty() {
@@ -540,7 +558,7 @@ impl Tool for FolderToPdf {
         progress.report(1.0, "完成".to_string());
 
         let mut summary = format!(
-            "已生成 {} 个 PDF（共 {total_images} 张图片，模板：{}，最大 {:.1} MB）",
+            "已生成 {} 个 PDF（{total_images} 张图片、{total_pages} 页，模板：{}，最大 {:.1} MB）",
             outputs.len(),
             template.label,
             largest as f64 / (1024.0 * 1024.0)
@@ -576,18 +594,19 @@ impl Tool for FolderToPdf {
 
 // ----------------------------------------------------------------- planning
 
-/// Plan one document's pages from its image count.
+/// Plan one document's pages from its images.
 ///
-/// `strict_spec` decides whether an index beyond `count` is an error (a spec
-/// the user typed for one folder) or is skipped (a preset's own spec, and every
-/// group when one folder is split by name).
+/// `strict_spec` decides whether a number the folder does not contain is an
+/// error (a spec the user typed for one folder) or is skipped (a preset's own
+/// spec, and every group when one folder is split by name).
 fn plan_pages(
-    count: usize,
+    images: &[PathBuf],
     mode: BatchPageMode,
     use_merge_spec: bool,
     spec: &str,
     strict_spec: bool,
 ) -> Result<Vec<PagePlan>, ToolError> {
+    let count = images.len();
     match mode {
         BatchPageMode::Single => Ok(single_page_plans(count)),
         BatchPageMode::TwoPerPage => {
@@ -600,13 +619,48 @@ fn plan_pages(
                             .to_string(),
                     });
                 }
-                parse_merge_spec(spec, count, strict_spec)
+                let numbers = own_numbers(images);
+                parse_merge_spec(spec, count, numbers.as_deref(), strict_spec)
             } else {
                 // Unchecked: pair everything sequentially.
                 Ok(sequential_pairs(count))
             }
         }
     }
+}
+
+/// The number each image is referred to by, in `images` order (1-based).
+///
+/// Prefer the number the file name already carries (`form-2.jpg` → 2): that is
+/// the number the user sees in Explorer, and the one a merge spec means. Only
+/// when the folder has no usable numbering (no trailing number, or two files
+/// sharing one) does the sorted position stand in for it.
+pub fn image_numbers(images: &[PathBuf]) -> Vec<usize> {
+    own_numbers(images).unwrap_or_else(|| (1..=images.len()).collect())
+}
+
+/// The images' own numbers, `None` when the folder cannot provide a unique one
+/// for every image.
+fn own_numbers(images: &[PathBuf]) -> Option<Vec<usize>> {
+    if images.is_empty() {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(images.len());
+    for path in images {
+        let stem = path.file_stem()?.to_string_lossy();
+        numbers.push(usize::try_from(sequence_number(&stem)?).ok()?);
+    }
+    let mut sorted = numbers.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    // A duplicate number makes the mapping ambiguous: fall back to positions.
+    (sorted.len() == numbers.len()).then_some(numbers)
+}
+
+/// Whether `numbers` is a gap-free run (`11,12,13`), which is how a folder that
+/// continues an earlier scan is numbered.
+fn is_contiguous(numbers: &[usize]) -> bool {
+    numbers.windows(2).all(|pair| pair[1] == pair[0] + 1)
 }
 
 /// One output document produced from a folder that is split by file name.
@@ -674,7 +728,7 @@ pub struct GroupPreview {
 
 /// Plan the by-name preview without rendering anything.
 ///
-/// Shares `group_images`, `spec_max_index` and `preview_page_numbers` with the
+/// Shares `group_images`, `merge_spec_gaps` and `preview_page_numbers` with the
 /// run, so a group that would be skipped is shown as skipped instead of
 /// advertising a PDF that never appears.
 pub fn preview_groups(
@@ -684,22 +738,24 @@ pub fn preview_groups(
     merge_spec: &str,
     typed_spec: bool,
 ) -> Vec<GroupPreview> {
-    let merge_active = two_per_page && use_merge_spec;
-    let required = if merge_active && typed_spec {
-        spec_max_index(merge_spec).unwrap_or(0)
-    } else {
-        0
-    };
+    let merge_active = two_per_page && use_merge_spec && typed_spec;
     group_images(images)
         .into_iter()
         .map(|group| {
-            if group.images.len() < required {
+            // Same rule as the run: the numbers must exist in *this* group.
+            let missing = if merge_active {
+                merge_spec_gaps(&group.images, merge_spec)
+            } else {
+                Vec::new()
+            };
+            if !missing.is_empty() {
                 return GroupPreview {
                     name: group.name,
                     images: group.images.len(),
                     pages: None,
                     skip: Some(format!(
-                        "合并序号 {merge_spec} 超出该组图片数 {}",
+                        "合并序号 {} 在该组图片中不存在（共 {} 张）",
+                        format_numbers(&missing),
                         group.images.len()
                     )),
                 };
@@ -707,7 +763,7 @@ pub fn preview_groups(
             // `preview_page_numbers` labels every image with its output page;
             // the largest label is the page count (merges repeat a page).
             let pages = preview_page_numbers(
-                group.images.len(),
+                &group.images,
                 two_per_page,
                 use_merge_spec,
                 merge_spec,
@@ -898,19 +954,22 @@ fn sequential_pairs(count: usize) -> Vec<PagePlan> {
 /// Lenient on purpose: an unusable merge spec falls back to sequential
 /// pairing so the preview keeps working while the user types — the run
 /// itself reports the exact error. `strict` must mirror the run's rule for
-/// the spec at hand: a preset's own spec is advisory (out-of-range indices
-/// are skipped), a spec the user typed is not.
+/// the spec at hand: a preset's own spec is advisory (numbers the folder does
+/// not contain are skipped), a spec the user typed is not.
 pub fn preview_page_numbers(
-    count: usize,
+    images: &[PathBuf],
     two_per_page: bool,
     use_merge_spec: bool,
     merge_spec: &str,
     strict: bool,
 ) -> Vec<usize> {
+    let count = images.len();
     let plans = if !two_per_page {
         single_page_plans(count)
     } else if use_merge_spec && !merge_spec.trim().is_empty() {
-        parse_merge_spec(merge_spec, count, strict).unwrap_or_else(|_| sequential_pairs(count))
+        let numbers = own_numbers(images);
+        parse_merge_spec(merge_spec, count, numbers.as_deref(), strict)
+            .unwrap_or_else(|_| sequential_pairs(count))
     } else {
         sequential_pairs(count)
     };
@@ -936,23 +995,38 @@ pub fn preview_page_numbers(
 ///   follow the original image sequence (spec `2-3` yields pages
 ///   [1], [2+3], [4], …) instead of jumping to the spec pairs first.
 ///
-/// With `strict == false` an index beyond `count` is skipped instead of
-/// rejected: preset specs (入团志愿书's `2-3`) must still convert a folder
-/// that holds fewer images. A malformed token is always an error — that is a
-/// typing mistake, not a smaller folder.
-fn parse_merge_spec(spec: &str, count: usize, strict: bool) -> Result<Vec<PagePlan>, ToolError> {
+/// Numbers are resolved by [`spec_index`]: the file name's own number first,
+/// the sorted position only when the folder carries no numbering. With
+/// `strict == false` a number the folder does not contain is skipped instead of
+/// rejected: preset specs (入团志愿书's `2-3`) must still convert a folder that
+/// has no such page. A malformed token is always an error — that is a typing
+/// mistake, not a smaller folder.
+fn parse_merge_spec(
+    spec: &str,
+    count: usize,
+    numbers: Option<&[usize]>,
+    strict: bool,
+) -> Result<Vec<PagePlan>, ToolError> {
     let mut plans: Vec<PagePlan> = Vec::new();
     let mut used = vec![false; count];
 
     let mark_single = |idx: usize, used: &mut Vec<bool>| -> Result<(), ToolError> {
         if used[idx] {
+            let number = numbers.map_or(idx + 1, |list| list[idx]);
             return Err(ToolError::InvalidPageRange {
-                detail: format!("合并序号 {} 重复出现", idx + 1),
+                detail: format!("合并序号 {number} 重复出现"),
             });
         }
         used[idx] = true;
         Ok(())
     };
+
+    // 1-based spec token → 0-based index (`None` = the folder has no such image).
+    let resolve = move |raw: &str| -> Result<Option<usize>, ToolError> {
+        spec_index(parse_spec_number(raw)?, count, numbers, strict)
+    };
+    // The number to show for an index: the image's own number when it has one.
+    let shown = move |idx: usize| numbers.map_or(idx + 1, |list| list[idx]);
 
     for part in spec.split([',', '，', ' ', ';', '；']) {
         let part = part.trim();
@@ -960,10 +1034,10 @@ fn parse_merge_spec(spec: &str, count: usize, strict: bool) -> Result<Vec<PagePl
             continue;
         }
         if let Some((a, b)) = part.split_once(['-', '~', '+']) {
-            let Some(x) = parse_index(a, count, strict)? else {
+            let Some(x) = resolve(a)? else {
                 continue;
             };
-            let Some(y) = parse_index(b, count, strict)? else {
+            let Some(y) = resolve(b)? else {
                 continue;
             };
             if x == y {
@@ -975,8 +1049,8 @@ fn parse_merge_spec(spec: &str, count: usize, strict: bool) -> Result<Vec<PagePl
                     return Err(ToolError::InvalidPageRange {
                         detail: format!(
                             "合并序号范围 {}-{} 包含 {} 张图片，一次只能合并两张",
-                            lo + 1,
-                            hi + 1,
+                            shown(lo),
+                            shown(hi),
                             hi - lo + 1
                         ),
                     });
@@ -986,7 +1060,7 @@ fn parse_merge_spec(spec: &str, count: usize, strict: bool) -> Result<Vec<PagePl
                 plans.push(PagePlan::Two(lo, hi));
             }
         } else {
-            let Some(x) = parse_index(part, count, strict)? else {
+            let Some(x) = resolve(part)? else {
                 continue;
             };
             mark_single(x, &mut used)?;
@@ -1051,19 +1125,100 @@ fn spec_max_index(spec: &str) -> Result<usize, ToolError> {
     Ok(max)
 }
 
-/// 1-based image number → 0-based index. `Ok(None)` means "beyond `count`"
-/// while `strict` is off.
-fn parse_index(raw: &str, count: usize, strict: bool) -> Result<Option<usize>, ToolError> {
-    let n = parse_spec_number(raw)?;
-    if n > count {
-        if strict {
-            return Err(ToolError::InvalidPageRange {
-                detail: format!("合并序号 {n} 超出图片数量 {count}"),
-            });
+/// 1-based spec number → 0-based index into `images`.
+///
+/// The number is matched against the images' own numbers (`form-2.jpg` → 2)
+/// whenever the folder has them, so a merge spec means the page the user sees
+/// in Explorer — not whatever happens to sit at that position in the sorted
+/// list. A folder that continues an earlier scan (`11–20`) keeps working: its
+/// run is gap-free, so `2` still means the second image.
+///
+/// `Ok(None)` = "the folder has no such image" and `strict` is off (a preset's
+/// advisory spec); a strict spec turns it into an error instead of silently
+/// merging the wrong pages.
+fn spec_index(
+    number: usize,
+    count: usize,
+    numbers: Option<&[usize]>,
+    strict: bool,
+) -> Result<Option<usize>, ToolError> {
+    let Some(list) = numbers else {
+        // No usable numbering: the sorted position is the number.
+        if number > count {
+            if strict {
+                return Err(ToolError::InvalidPageRange {
+                    detail: format!("合并序号 {number} 超出图片数量 {count}"),
+                });
+            }
+            return Ok(None);
         }
-        return Ok(None);
+        return Ok(Some(number - 1));
+    };
+
+    if let Some(index) = list.iter().position(|candidate| *candidate == number) {
+        return Ok(Some(index));
     }
-    Ok(Some(n - 1))
+    // A gap-free run that does not start at 1 (`11–20`): offset the number so
+    // "the second image" keeps meaning the second image.
+    if is_contiguous(list) {
+        if let Some(target) = list[0].checked_add(number - 1) {
+            if let Some(index) = list.iter().position(|candidate| *candidate == target) {
+                return Ok(Some(index));
+            }
+        }
+    }
+    if strict {
+        return Err(ToolError::InvalidPageRange {
+            detail: format!("合并序号 {number} 在该文件夹的图片编号里不存在"),
+        });
+    }
+    Ok(None)
+}
+
+/// Numbers a preset's merge spec asks for that the folder does not contain.
+///
+/// The preview uses this to say why a merge from a template did not happen
+/// instead of silently showing one page per image.
+pub fn merge_spec_gaps(images: &[PathBuf], spec: &str) -> Vec<usize> {
+    let count = images.len();
+    let numbers = own_numbers(images);
+    let mut gaps: Vec<usize> = Vec::new();
+    for part in spec.split([',', '，', ' ', ';', '；']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let tokens: [&str; 2] = match part.split_once(['-', '~', '+']) {
+            Some((a, b)) => [a, b],
+            None => [part, ""],
+        };
+        for token in tokens {
+            if token.trim().is_empty() {
+                continue;
+            }
+            let Ok(number) = parse_spec_number(token) else {
+                continue;
+            };
+            if spec_index(number, count, numbers.as_deref(), false)
+                .ok()
+                .flatten()
+                .is_none()
+                && !gaps.contains(&number)
+            {
+                gaps.push(number);
+            }
+        }
+    }
+    gaps
+}
+
+/// Image numbers as the UI writes them: `3、4`.
+pub fn format_numbers(numbers: &[usize]) -> String {
+    numbers
+        .iter()
+        .map(|number| number.to_string())
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 // ---------------------------------------------------------------- rendering
@@ -1374,6 +1529,7 @@ mod tests {
     fn center(sheet: &Sheet) -> (f32, f32) {
         match sheet {
             Sheet::Fixed { center, .. } => *center,
+            Sheet::Cover { page } => (page.0 / 2.0, page.1 / 2.0),
             Sheet::Follow { .. } => panic!("a two-image page always has fixed slots"),
         }
     }

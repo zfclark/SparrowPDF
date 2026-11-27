@@ -337,7 +337,7 @@ fn log_lines_are_appended_to_the_log_file() {
 #[test]
 fn tool_ids_are_unique_and_complete() {
     let all = ToolId::ALL;
-    assert_eq!(all.len(), 12, "registry fixes exactly 12 tools");
+    assert_eq!(all.len(), 14, "registry fixes exactly 14 tools");
     for i in 0..all.len() {
         for j in (i + 1)..all.len() {
             assert_ne!(all[i], all[j]);
@@ -828,36 +828,112 @@ fn folder_batch_two_per_page_merges_specified_pairs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Image paths that only carry names: `preview_page_numbers` reads file names,
+/// never file contents, so these need no fixture on disk.
+fn named_images(names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| PathBuf::from(format!("{name}.jpg")))
+        .collect()
+}
+
 #[test]
 fn preview_page_numbers_renumber_by_output_page() {
     use sparrowpdf::tools::folder_to_pdf::preview_page_numbers;
+    let five = named_images(&["1", "2", "3", "4", "5"]);
     // Spec "2-3" with 5 images: pages [1], [2+3], [4], [5] — inline order,
     // continuous page numbers, merged images share one label.
     assert_eq!(
-        preview_page_numbers(5, true, true, "2-3", true),
+        preview_page_numbers(&five, true, true, "2-3", true),
         vec![1, 2, 2, 3, 4]
     );
-    // Advisory spec (a preset's own): images beyond the folder are skipped, so
-    // a two-image folder previews as two pages — exactly what the run writes.
+    // Advisory spec (a preset's own): numbers the folder does not contain are
+    // skipped, so a two-image folder previews as two pages — exactly what the
+    // run writes.
     assert_eq!(
-        preview_page_numbers(2, true, true, "2-3", false),
+        preview_page_numbers(&five[..2], true, true, "2-3", false),
         vec![1, 2]
     );
     // Unchecked: sequential pairs over everything.
     assert_eq!(
-        preview_page_numbers(5, true, false, "9-9", true),
+        preview_page_numbers(&five, true, false, "9-9", true),
         vec![1, 1, 2, 2, 3]
     );
     // Single mode: every image its own page, spec ignored.
     assert_eq!(
-        preview_page_numbers(3, false, true, "1-2", true),
+        preview_page_numbers(&named_images(&["1", "2", "3"]), false, true, "1-2", true),
         vec![1, 2, 3]
     );
     // Invalid spec: the preview falls back to sequential pairing.
     assert_eq!(
-        preview_page_numbers(4, true, true, "9", true),
+        preview_page_numbers(&named_images(&["1", "2", "3", "4"]), true, true, "9", true),
         vec![1, 1, 2, 2]
     );
+}
+
+#[test]
+fn merge_spec_follows_the_images_own_numbers() {
+    use sparrowpdf::tools::folder_to_pdf::{
+        image_numbers, merge_spec_gaps, preview_page_numbers,
+    };
+
+    // 扫描件缺第 3 张（文件名为 1、2、4、5）：模板的 2-3 不能借用第 3 个位置，
+    // 否则第 2 张会和第 4 张挤在一页、整份文档少一页。
+    let gapped = named_images(&["form-1", "form-2", "form-4", "form-5"]);
+    assert_eq!(image_numbers(&gapped), vec![1, 2, 4, 5]);
+    assert_eq!(
+        preview_page_numbers(&gapped, true, true, "2-3", false),
+        vec![1, 2, 3, 4],
+        "编号 3 不存在，四张各占一页"
+    );
+    assert_eq!(merge_spec_gaps(&gapped, "2-3"), vec![3]);
+    // 严格语义（用户手填）不能静默换成别的图片：越界即报错，预览退回顺序配对。
+    assert_eq!(
+        preview_page_numbers(&gapped, true, true, "2-3", true),
+        vec![1, 1, 2, 2]
+    );
+
+    // 编号连续但起点不是 1（接着上一批扫的 11–20）：按偏移匹配，行为不变。
+    let shifted = named_images(&["scan-11", "scan-12", "scan-13", "scan-14"]);
+    assert_eq!(image_numbers(&shifted), vec![11, 12, 13, 14]);
+    assert_eq!(
+        preview_page_numbers(&shifted, true, true, "2-3", false),
+        vec![1, 2, 2, 3]
+    );
+    assert!(merge_spec_gaps(&shifted, "2-3").is_empty());
+
+    // 文件名没有末尾序号：退回顺序号。
+    let plain = named_images(&["cover", "back"]);
+    assert_eq!(image_numbers(&plain), vec![1, 2]);
+    assert_eq!(
+        preview_page_numbers(&plain, true, true, "1-2", false),
+        vec![1, 1]
+    );
+}
+
+#[test]
+fn youth_league_preset_keeps_a_gapped_folder_on_single_pages() {
+    let dir = scratch("folder-gap-preset");
+    let album = dir.join("gapped");
+    std::fs::create_dir_all(&album).unwrap();
+    for name in ["form-1.jpg", "form-2.jpg", "form-4.jpg", "form-5.jpg"] {
+        make_image(&album, name, 60, 90);
+    }
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut req = request(ToolId::FolderToPdf, vec![album], out_dir);
+    let template = batch_template_by_key("youth-league-form").expect("preset exists");
+    req.options.apply_batch_template(template);
+    let outcome = run(ToolId::FolderToPdf, &req).expect("gapped folder converts");
+
+    assert_eq!(outcome.outputs.len(), 1);
+    let count = pdf_io::page_count_of(&outcome.outputs[0], None).unwrap();
+    assert_eq!(
+        count, 4,
+        "编号 3 缺失时 2-3 不合并：四张图四页，不能少一页"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2945,21 +3021,39 @@ fn renderer_honours_short_cubic_operators() {
 }
 
 /// The sidebar is generated from the registry, so the grouping contract lives
-/// in `model.rs`: four groups, "转换" first, PDF 转图片 inside it, and every
-/// group's tools contiguous in `ToolId::ALL` (otherwise a member is listed
-/// under the wrong caption).
+/// in `model.rs`: four groups, one caption per task stage, and every group's
+/// tools contiguous in `ToolId::ALL` (otherwise a member is listed under the
+/// wrong caption).
 #[test]
-fn sidebar_groups_merge_pdf_to_image_into_convert() {
+fn sidebar_groups_follow_task_stage() {
     use sparrowpdf::model::ToolGroup;
 
     let labels: Vec<&str> = ToolGroup::ALL.iter().map(|group| group.label()).collect();
-    assert_eq!(labels, vec!["转换", "结构操作", "页面编辑", "安全"]);
+    assert_eq!(labels, vec!["格式转换", "文档结构", "页面编辑", "文件处理"]);
 
-    let convert = ToolGroup::Generate.tools();
+    // 格式转换只留真正换格式的三项：压缩是「整份文件」的事，不属于转换。
+    let convert = ToolGroup::Convert.tools();
     assert_eq!(convert.len(), 3, "图片合并、批量转换、PDF 转图片");
     assert!(convert.contains(&ToolId::PdfToImage));
     assert!(convert.contains(&ToolId::ImageToPdf));
     assert!(convert.contains(&ToolId::FolderToPdf));
+    assert!(!convert.contains(&ToolId::Compress));
+
+    // 旋转改的是页面本身，归页面编辑；合并与拆分是文档结构。
+    assert!(ToolGroup::PageEdit.tools().contains(&ToolId::Rotate));
+    assert!(ToolGroup::Structure.tools().contains(&ToolId::Merge));
+    assert!(ToolGroup::File.tools().contains(&ToolId::Compress));
+    assert!(ToolGroup::File.tools().contains(&ToolId::Encrypt));
+
+    // 每组的行数落在 2–5 之间：不再出现六行大组，也不留只有一个工具的分组。
+    for group in ToolGroup::ALL {
+        let rows = group.tools().len();
+        assert!(
+            (2..=5).contains(&rows),
+            "{:?} 有 {rows} 项，分组失衡",
+            group
+        );
+    }
 
     let total: usize = ToolGroup::ALL
         .iter()
@@ -3841,4 +3935,1275 @@ fn group_preview_counts_pages_and_marks_skips() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].pages, None);
     assert!(groups[0].skip.is_some());
+}
+
+// ------------------------------------------------------ page replacement
+
+/// A one-colour PDF: every page is filled with `rgb` (each channel 0..=1).
+fn make_solid_pdf(
+    dir: &Path,
+    name: &str,
+    pages: u32,
+    w: f32,
+    h: f32,
+    rgb: [f32; 3],
+) -> PathBuf {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => pages as i64,
+        "Kids" => Object::Array(Vec::new()),
+    });
+    let mut kids = Vec::new();
+    for _ in 0..pages {
+        let content = format!(
+            "q {} {} {} rg 0 0 {w} {h} re f Q",
+            rgb[0], rgb[1], rgb[2]
+        );
+        let content_id = doc.add_object(Stream::new(Default::default(), content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(w),
+                Object::Real(h),
+            ],
+            "Contents" => content_id,
+            "Resources" => dictionary! {},
+        });
+        kids.push(page_id.into());
+    }
+    if let Object::Dictionary(d) = &mut doc.objects.get_mut(&pages_id).unwrap() {
+        d.set("Kids", Object::Array(kids));
+    }
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+
+    let path = dir.join(name);
+    doc.save(&path).expect("save fixture");
+    path
+}
+
+/// A solid-colour photo fixture.
+fn make_solid_image(dir: &Path, name: &str, w: u32, h: u32, rgb: [u8; 3]) -> PathBuf {
+    let path = dir.join(name);
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+    img.save_with_format(&path, image::ImageFormat::Jpeg)
+        .expect("write jpeg fixture");
+    path
+}
+
+/// RGB of the pixel at the centre of a rendered page.
+fn page_centre(path: &Path, page: u32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[page], 160.0, &fonts)
+        .expect("render page");
+    let pixmap = &rendered[0].1;
+    let index = ((pixmap.height / 2) * pixmap.width + pixmap.width / 2) as usize * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// RGB at `(fx, fy)` (fractions of the page) of the first rendered page.
+fn page_pixel_at(path: &Path, fx: f32, fy: f32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[1], 240.0, &fonts)
+        .expect("render page");
+    let pixmap = &rendered[0].1;
+    let x = ((pixmap.width as f32 * fx) as u32).min(pixmap.width - 1);
+    // Rendering puts y=0 at the top, so flip the fraction.
+    let y = ((pixmap.height as f32 * (1.0 - fy)) as u32).min(pixmap.height - 1);
+    let index = (y * pixmap.width + x) as usize * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// Rendered RGBA of one page, for "this page did not change" checks.
+fn page_pixels(path: &Path, page: u32) -> Vec<u8> {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[page], 160.0, &fonts)
+        .expect("render page");
+    rendered[0].1.data.clone()
+}
+
+/// Number of image XObjects in the file.
+fn image_xobject_count(path: &Path) -> usize {
+    let doc = lopdf::Document::load(path).expect("load output");
+    doc.objects
+        .values()
+        .filter(|object| {
+            object
+                .as_stream()
+                .is_ok_and(|stream| {
+                    matches!(
+                        stream.dict.get(b"Subtype"),
+                        Ok(lopdf::Object::Name(name)) if name.as_slice() == b"Image"
+                    )
+                })
+        })
+        .count()
+}
+
+/// Options helper for the replacement tool.
+fn replace_options(pages: &str, source_pages: &str) -> ToolOptions {
+    ToolOptions::ReplacePages {
+        pages: pages.to_string(),
+        source_pages: source_pages.to_string(),
+        fit: sparrowpdf::tools::ReplaceFit::Contain,
+        geometry: sparrowpdf::tools::ReplaceGeometry::KeepTarget,
+    }
+}
+
+/// The printed page is the one that gets replaced: the target keeps its size,
+/// unaffected pages stay byte-identical, and the imported page carries the
+/// source's content (vector import, not a screenshot of it).
+#[test]
+fn replace_pages_imports_a_pdf_page_and_keeps_the_target_sheet() {
+    let dir = scratch("replace-keep");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    let source = make_solid_pdf(&dir, "source.pdf", 1, 300.0, 400.0, [1.0, 0.0, 0.0]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("2", "");
+
+    let outcome = run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+    assert_eq!(outcome.outputs.len(), 1);
+    assert!(outcome.summary.contains("第 2 页"), "{}", outcome.summary);
+
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 3, "page count kept");
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[1][2] - 612.0).abs() < 0.6 && (boxes[1][3] - 792.0).abs() < 0.6,
+        "replaced page keeps the target sheet, got {:?}",
+        boxes[1]
+    );
+
+    // The imported page shows the source's red fill.
+    let (r, g, b) = page_centre(&out, 2);
+    assert!(r > 180 && g < 80 && b < 80, "page 2 must be red, got ({r},{g},{b})");
+
+    // Pages that were not selected are copied verbatim.
+    for page in [1u32, 3u32] {
+        assert_eq!(
+            page_pixels(&target, page),
+            page_pixels(&out, page),
+            "page {page} must be unchanged"
+        );
+    }
+
+    // The source file is only read.
+    let source_boxes = page_media_boxes(&source);
+    assert_eq!(pdf_io::page_count_of(&source, None).unwrap(), 1);
+    assert!((source_boxes[0][2] - 300.0).abs() < 0.6, "source untouched");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "Follow the source page size" turns the replaced page into the source sheet,
+/// while every other page keeps the target's own size.
+#[test]
+fn replace_pages_can_take_the_source_page_size() {
+    let dir = scratch("replace-follow");
+    let target = make_marked_pdf(&dir, "target.pdf", 2);
+    let source = make_solid_pdf(&dir, "source.pdf", 1, 300.0, 400.0, [0.0, 0.0, 1.0]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    if let ToolOptions::ReplacePages { geometry, .. } = &mut req.options {
+        *geometry = sparrowpdf::tools::ReplaceGeometry::FollowSource;
+    }
+    let outcome = run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+    assert!(
+        outcome.summary.contains("跟随来源"),
+        "the summary must say the paper changed: {}",
+        outcome.summary
+    );
+
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[0][2] - 300.0).abs() < 0.6 && (boxes[0][3] - 400.0).abs() < 0.6,
+        "page 1 takes the source sheet, got {:?}",
+        boxes[0]
+    );
+    assert!(
+        (boxes[1][2] - 612.0).abs() < 0.6 && (boxes[1][3] - 792.0).abs() < 0.6,
+        "page 2 keeps the target sheet, got {:?}",
+        boxes[1]
+    );
+    let (r, g, b) = page_centre(&out, 1);
+    assert!(b > 180 && r < 80 && g < 80, "page 1 must be blue, got ({r},{g},{b})");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A photo source fills the target sheet, and the pixels are embedded once even
+/// when several pages are replaced with it.
+#[test]
+fn replace_pages_photo_covers_every_replaced_page_with_one_copy() {
+    let dir = scratch("replace-photo");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    let photo = make_solid_image(&dir, "photo.jpg", 800, 400, [30, 90, 200]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), photo.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1-2", "");
+    if let ToolOptions::ReplacePages { fit, .. } = &mut req.options {
+        *fit = sparrowpdf::tools::ReplaceFit::Cover;
+    }
+    run(ToolId::ReplacePages, &req).expect("photo replacement succeeds");
+
+    let boxes = page_media_boxes(&out);
+    for (index, box4) in boxes.iter().enumerate().take(2) {
+        assert!(
+            (box4[2] - 612.0).abs() < 0.6 && (box4[3] - 792.0).abs() < 0.6,
+            "page {} keeps the target sheet, got {:?}",
+            index + 1,
+            box4
+        );
+    }
+    for page in [1u32, 2u32] {
+        let (r, g, b) = page_centre(&out, page);
+        assert!(
+            b > 150 && r < 90 && g < 130,
+            "page {page} must show the photo, got ({r},{g},{b})"
+        );
+    }
+    assert_eq!(
+        image_xobject_count(&out),
+        1,
+        "the photo must be stored once, not once per page"
+    );
+    assert_eq!(
+        page_pixels(&target, 3),
+        page_pixels(&out, 3),
+        "page 3 is not part of the range"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression guard for the rotation algebra: a source page stored sideways with
+/// `/Rotate 90` must land upright, with its content where a reader would see it.
+#[test]
+fn replace_pages_uprights_a_rotated_source_page() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("replace-rotate");
+    // Source: 600 x 800 stored, /Rotate 90 -> displayed 800 x 600, with a black
+    // bar along the stored top edge (which a reader sees on the right).
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {});
+    let content_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"q 1 1 1 rg 0 0 600 800 re f Q q 0 0 0 rg 0 700 600 100 re f Q".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+        "Rotate" => 90i64,
+        "Contents" => content_id,
+        "Resources" => dictionary! {},
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => vec![page_id.into()],
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let source = dir.join("sideways.pdf");
+    doc.save(&source).expect("save fixture");
+
+    let target = make_solid_pdf(&dir, "target.pdf", 1, 800.0, 600.0, [1.0, 1.0, 1.0]);
+    let out = dir.join("replaced.pdf");
+
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[0][2] - 800.0).abs() < 0.6 && (boxes[0][3] - 600.0).abs() < 0.6,
+        "the page keeps the target sheet, got {:?}",
+        boxes[0]
+    );
+
+    // The bar is on the right, exactly where the rotated source shows it.
+    let (right_r, right_g, right_b) = page_pixel_at(&out, 0.95, 0.5);
+    assert!(
+        right_r < 90 && right_g < 90 && right_b < 90,
+        "the bar belongs on the right edge, got ({right_r},{right_g},{right_b})"
+    );
+    let (left_r, left_g, left_b) = page_pixel_at(&out, 0.05, 0.5);
+    assert!(
+        left_r > 180 && left_g > 180 && left_b > 180,
+        "the left edge stays white, got ({left_r},{left_g},{left_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A page that inherits `/Resources` and `/MediaBox` from its `/Pages` node must
+/// survive the rebuild: the tool copies pages into a brand-new document, so
+/// without materialising the inherited entries the kept pages would come out
+/// blank and unsized.
+#[test]
+fn replace_pages_keeps_pages_that_inherit_their_resources() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("replace-inherit");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let (w, h) = (8u32, 8u32);
+    let pixels: Vec<u8> = (0..(w * h)).flat_map(|_| [220u8, 40, 40]).collect();
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+        },
+        pixels,
+    ));
+    let mut kids = Vec::new();
+    for _ in 0..2 {
+        let content_id = doc.add_object(Stream::new(
+            Default::default(),
+            b"q 612 0 0 792 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        // No /Resources and no /MediaBox: both live on the /Pages node.
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        kids.push(page_id.into());
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => Object::Array(kids),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im1" => image_id },
+            },
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let target = dir.join("inherited.pdf");
+    doc.save(&target).expect("save fixture");
+
+    let photo = make_solid_image(&dir, "photo.jpg", 200, 200, [30, 90, 200]);
+    let out = dir.join("replaced.pdf");
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), photo.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 2);
+    // Page 2 was kept: its inherited image resource and size must have survived.
+    let boxes = page_media_boxes(&out);
+    assert!(
+        (boxes[1][2] - 612.0).abs() < 0.6 && (boxes[1][3] - 792.0).abs() < 0.6,
+        "the kept page keeps its inherited size, got {:?}",
+        boxes[1]
+    );
+    let (r, g, b) = page_centre(&out, 2);
+    assert!(
+        r > 150 && g < 110 && b < 110,
+        "the kept page must still draw its inherited image, got ({r},{g},{b})"
+    );
+    // Page 1 is the photo.
+    let (r, g, b) = page_centre(&out, 1);
+    assert!(b > 150 && r < 90, "page 1 is the photo, got ({r},{g},{b})");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Page specs are validated before anything is written, and a photo cannot
+/// "follow the source size" — it has none.
+#[test]
+fn replace_pages_rejects_bad_requests() {
+    let dir = scratch("replace-errors");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    let source = make_solid_pdf(&dir, "source.pdf", 2, 300.0, 400.0, [1.0, 0.0, 0.0]);
+    let photo = make_solid_image(&dir, "photo.jpg", 80, 80, [10, 120, 40]);
+    let out = dir.join("replaced.pdf");
+    let tool = sparrowpdf::tools::tool_for(ToolId::ReplacePages);
+
+    // Empty page spec is caught by the cheap pre-flight.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("", "");
+    match tool.validate(&req) {
+        Err(ToolError::InvalidPageRange { .. }) => {}
+        other => panic!("expected InvalidPageRange, got {other:?}"),
+    }
+
+    // A photo has no page box.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), photo.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    if let ToolOptions::ReplacePages { geometry, .. } = &mut req.options {
+        *geometry = sparrowpdf::tools::ReplaceGeometry::FollowSource;
+    }
+    match tool.validate(&req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("保持原页尺寸"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+
+    // Only PDF / JPG / PNG are accepted in the source slot.
+    let notes = dir.join("notes.txt");
+    std::fs::write(&notes, b"not a page").unwrap();
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), notes],
+        out.clone(),
+    );
+    req.options = replace_options("1", "");
+    match tool.validate(&req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("JPG"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+
+    // Out-of-range target pages fail on the run, not silently.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("9", "");
+    match run(ToolId::ReplacePages, &req) {
+        Err(ToolError::InvalidPageRange { .. }) => {}
+        other => panic!("expected InvalidPageRange, got {other:?}"),
+    }
+
+    // A multi-page source spec must match the number of target pages.
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    req.options = replace_options("1-3", "1-2");
+    match run(ToolId::ReplacePages, &req) {
+        Err(ToolError::InvalidPageRange { detail }) => {
+            assert!(detail.contains("数量"), "detail was {detail}")
+        }
+        other => panic!("expected InvalidPageRange, got {other:?}"),
+    }
+
+    assert!(!out.exists(), "a rejected request writes nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tool must never write its result over one of its own inputs: with
+/// 「覆盖」 that would replace the original bytes and lose the only copy.
+#[test]
+fn replace_pages_refuses_to_write_over_its_input() {
+    let dir = scratch("replace-input-as-output");
+    let target = make_pdf(&dir, "target.pdf", 2, 0);
+    let source = make_pdf(&dir, "source.pdf", 1, 0);
+
+    // 输出刻意指向目标文件本身，冲突策略设为覆盖（用户真会这样选）。
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source],
+        target.clone(),
+    );
+    req.options = replace_options("1", "1");
+    req.conflict = ConflictPolicy::Overwrite;
+    let err = run(ToolId::ReplacePages, &req).expect_err("输出不得覆盖输入");
+    match err {
+        ToolError::WriteFailed { path, detail } => {
+            assert_eq!(path, target, "报错要指出被覆盖的那个输入");
+            assert!(detail.contains("输入文件相同"), "{detail}");
+        }
+        other => panic!("应为 WriteFailed，实际 {other:?}"),
+    }
+    assert_eq!(
+        pdf_io::page_count_of(&target, None).unwrap(),
+        2,
+        "原件必须完好"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/Contents` may point at an *array object*; copying that reference into the
+/// new contents array would nest an array where a stream belongs, and readers
+/// then skip the page's only content.
+#[test]
+fn replace_pages_flattens_an_indirect_contents_array() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("replace-contents-array");
+    let target = make_pdf(&dir, "target.pdf", 2, 0);
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let red = doc.add_object(Stream::new(
+        Default::default(),
+        b"1 0 0 rg 0 0 300 300 re f".to_vec(),
+    ));
+    let green = doc.add_object(Stream::new(
+        Default::default(),
+        b"0 1 0 rg 300 0 300 300 re f".to_vec(),
+    ));
+    // 间接数组：页面只引用这个数组对象，流在数组里。
+    let contents_array = doc.add_object(Object::Array(vec![red.into(), green.into()]));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 600.into(), 600.into()],
+        "Contents" => Object::Reference(contents_array),
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => vec![page_id.into()],
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    doc.max_id = doc.objects.len() as u32;
+    let source = dir.join("source.pdf");
+    doc.save(&source).expect("save source");
+
+    let out = dir.join("out.pdf");
+    let mut req = request(ToolId::ReplacePages, vec![target, source], out.clone());
+    req.options = replace_options("1", "1");
+    run(ToolId::ReplacePages, &req).expect("替换成功");
+
+    let doc = pdf_io::open_document(&out, None).unwrap();
+    let page_id = *doc.get_pages().values().next().unwrap();
+    let contents = doc
+        .get_object(page_id)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Contents")
+        .unwrap()
+        .as_array()
+        .expect("输出的 /Contents 必须是数组");
+    for item in contents {
+        let id = item.as_reference().expect("数组项必须是流引用，不能是数组");
+        assert!(
+            doc.get_object(id).unwrap().as_stream().is_ok(),
+            "数组项必须是流"
+        );
+    }
+    assert_eq!(contents.len(), 4, "前缀 + 两个来源流 + 后缀：{contents:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One source page is reused for every target page, and the mapping is what the
+/// preview shows.
+#[test]
+fn replace_pages_repeats_one_source_page_and_maps_several() {
+    use lopdf::dictionary;
+    use sparrowpdf::tools::replace_pages::{output_pages, plan, OutputPage};
+
+    let dir = scratch("replace-map");
+    let target = make_marked_pdf(&dir, "target.pdf", 3);
+    // Page 1 red, page 2 blue.
+    let mut doc = lopdf::Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => 2i64,
+        "Kids" => lopdf::Object::Array(Vec::new()),
+    });
+    let mut kids = Vec::new();
+    for rgb in [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]] {
+        let content = format!(
+            "q {} {} {} rg 0 0 300 400 re f Q",
+            rgb[0], rgb[1], rgb[2]
+        );
+        let content_id = doc.add_object(lopdf::Stream::new(Default::default(), content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 400.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! {},
+        });
+        kids.push(page_id.into());
+    }
+    if let lopdf::Object::Dictionary(d) = &mut doc.objects.get_mut(&pages_id).unwrap() {
+        d.set("Kids", lopdf::Object::Array(kids));
+    }
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let source = dir.join("two-colours.pdf");
+    doc.save(&source).expect("save fixture");
+
+    let out = dir.join("replaced.pdf");
+    let mut req = request(
+        ToolId::ReplacePages,
+        vec![target.clone(), source.clone()],
+        out.clone(),
+    );
+    // Source page 2 (blue) repeated over target pages 1 and 3.
+    req.options = replace_options("1,3", "2");
+    run(ToolId::ReplacePages, &req).expect("replacement succeeds");
+
+    for page in [1u32, 3u32] {
+        let (r, g, b) = page_centre(&out, page);
+        assert!(b > 180 && r < 80, "page {page} must be blue, got ({r},{g},{b})");
+    }
+    // Page 2 was not selected and keeps the target's own content.
+    assert_eq!(page_pixels(&target, 2), page_pixels(&out, 2));
+
+    // The preview and the run share one planner.
+    let planned = plan(3, Some(2), "1,3", "2").expect("plan");
+    assert_eq!(planned.targets, vec![1, 3]);
+    assert_eq!(planned.source_pages, vec![2, 2]);
+    assert_eq!(
+        output_pages(3, &planned),
+        vec![OutputPage::FromPdf(2), OutputPage::Kept(2), OutputPage::FromPdf(2)]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------ Adobe CMYK JPEG 预览
+
+/// White paper with a solid-K black bar, encoded as Adobe CMYK (transform 0).
+fn make_cmyk_jpeg(dir: &Path, name: &str, w: u16, h: u16) -> PathBuf {
+    let mut data = Vec::with_capacity(w as usize * h as usize * 4);
+    for row in 0..h {
+        for _column in 0..w {
+            // No ink = white paper; the middle third carries full K ink.
+            let ink: [u8; 4] = if row >= h / 3 && row < h * 2 / 3 {
+                [0, 0, 0, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+            data.extend_from_slice(&ink);
+        }
+    }
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, 92)
+        .encode(&data, w, h, jpeg_encoder::ColorType::Cmyk)
+        .expect("encode CMYK jpeg");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write fixture");
+    path
+}
+
+/// A one-page PDF drawing `jpeg` as a DeviceCMYK DCTDecode image, full page.
+fn make_jpeg_page_pdf(dir: &Path, name: &str, jpeg: &Path, w: u16, h: u16) -> PathBuf {
+    use lopdf::{dictionary, Document, Stream};
+
+    let bytes = std::fs::read(jpeg).expect("read jpeg fixture");
+    let mut doc = Document::with_version("1.5");
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceCMYK",
+            "BitsPerComponent" => 8i64,
+            "Filter" => "DCTDecode",
+        },
+        bytes,
+    ));
+    let content_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "MediaBox" => vec![0.into(), 0.into(), 400.into(), 400.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => 1i64,
+        "Kids" => vec![page_id.into()],
+    });
+    if let Ok(dict) = doc.get_object_mut(page_id).unwrap().as_dict_mut() {
+        dict.set("Parent", pages_id);
+    }
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let path = dir.join(name);
+    doc.save(&path).expect("save fixture");
+    path
+}
+
+/// Adobe YCCK written with the *conformant* component convention (the one
+/// Photoshop uses): the first three components are YCbCr of the inverted CMY
+/// and K is stored as-is. `jpeg_encoder`'s own `CmykAsYcck` maps CMY directly
+/// and inverts K, which is not what the APP14 transform byte promises, so the
+/// fixture implements the buffer itself.
+struct AdobeYcckFixture {
+    width: u16,
+    height: u16,
+}
+
+impl jpeg_encoder::ImageBuffer for AdobeYcckFixture {
+    fn get_jpeg_color_type(&self) -> jpeg_encoder::JpegColorType {
+        jpeg_encoder::JpegColorType::Ycck
+    }
+    fn width(&self) -> u16 {
+        self.width
+    }
+    fn height(&self) -> u16 {
+        self.height
+    }
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        for _column in 0..self.width {
+            // Both rows carry no CMY ink, so the YCC part is white (the scan's
+            // paper); the middle third is black through the K channel alone.
+            buffers[0].push(255);
+            buffers[1].push(128);
+            buffers[2].push(128);
+            buffers[3].push(if y >= self.height / 3 && y < self.height * 2 / 3 {
+                255
+            } else {
+                0
+            });
+        }
+    }
+}
+
+fn make_ycck_jpeg(dir: &Path, name: &str, w: u16, h: u16) -> PathBuf {
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, 92)
+        .encode_image(AdobeYcckFixture { width: w, height: h })
+        .expect("encode YCCK jpeg");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write fixture");
+    path
+}
+
+/// Render one page and read the RGB at a fraction of the page.
+fn jpeg_page_pixel(path: &Path, fx: f32, fy: f32) -> (u8, u8, u8) {
+    use sparrowpdf::engine::render;
+
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(path, None, &[1], 192.0, &fonts)
+        .expect("render jpeg page");
+    let pixmap = &rendered[0].1;
+    let x = ((pixmap.width as f32 * fx) as u32).min(pixmap.width - 1) as usize;
+    let y = ((pixmap.height as f32 * fy) as u32).min(pixmap.height - 1) as usize;
+    let index = (y * pixmap.width as usize + x) * 4;
+    (
+        pixmap.data[index],
+        pixmap.data[index + 1],
+        pixmap.data[index + 2],
+    )
+}
+
+/// CMYK scans must render as the reader sees them: white paper, dark ink.
+/// Covers the Adobe transform-0 flavour (inverted CMYK storage), which the
+/// image-crate decode handles correctly.
+#[test]
+fn renderer_decodes_adobe_cmyk_jpeg_right_way_up() {
+    let dir = scratch("cmyk-jpeg");
+    let jpeg = make_cmyk_jpeg(&dir, "photo.jpg", 64, 96);
+    let pdf = make_jpeg_page_pdf(&dir, "page.pdf", &jpeg, 64, 96);
+
+    let (paper_r, paper_g, paper_b) = jpeg_page_pixel(&pdf, 0.5, 0.10);
+    assert!(
+        paper_r > 200 && paper_g > 200 && paper_b > 200,
+        "paper must be white, got ({paper_r},{paper_g},{paper_b})"
+    );
+    let (bar_r, bar_g, bar_b) = jpeg_page_pixel(&pdf, 0.5, 0.50);
+    assert!(
+        bar_r < 80 && bar_g < 80 && bar_b < 80,
+        "the full-K bar must be black, got ({bar_r},{bar_g},{bar_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: Adobe YCCK scans (APP14 transform 2, Photoshop exports) used to
+/// render as the photometric inverse — black paper, white text — because the
+/// general decoder collapses the colour space onto the ink map.
+#[test]
+fn renderer_decodes_adobe_ycck_jpeg_right_way_up() {
+    let dir = scratch("ycck-jpeg");
+    let jpeg = make_ycck_jpeg(&dir, "scan.jpg", 64, 96);
+    let pdf = make_jpeg_page_pdf(&dir, "page.pdf", &jpeg, 64, 96);
+
+    let (paper_r, paper_g, paper_b) = jpeg_page_pixel(&pdf, 0.5, 0.10);
+    assert!(
+        paper_r > 200 && paper_g > 200 && paper_b > 200,
+        "paper must be white, got ({paper_r},{paper_g},{paper_b})"
+    );
+    let (bar_r, bar_g, bar_b) = jpeg_page_pixel(&pdf, 0.5, 0.50);
+    assert!(
+        bar_r < 80 && bar_g < 80 && bar_b < 80,
+        "the full-K bar must be black, got ({bar_r},{bar_g},{bar_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------ PDF 压缩
+
+/// An RGB JPEG with a horizontal colour gradient; high quality keeps it large
+/// so there is real headroom for compression.
+fn make_gradient_jpeg(path: &Path, w: u32, h: u32, quality: u8) {
+    let mut data = Vec::with_capacity(w as usize * h as usize * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x * 255 / w.max(1)) as u8;
+            let g = (y * 255 / h.max(1)) as u8;
+            let b = ((x * 7 + y * 13) % 256) as u8;
+            data.extend_from_slice(&[r, g, b]);
+        }
+    }
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, quality)
+        .encode(&data, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+        .expect("encode gradient");
+    std::fs::write(path, bytes).expect("write jpeg");
+}
+
+/// An N-page PDF drawing one DCTDecode image full-page on every page.
+fn make_jpeg_doc(dir: &Path, name: &str, jpeg: &Path, w: u32, h: u32, pages: u32) -> PathBuf {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let bytes = std::fs::read(jpeg).expect("read jpeg");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => pages as i64,
+        "Kids" => Object::Array(Vec::new()),
+    });
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+            "Filter" => "DCTDecode",
+        },
+        bytes,
+    ));
+    let mut kids = Vec::new();
+    for _ in 0..pages {
+        let content_id = doc.add_object(Stream::new(
+            Default::default(),
+            b"q 595 0 0 842 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+        });
+        kids.push(page_id.into());
+    }
+    if let Ok(dict) = doc.get_object_mut(pages_id).unwrap().as_dict_mut() {
+        dict.set("Kids", Object::Array(kids));
+    }
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let path = dir.join(name);
+    doc.save(&path).expect("save fixture");
+    path
+}
+
+fn compress_options(level: sparrowpdf::tools::CompressLevel) -> ToolOptions {
+    ToolOptions::Compress { level }
+}
+
+/// The happy path: page order is kept, the file shrinks, and the picture is
+/// still the picture (gradient direction survives the re-encode).
+#[test]
+fn compress_shrinks_a_jpeg_pdf_and_keeps_page_order() {
+    let dir = scratch("compress-shrink");
+    let jpeg = dir.join("photo.jpg");
+    make_gradient_jpeg(&jpeg, 600, 900, 96);
+    let target = make_jpeg_doc(&dir, "target.pdf", &jpeg, 600, 900, 2);
+    let original_len = std::fs::metadata(&target).unwrap().len();
+    let out = dir.join("compressed.pdf");
+
+    let mut req = request(ToolId::Compress, vec![target.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    let outcome = run(ToolId::Compress, &req).expect("compress succeeds");
+
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 2, "pages kept");
+    assert!(
+        outcome.summary.contains("已压缩"),
+        "summary must report the size comparison: {}",
+        outcome.summary
+    );
+    // 页数必须在摘要里给出：只报图片张数时，一页多图的文档会被读成页数不对。
+    assert!(
+        outcome.summary.contains("2 页"),
+        "summary must state the page count: {}",
+        outcome.summary
+    );
+    let compressed_len = std::fs::metadata(&out).unwrap().len();
+    assert!(
+        compressed_len < original_len,
+        "output must be smaller: {original_len} -> {compressed_len}"
+    );
+
+    // The rendered page still shows the gradient (red grows left→right).
+    use sparrowpdf::engine::render;
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(&out, None, &[1], 160.0, &fonts).unwrap();
+    let pixmap = &rendered[0].1;
+    let pixel = |fx: f32| {
+        let x = ((pixmap.width as f32 * fx) as u32).min(pixmap.width - 1) as usize;
+        let y = pixmap.height as usize / 2;
+        (pixmap.data[(y * pixmap.width as usize + x) * 4], pixmap.data[(y * pixmap.width as usize + x) * 4 + 1])
+    };
+    let (left_r, _) = pixel(0.05);
+    let (right_r, _) = pixel(0.95);
+    assert!(
+        right_r > left_r + 60,
+        "gradient direction must survive: left {left_r}, right {right_r}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Objects nothing references (leftovers from page operations) are dropped.
+#[test]
+fn compress_drops_unreferenced_objects() {
+    use lopdf::{dictionary, Document, Stream};
+
+    let dir = scratch("compress-orphan");
+    // One real page plus a big orphan stream nothing points at.
+    let jpeg = dir.join("photo.jpg");
+    make_gradient_jpeg(&jpeg, 300, 450, 96);
+    let target = make_jpeg_doc(&dir, "target.pdf", &jpeg, 300, 450, 1);
+    let mut doc = Document::load(&target).unwrap();
+    let orphan_payload: Vec<u8> = std::iter::repeat_n(7u8, 60_000).collect();
+    doc.add_object(Stream::new(
+        dictionary! { "Type" => "Junk", "Length" => orphan_payload.len() as i64 },
+        orphan_payload,
+    ));
+    doc.trailer.set("Size", doc.objects.len() as i64);
+    doc.save(&target).unwrap();
+    let original_len = std::fs::metadata(&target).unwrap().len();
+    let objects_before = Document::load(&target).unwrap().objects.len();
+    let out = dir.join("compressed.pdf");
+
+    let mut req = request(ToolId::Compress, vec![target.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Light);
+    let outcome = run(ToolId::Compress, &req).expect("compress succeeds");
+
+    assert!(
+        outcome.summary.contains("清理未引用对象"),
+        "the orphan must be reported: {}",
+        outcome.summary
+    );
+    let doc_after = Document::load(&out).unwrap();
+    let junk_left = doc_after
+        .objects
+        .values()
+        .filter(|object| {
+            object
+                .as_stream()
+                .is_ok_and(|stream| {
+                    stream
+                        .dict
+                        .get(b"Type")
+                        .ok()
+                        .and_then(|o| o.as_name().ok())
+                        .is_some_and(|name| name == b"Junk".as_slice())
+                })
+        })
+        .count();
+    assert_eq!(junk_left, 0, "the orphan stream must be gone");
+    assert!(
+        doc_after.objects.len() < objects_before,
+        "object count must shrink: {} vs {objects_before}",
+        doc_after.objects.len()
+    );
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 1);
+    let compressed_len = std::fs::metadata(&out).unwrap().len();
+    assert!(
+        compressed_len < original_len,
+        "the orphan bytes must be gone: {original_len} -> {compressed_len}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Encrypting first must be refused: saving a compressed copy would silently
+/// strip the open password.
+#[test]
+fn compress_rejects_encrypted_documents() {
+    let dir = scratch("compress-encrypted");
+    make_gradient_jpeg(&dir.join("x.jpg"), 40, 60, 96);
+    let plain = make_jpeg_doc(&dir, "plain.pdf", &dir.join("x.jpg"), 40, 60, 1);
+    let encrypted = dir.join("encrypted.pdf");
+    let mut req = request(
+        ToolId::Encrypt,
+        vec![plain.clone()],
+        encrypted.clone(),
+    );
+    if let ToolOptions::Encrypt {
+        user_password, ..
+    } = &mut req.options
+    {
+        *user_password = "secret".to_string();
+    }
+    run(ToolId::Encrypt, &req).expect("encryption succeeds");
+
+    let out = dir.join("compressed.pdf");
+    let mut req = request(ToolId::Compress, vec![encrypted.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    match run(ToolId::Compress, &req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("密码"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+    assert!(!out.exists(), "a rejected request writes nothing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Empty documents and files that are not PDFs fail before anything is written.
+#[test]
+fn compress_rejects_empty_and_broken_files() {
+    use lopdf::{dictionary, Document, Object};
+
+    let dir = scratch("compress-errors");
+    // A document with no pages.
+    let empty = dir.join("empty.pdf");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! { "Type" => "Pages", "Count" => 0i64, "Kids" => Object::Array(Vec::new()) });
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.save(&empty).unwrap();
+
+    let out = dir.join("out.pdf");
+    let mut req = request(ToolId::Compress, vec![empty], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    match run(ToolId::Compress, &req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("页面"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+
+    // Not a PDF at all.
+    let broken = dir.join("broken.pdf");
+    std::fs::write(&broken, b"this is not a pdf").unwrap();
+    let mut req = request(ToolId::Compress, vec![broken], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    match run(ToolId::Compress, &req) {
+        Err(ToolError::ReadFailed { .. }) => {}
+        other => panic!("expected ReadFailed, got {other:?}"),
+    }
+    assert!(!out.exists(), "a rejected request writes nothing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A soft mask tracks the image it masks: when the picture is downsampled the
+/// mask is resampled with it (and stays functional).
+#[test]
+fn compress_resamples_the_soft_mask_with_its_image() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("compress-smask");
+    // 2000 x 2000 blue-dominant gradient drawn on a 400 pt page: 360 DPI, far
+    // above the Strong cap, so both the image and its mask get downsampled.
+    // A solid image would be skipped on purpose: its Flate stream is already
+    // smaller than any JPEG of it, and re-encoding for nothing is exactly what
+    // the gain check exists to prevent.
+    let (w, h) = (2000u32, 2000u32);
+    // Blue-dominant with deterministic noise: without the noise, Flate beats
+    // any JPEG of the same picture and the gain check would (correctly) keep
+    // the original stream.
+    let noise_rows: Vec<u8> = (0..(w * h))
+        .scan(1234u32, |state, _| {
+            *state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let noise = ((*state >> 16) % 24) as u8;
+            Some([30 + noise, 90 + noise / 2, 190 + noise])
+        })
+        .flatten()
+        .collect();
+    let solid = noise_rows;
+    let mask_delta: Vec<u8> = (0..h)
+        .flat_map(|_| std::iter::once(255u8).chain(std::iter::repeat_n(0u8, w as usize - 1)))
+        .collect(); // Predictor 2 rows of 255,255,... (delta-encoded)
+    let mut mask_stream = Stream::new(
+        dictionary! {},
+        mask_delta,
+    )
+    .with_compression(true);
+    mask_stream.compress().unwrap();
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let smask_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8i64,
+            "Filter" => "FlateDecode",
+            "DecodeParms" => dictionary! { "Predictor" => 2i64, "Colors" => 1i64, "BitsPerComponent" => 8i64, "Columns" => w as i64 },
+        },
+        mask_stream.content.clone(),
+    ));
+    // No /Filter in the dict: lopdf's `compress()` refuses to touch a stream
+    // that already claims a filter, which would save raw pixels behind a
+    // FlateDecode declaration.
+    let mut image_stream = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+            "SMask" => smask_id,
+        },
+        solid,
+    )
+    .with_compression(true);
+    image_stream.compress().unwrap();
+    let image_id = doc.add_object(image_stream);
+    let content_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 400.into(), 400.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => vec![page_id.into()],
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let target = dir.join("masked.pdf");
+    doc.save(&target).unwrap();
+
+    let out = dir.join("compressed.pdf");
+    let mut req = request(ToolId::Compress, vec![target.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Strong);
+    let outcome = run(ToolId::Compress, &req).expect("compress succeeds");
+    assert!(outcome.summary.contains("已压缩"), "{}", outcome.summary);
+
+    // The mask must have been downsampled alongside its image.
+    let doc_after = Document::load(&out).unwrap();
+    let mask_widths: Vec<i64> = doc_after
+        .objects
+        .values()
+        .filter_map(|object| object.as_stream().ok())
+        .filter(|stream| {
+            stream
+                .dict
+                .get(b"ColorSpace")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|name| name == b"DeviceGray".as_slice())
+        })
+        .filter_map(|stream| stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()))
+        .collect();
+    assert!(
+        mask_widths.iter().all(|width| *width < 2000),
+        "the mask must be downsampled, got {mask_widths:?}"
+    );
+    assert!(!mask_widths.is_empty(), "a gray mask must exist");
+
+    // And the page still shows the solid picture (mask fully opaque).
+    use sparrowpdf::engine::render;
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(&out, None, &[1], 200.0, &fonts).unwrap();
+    let pixmap = &rendered[0].1;
+    let index = (pixmap.height / 2 * pixmap.width + pixmap.width / 2) as usize * 4;
+    let (r, g, b) = (pixmap.data[index], pixmap.data[index + 1], pixmap.data[index + 2]);
+    assert!(
+        b > 150 && r < 90,
+        "the image must still be visible through the mask, got ({r},{g},{b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
