@@ -491,8 +491,9 @@ pub struct BatchPreset {
     pub pair_orientation: Orientation,
     /// Two images share one page.
     pub two_per_page: bool,
-    /// Merge only the listed images (1-based, e.g. `2-3`); `None` pairs every
-    /// image sequentially when `two_per_page` is set.
+    /// Merge only the listed images (1-based image numbers, e.g. `2-3`); `None`
+    /// pairs every image sequentially when `two_per_page` is set. A number is
+    /// the file name's trailing number, so `2-3` means the images named 2 and 3.
     pub merge_spec: Option<&'static str>,
     /// Fixed slot size in points (card-size copies such as 身份证). `None`
     /// gives each image half of the page.
@@ -566,9 +567,10 @@ pub struct BatchTemplate {
 impl BatchTemplate {
     /// Whether the preset's own merge spec is the one currently in use.
     ///
-    /// A template's spec is advisory: a folder with fewer images keeps those
-    /// pages separate instead of failing the whole batch. A spec the user
-    /// typed is strict — a typo must not silently change the layout.
+    /// A template's spec is advisory: a folder that has no image with one of
+    /// those numbers (fewer images, or a scan set that skips a page) keeps those
+    /// pages separate instead of failing the whole batch. A spec the user typed
+    /// is strict — a typo must not silently change the layout.
     pub fn owns_merge_spec(&self, spec: &str) -> bool {
         self.preset.merge_spec == Some(spec.trim())
     }

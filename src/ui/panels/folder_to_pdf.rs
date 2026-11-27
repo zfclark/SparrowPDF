@@ -265,7 +265,7 @@ fn params_card(ui: &mut Ui, form: &mut FormState, tool: ToolId) {
             theme::field_row_hover(
                 ui,
                 "页码",
-                "图片在文件夹中的序号（悬停预览可见），如 2-3",
+                "图片编号，即文件名末尾的数字（悬停预览可见），如 2-3；编号不存在时不合并",
                 |ui| {
                     theme::text_input(ui, merge_spec, "如 2-3");
                 },
