@@ -1,4 +1,4 @@
-//! Left sidebar: the 13 tools in four groups (转换 / 结构操作 / 页面编辑 / 安全).
+//! Left sidebar: the 14 tools in four groups (转换 / 结构操作 / 页面编辑 / 安全).
 //!
 //! Selection crossfades between rows instead of snapping, so switching tools
 //! reads as motion rather than a jump.
@@ -16,7 +16,7 @@ const WIDTH: f32 = 204.0;
 /// Height of the About entry in the footer.
 ///
 /// 26 pt keeps it shorter than a tool row: it is shell chrome, not a tool, and
-/// the footer has to keep all 13 tools above the fold at the default window.
+/// the footer has to keep all 14 tools above the fold at the default window.
 const ABOUT_ROW_H: f32 = 26.0;
 
 /// What the sidebar produced this frame.
@@ -58,7 +58,7 @@ pub fn show(
             // window: 安全 (加密与解密) and the old 转换 group (PDF 转图片) sat
             // below the fold with no visible scroll bar, so the app looked like
             // it shipped ten tools. Every row and caption fits at the default
-            // size again (including the 13th row, 页面替换).
+            // size again (including the newest rows, 页面替换 and PDF 压缩).
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 egui::ScrollArea::vertical()

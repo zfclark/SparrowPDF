@@ -21,6 +21,7 @@ pub enum ToolId {
     ImageWatermark,
     ReplacePages,
     Encrypt,
+    Compress,
     PdfToImage,
 }
 
@@ -30,10 +31,11 @@ impl ToolId {
     /// Tools of one group are contiguous: the sidebar walks `ALL` and filters
     /// by group, so a stray member at the end would be listed under the first
     /// group but after every other group's rows.
-    pub const ALL: [ToolId; 13] = [
+    pub const ALL: [ToolId; 14] = [
         ToolId::ImageToPdf,
         ToolId::FolderToPdf,
         ToolId::PdfToImage,
+        ToolId::Compress,
         ToolId::Merge,
         ToolId::Split,
         ToolId::Rotate,
@@ -48,7 +50,9 @@ impl ToolId {
 
     pub fn group(self) -> ToolGroup {
         match self {
-            ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage => ToolGroup::Generate,
+            ToolId::ImageToPdf | ToolId::FolderToPdf | ToolId::PdfToImage | ToolId::Compress => {
+                ToolGroup::Generate
+            }
             ToolId::Merge
             | ToolId::Split
             | ToolId::Rotate
@@ -76,6 +80,7 @@ impl ToolId {
             ToolId::ImageWatermark => "图片水印",
             ToolId::ReplacePages => "页面替换",
             ToolId::Encrypt => "加密与解密",
+            ToolId::Compress => "PDF 压缩",
             ToolId::PdfToImage => "PDF 转图片",
         }
     }
@@ -95,6 +100,7 @@ impl ToolId {
             ToolId::ImageWatermark => "将图片作为水印叠加到每一页",
             ToolId::ReplacePages => "用 PDF 页面或照片替换指定页面，可保持原页尺寸或跟随来源",
             ToolId::Encrypt => "AES-256 加密，或移除已有密码",
+            ToolId::Compress => "按强度重新编码图片并清理未引用对象，保持页面顺序与文字不变",
             ToolId::PdfToImage => "逐页渲染为 PNG / JPEG，支持 36–600 DPI 与多文件批量导出",
         }
     }
@@ -106,7 +112,7 @@ impl ToolId {
             ToolId::ImageWatermark => &["pdf", "jpg", "jpeg", "png"],
             // Slot 1 is the PDF being replaced, slot 2 the source page or photo.
             ToolId::ReplacePages => &["pdf", "jpg", "jpeg", "png"],
-            ToolId::PdfToImage => &["pdf"],
+            ToolId::PdfToImage | ToolId::Compress => &["pdf"],
             _ => &["pdf"],
         }
     }

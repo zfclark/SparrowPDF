@@ -337,7 +337,7 @@ fn log_lines_are_appended_to_the_log_file() {
 #[test]
 fn tool_ids_are_unique_and_complete() {
     let all = ToolId::ALL;
-    assert_eq!(all.len(), 13, "registry fixes exactly 13 tools");
+    assert_eq!(all.len(), 14, "registry fixes exactly 14 tools");
     for i in 0..all.len() {
         for j in (i + 1)..all.len() {
             assert_ne!(all[i], all[j]);
@@ -2956,10 +2956,11 @@ fn sidebar_groups_merge_pdf_to_image_into_convert() {
     assert_eq!(labels, vec!["转换", "结构操作", "页面编辑", "安全"]);
 
     let convert = ToolGroup::Generate.tools();
-    assert_eq!(convert.len(), 3, "图片合并、批量转换、PDF 转图片");
+    assert_eq!(convert.len(), 4, "图片合并、批量转换、PDF 转图片、PDF 压缩");
     assert!(convert.contains(&ToolId::PdfToImage));
     assert!(convert.contains(&ToolId::ImageToPdf));
     assert!(convert.contains(&ToolId::FolderToPdf));
+    assert!(convert.contains(&ToolId::Compress));
 
     let total: usize = ToolGroup::ALL
         .iter()
@@ -4608,6 +4609,400 @@ fn renderer_decodes_adobe_ycck_jpeg_right_way_up() {
     assert!(
         bar_r < 80 && bar_g < 80 && bar_b < 80,
         "the full-K bar must be black, got ({bar_r},{bar_g},{bar_b})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------ PDF 压缩
+
+/// An RGB JPEG with a horizontal colour gradient; high quality keeps it large
+/// so there is real headroom for compression.
+fn make_gradient_jpeg(path: &Path, w: u32, h: u32, quality: u8) {
+    let mut data = Vec::with_capacity(w as usize * h as usize * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x * 255 / w.max(1)) as u8;
+            let g = (y * 255 / h.max(1)) as u8;
+            let b = ((x * 7 + y * 13) % 256) as u8;
+            data.extend_from_slice(&[r, g, b]);
+        }
+    }
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, quality)
+        .encode(&data, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+        .expect("encode gradient");
+    std::fs::write(path, bytes).expect("write jpeg");
+}
+
+/// An N-page PDF drawing one DCTDecode image full-page on every page.
+fn make_jpeg_doc(dir: &Path, name: &str, jpeg: &Path, w: u32, h: u32, pages: u32) -> PathBuf {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let bytes = std::fs::read(jpeg).expect("read jpeg");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => pages as i64,
+        "Kids" => Object::Array(Vec::new()),
+    });
+    let image_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+            "Filter" => "DCTDecode",
+        },
+        bytes,
+    ));
+    let mut kids = Vec::new();
+    for _ in 0..pages {
+        let content_id = doc.add_object(Stream::new(
+            Default::default(),
+            b"q 595 0 0 842 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+        });
+        kids.push(page_id.into());
+    }
+    if let Ok(dict) = doc.get_object_mut(pages_id).unwrap().as_dict_mut() {
+        dict.set("Kids", Object::Array(kids));
+    }
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let path = dir.join(name);
+    doc.save(&path).expect("save fixture");
+    path
+}
+
+fn compress_options(level: sparrowpdf::tools::CompressLevel) -> ToolOptions {
+    ToolOptions::Compress { level }
+}
+
+/// The happy path: page order is kept, the file shrinks, and the picture is
+/// still the picture (gradient direction survives the re-encode).
+#[test]
+fn compress_shrinks_a_jpeg_pdf_and_keeps_page_order() {
+    let dir = scratch("compress-shrink");
+    let jpeg = dir.join("photo.jpg");
+    make_gradient_jpeg(&jpeg, 600, 900, 96);
+    let target = make_jpeg_doc(&dir, "target.pdf", &jpeg, 600, 900, 2);
+    let original_len = std::fs::metadata(&target).unwrap().len();
+    let out = dir.join("compressed.pdf");
+
+    let mut req = request(ToolId::Compress, vec![target.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    let outcome = run(ToolId::Compress, &req).expect("compress succeeds");
+
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 2, "pages kept");
+    assert!(
+        outcome.summary.contains("已压缩"),
+        "summary must report the size comparison: {}",
+        outcome.summary
+    );
+    let compressed_len = std::fs::metadata(&out).unwrap().len();
+    assert!(
+        compressed_len < original_len,
+        "output must be smaller: {original_len} -> {compressed_len}"
+    );
+
+    // The rendered page still shows the gradient (red grows left→right).
+    use sparrowpdf::engine::render;
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(&out, None, &[1], 160.0, &fonts).unwrap();
+    let pixmap = &rendered[0].1;
+    let pixel = |fx: f32| {
+        let x = ((pixmap.width as f32 * fx) as u32).min(pixmap.width - 1) as usize;
+        let y = pixmap.height as usize / 2;
+        (pixmap.data[(y * pixmap.width as usize + x) * 4], pixmap.data[(y * pixmap.width as usize + x) * 4 + 1])
+    };
+    let (left_r, _) = pixel(0.05);
+    let (right_r, _) = pixel(0.95);
+    assert!(
+        right_r > left_r + 60,
+        "gradient direction must survive: left {left_r}, right {right_r}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Objects nothing references (leftovers from page operations) are dropped.
+#[test]
+fn compress_drops_unreferenced_objects() {
+    use lopdf::{dictionary, Document, Stream};
+
+    let dir = scratch("compress-orphan");
+    // One real page plus a big orphan stream nothing points at.
+    let jpeg = dir.join("photo.jpg");
+    make_gradient_jpeg(&jpeg, 300, 450, 96);
+    let target = make_jpeg_doc(&dir, "target.pdf", &jpeg, 300, 450, 1);
+    let mut doc = Document::load(&target).unwrap();
+    let orphan_payload: Vec<u8> = std::iter::repeat_n(7u8, 60_000).collect();
+    doc.add_object(Stream::new(
+        dictionary! { "Type" => "Junk", "Length" => orphan_payload.len() as i64 },
+        orphan_payload,
+    ));
+    doc.trailer.set("Size", doc.objects.len() as i64);
+    doc.save(&target).unwrap();
+    let original_len = std::fs::metadata(&target).unwrap().len();
+    let objects_before = Document::load(&target).unwrap().objects.len();
+    let out = dir.join("compressed.pdf");
+
+    let mut req = request(ToolId::Compress, vec![target.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Light);
+    let outcome = run(ToolId::Compress, &req).expect("compress succeeds");
+
+    assert!(
+        outcome.summary.contains("清理未引用对象"),
+        "the orphan must be reported: {}",
+        outcome.summary
+    );
+    let doc_after = Document::load(&out).unwrap();
+    let junk_left = doc_after
+        .objects
+        .values()
+        .filter(|object| {
+            object
+                .as_stream()
+                .is_ok_and(|stream| {
+                    stream
+                        .dict
+                        .get(b"Type")
+                        .ok()
+                        .and_then(|o| o.as_name().ok())
+                        .is_some_and(|name| name == b"Junk".as_slice())
+                })
+        })
+        .count();
+    assert_eq!(junk_left, 0, "the orphan stream must be gone");
+    assert!(
+        doc_after.objects.len() < objects_before,
+        "object count must shrink: {} vs {objects_before}",
+        doc_after.objects.len()
+    );
+    assert_eq!(pdf_io::page_count_of(&out, None).unwrap(), 1);
+    let compressed_len = std::fs::metadata(&out).unwrap().len();
+    assert!(
+        compressed_len < original_len,
+        "the orphan bytes must be gone: {original_len} -> {compressed_len}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Encrypting first must be refused: saving a compressed copy would silently
+/// strip the open password.
+#[test]
+fn compress_rejects_encrypted_documents() {
+    let dir = scratch("compress-encrypted");
+    make_gradient_jpeg(&dir.join("x.jpg"), 40, 60, 96);
+    let plain = make_jpeg_doc(&dir, "plain.pdf", &dir.join("x.jpg"), 40, 60, 1);
+    let encrypted = dir.join("encrypted.pdf");
+    let mut req = request(
+        ToolId::Encrypt,
+        vec![plain.clone()],
+        encrypted.clone(),
+    );
+    if let ToolOptions::Encrypt {
+        user_password, ..
+    } = &mut req.options
+    {
+        *user_password = "secret".to_string();
+    }
+    run(ToolId::Encrypt, &req).expect("encryption succeeds");
+
+    let out = dir.join("compressed.pdf");
+    let mut req = request(ToolId::Compress, vec![encrypted.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    match run(ToolId::Compress, &req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("密码"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+    assert!(!out.exists(), "a rejected request writes nothing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Empty documents and files that are not PDFs fail before anything is written.
+#[test]
+fn compress_rejects_empty_and_broken_files() {
+    use lopdf::{dictionary, Document, Object};
+
+    let dir = scratch("compress-errors");
+    // A document with no pages.
+    let empty = dir.join("empty.pdf");
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! { "Type" => "Pages", "Count" => 0i64, "Kids" => Object::Array(Vec::new()) });
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.save(&empty).unwrap();
+
+    let out = dir.join("out.pdf");
+    let mut req = request(ToolId::Compress, vec![empty], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    match run(ToolId::Compress, &req) {
+        Err(ToolError::UnsupportedFormat { detail, .. }) => {
+            assert!(detail.contains("页面"), "detail was {detail}")
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+
+    // Not a PDF at all.
+    let broken = dir.join("broken.pdf");
+    std::fs::write(&broken, b"this is not a pdf").unwrap();
+    let mut req = request(ToolId::Compress, vec![broken], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Standard);
+    match run(ToolId::Compress, &req) {
+        Err(ToolError::ReadFailed { .. }) => {}
+        other => panic!("expected ReadFailed, got {other:?}"),
+    }
+    assert!(!out.exists(), "a rejected request writes nothing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A soft mask tracks the image it masks: when the picture is downsampled the
+/// mask is resampled with it (and stays functional).
+#[test]
+fn compress_resamples_the_soft_mask_with_its_image() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let dir = scratch("compress-smask");
+    // 2000 x 2000 blue-dominant gradient drawn on a 400 pt page: 360 DPI, far
+    // above the Strong cap, so both the image and its mask get downsampled.
+    // A solid image would be skipped on purpose: its Flate stream is already
+    // smaller than any JPEG of it, and re-encoding for nothing is exactly what
+    // the gain check exists to prevent.
+    let (w, h) = (2000u32, 2000u32);
+    // Blue-dominant with deterministic noise: without the noise, Flate beats
+    // any JPEG of the same picture and the gain check would (correctly) keep
+    // the original stream.
+    let noise_rows: Vec<u8> = (0..(w * h))
+        .scan(1234u32, |state, _| {
+            *state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let noise = ((*state >> 16) % 24) as u8;
+            Some([30 + noise, 90 + noise / 2, 190 + noise])
+        })
+        .flatten()
+        .collect();
+    let solid = noise_rows;
+    let mask_delta: Vec<u8> = (0..h)
+        .flat_map(|_| std::iter::once(255u8).chain(std::iter::repeat_n(0u8, w as usize - 1)))
+        .collect(); // Predictor 2 rows of 255,255,... (delta-encoded)
+    let mut mask_stream = Stream::new(
+        dictionary! {},
+        mask_delta,
+    )
+    .with_compression(true);
+    mask_stream.compress().unwrap();
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let smask_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8i64,
+            "Filter" => "FlateDecode",
+            "DecodeParms" => dictionary! { "Predictor" => 2i64, "Colors" => 1i64, "BitsPerComponent" => 8i64, "Columns" => w as i64 },
+        },
+        mask_stream.content.clone(),
+    ));
+    // No /Filter in the dict: lopdf's `compress()` refuses to touch a stream
+    // that already claims a filter, which would save raw pixels behind a
+    // FlateDecode declaration.
+    let mut image_stream = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8i64,
+            "SMask" => smask_id,
+        },
+        solid,
+    )
+    .with_compression(true);
+    image_stream.compress().unwrap();
+    let image_id = doc.add_object(image_stream);
+    let content_id = doc.add_object(Stream::new(
+        Default::default(),
+        b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 400.into(), 400.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Count" => 1i64,
+            "Kids" => vec![page_id.into()],
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.max_id = doc.objects.len() as u32;
+    let target = dir.join("masked.pdf");
+    doc.save(&target).unwrap();
+
+    let out = dir.join("compressed.pdf");
+    let mut req = request(ToolId::Compress, vec![target.clone()], out.clone());
+    req.options = compress_options(sparrowpdf::tools::CompressLevel::Strong);
+    let outcome = run(ToolId::Compress, &req).expect("compress succeeds");
+    assert!(outcome.summary.contains("已压缩"), "{}", outcome.summary);
+
+    // The mask must have been downsampled alongside its image.
+    let doc_after = Document::load(&out).unwrap();
+    let mask_widths: Vec<i64> = doc_after
+        .objects
+        .values()
+        .filter_map(|object| object.as_stream().ok())
+        .filter(|stream| {
+            stream
+                .dict
+                .get(b"ColorSpace")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|name| name == b"DeviceGray".as_slice())
+        })
+        .filter_map(|stream| stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()))
+        .collect();
+    assert!(
+        mask_widths.iter().all(|width| *width < 2000),
+        "the mask must be downsampled, got {mask_widths:?}"
+    );
+    assert!(!mask_widths.is_empty(), "a gray mask must exist");
+
+    // And the page still shows the solid picture (mask fully opaque).
+    use sparrowpdf::engine::render;
+    let fonts = render::FontSet::system();
+    let rendered = render::render_page_thumbnails(&out, None, &[1], 200.0, &fonts).unwrap();
+    let pixmap = &rendered[0].1;
+    let index = (pixmap.height / 2 * pixmap.width + pixmap.width / 2) as usize * 4;
+    let (r, g, b) = (pixmap.data[index], pixmap.data[index + 1], pixmap.data[index + 2]);
+    assert!(
+        b > 150 && r < 90,
+        "the image must still be visible through the mask, got ({r},{g},{b})"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

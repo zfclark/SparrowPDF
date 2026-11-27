@@ -4,6 +4,7 @@
 //! `model`; it never touches `lopdf`, `medpdf`, `medpdf_image`, `image` or
 //! `kamadak_exif` directly.
 
+pub mod compress;
 pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
@@ -139,6 +140,11 @@ pub enum ToolOptions {
         allow_copy: bool,
         allow_modify: bool,
     },
+    /// Re-encode the document's images to a strength-selected quality/DPI
+    /// budget and drop objects nothing references.
+    Compress {
+        level: CompressLevel,
+    },
     PdfToImage {
         dpi: u32,
         format: ImageFormat,
@@ -217,6 +223,9 @@ impl ToolOptions {
                 allow_copy: true,
                 allow_modify: true,
             },
+            ToolId::Compress => ToolOptions::Compress {
+                level: CompressLevel::Standard,
+            },
             ToolId::PdfToImage => ToolOptions::PdfToImage {
                 dpi: 300,
                 format: ImageFormat::Png,
@@ -262,8 +271,7 @@ impl ReplaceFit {
 
 /// What a replaced page's paper becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReplaceGeometry {
-    /// Keep the target page's displayed size and orientation; the source
+pub enum ReplaceGeometry {    /// Keep the target page's displayed size and orientation; the source
     /// content is fitted inside it (replace the content, not the sheet).
     #[default]
     KeepTarget,
@@ -328,6 +336,66 @@ pub enum ScanQuality {
 /// Output size above which a batch PDF is re-rendered with a tighter scan
 /// budget: 20 MiB.
 pub const SCAN_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// User-facing strength levels for PDF compression.
+///
+/// Each level pairs a JPEG re-encode quality with a display-resolution cap:
+/// images are only resampled when they are stored at a higher effective DPI
+/// than the page can use, so a level never throws away pixels a printer would
+/// have needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressLevel {
+    /// Highest fidelity: quality 80, only downsampling above 300 DPI.
+    Light,
+    /// The everyday pick: quality 65, 200 DPI cap.
+    #[default]
+    Standard,
+    /// Smallest file: quality 45, 120 DPI cap.
+    Strong,
+}
+
+impl CompressLevel {
+    pub const ALL: [CompressLevel; 3] = [
+        CompressLevel::Light,
+        CompressLevel::Standard,
+        CompressLevel::Strong,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CompressLevel::Light => "轻（画质优先）",
+            CompressLevel::Standard => "标准（推荐）",
+            CompressLevel::Strong => "强力（体积优先）",
+        }
+    }
+
+    /// JPEG re-encode quality.
+    pub fn quality(self) -> u8 {
+        match self {
+            CompressLevel::Light => 80,
+            CompressLevel::Standard => 65,
+            CompressLevel::Strong => 45,
+        }
+    }
+
+    /// Display-resolution cap in DPI.
+    pub fn max_dpi(self) -> f32 {
+        match self {
+            CompressLevel::Light => 300.0,
+            CompressLevel::Standard => 200.0,
+            CompressLevel::Strong => 120.0,
+        }
+    }
+
+    /// One-line explanation shown under the strength choice.
+    pub fn detail(self) -> &'static str {
+        match self {
+            CompressLevel::Light => "质量 80，超过 300 DPI 的图片降采样",
+            CompressLevel::Standard => "质量 65，超过 200 DPI 的图片降采样",
+            CompressLevel::Strong => "质量 45，超过 120 DPI 的图片降采样",
+        }
+    }
+}
 
 impl ScanQuality {
     pub const ALL: [ScanQuality; 3] = [
@@ -736,6 +804,7 @@ pub fn tool_for(id: ToolId) -> Box<dyn Tool> {
         ToolId::ImageWatermark => Box::new(image_watermark::ImageWatermark),
         ToolId::ReplacePages => Box::new(replace_pages::ReplacePages),
         ToolId::Encrypt => Box::new(encrypt::Encrypt),
+        ToolId::Compress => Box::new(compress::Compress),
         ToolId::PdfToImage => Box::new(pdf_to_image::PdfToImage),
     }
 }

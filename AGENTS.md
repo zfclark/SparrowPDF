@@ -41,7 +41,7 @@
 | 语言 | Rust，edition 2021，MSRV 1.95（CI 固定 1.97.1） |
 | 界面 | egui / eframe 0.37，Glow 后端，无 WebView |
 | 数据流 | **纯本地**：不联网、不上传、无遥测、无账号体系 |
-| 工具数 | 13 项，分组：转换 3 / 结构操作 6 / 页面编辑 3 / 安全 1 |
+| 工具数 | 14 项，分组：转换 4 / 结构操作 6 / 页面编辑 3 / 安全 1 |
 | 安装形态 | 绿色 exe（Windows x64 / arm64）、`.app` 打包为 DMG（macOS 通用版） |
 
 破坏性约束（任何改动都不得违反）：
@@ -119,7 +119,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
    ├── tools/     业务层：把一次请求变成产物
    │    ├── mod.rs        Tool trait、ToolOptions、Progress、CancelFlag、tool_for
    │    ├── image_embed.rs 图片页嵌入与排版（被图片类工具共享）
-   │    └── <tool>.rs     13 个工具实现（image_to_pdf、folder_to_pdf、merge、…）
+   │    └── <tool>.rs     14 个工具实现（image_to_pdf、folder_to_pdf、merge、…）
    │
    ├── engine/    基础设施层：不含业务语义
    │    ├── pdf_io.rs   打开/保存/原子写/可写性探测/错误文案
@@ -178,6 +178,7 @@ app.rs ─── 应用壳：工具切换、表单状态、输出路径解析、
 | 页面编辑 | 页面替换 | 1 个目标 PDF + 1 个来源（PDF 或 JPG/PNG） | 指定页被来源内容替换的 PDF |
 | 安全 | 加密 / 解密 | 1 个 PDF | AES-256 加密或移除密码 |
 | 转换 | PDF 转图片 | 1 个或多个 PDF | 每页 PNG/JPEG |
+| 转换 | PDF 压缩 | 1 个 PDF | 重编码图片并清理未引用对象的 PDF |
 
 ### 3.2 统一契约
 

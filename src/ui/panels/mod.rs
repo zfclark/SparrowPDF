@@ -8,6 +8,7 @@
 //! The sticky chrome (result area, action bar) is owned by the shell, not by
 //! panels; each panel reports through [`PanelView`] whether it can run.
 
+pub mod compress;
 pub mod delete_pages;
 pub mod encrypt;
 pub mod extract;
@@ -153,6 +154,7 @@ pub fn panel_view(tool: ToolId, form: &FormState, reorder: &ReorderState) -> Pan
                 "需要 1 个目标 PDF、1 个来源，并填写要替换的页码。",
             )
         }
+        ToolId::Compress => PanelView::new(has_input, "请先选择一个 PDF 文件。"),
         _ => PanelView::new(has_input, "请先选择一个 PDF 文件。"),
     }
 }

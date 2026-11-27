@@ -121,12 +121,12 @@ enum ImageObject {
 }
 
 /// A JPEG ready for a `DCTDecode` stream.
-struct EncodedJpeg {
-    data: Vec<u8>,
-    width: u32,
-    height: u32,
+pub(crate) struct EncodedJpeg {
+    pub(crate) data: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// 1 = Gray, 3 = RGB, 4 = CMYK.
-    components: u8,
+    pub(crate) components: u8,
 }
 
 /// Decoded input, kept in the shape that avoids a needless re-encode.
@@ -416,7 +416,7 @@ const OPAQUE_ALPHA: u8 = 250;
 /// else is resampled with a Lanczos-3 convolution and encoded at 4:4:4 with
 /// optimised Huffman tables — measured on a 600 DPI scan against `image`'s own
 /// encoder that is 30 % smaller at a higher PSNR, and roughly twice as fast.
-fn jpeg_from_dynamic(
+pub(crate) fn jpeg_from_dynamic(
     image: DynamicImage,
     target: (u32, u32),
     budget: ScanBudget,
@@ -447,7 +447,7 @@ fn jpeg_from_dynamic(
 /// `fast_image_resize` picks AVX2 / NEON at runtime, which turns the ~1.4 s
 /// that `image::imageops::resize` needs for one 600 DPI page into ~0.25 s
 /// while *raising* the filter quality (Lanczos-3 instead of Catmull-Rom).
-fn resample(
+pub(crate) fn resample(
     pixels: Vec<u8>,
     width: u32,
     height: u32,
@@ -523,7 +523,7 @@ fn raster_object(image: DynamicImage) -> ImageObject {
 ///
 /// Never upscales: an image that is already within budget keeps its own
 /// pixels, so the common case stays lossless.
-fn target_pixels(px_w: u32, px_h: u32, drawn: (f32, f32), max_dpi: f32) -> (u32, u32) {
+pub(crate) fn target_pixels(px_w: u32, px_h: u32, drawn: (f32, f32), max_dpi: f32) -> (u32, u32) {
     let (draw_w, draw_h) = drawn;
     if px_w == 0 || px_h == 0 || draw_w <= 0.0 || draw_h <= 0.0 || max_dpi <= 0.0 {
         return (px_w, px_h);

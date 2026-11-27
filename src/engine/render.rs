@@ -1966,7 +1966,7 @@ fn decode_adobe_ycck(data: &[u8]) -> Option<ImageRgba> {
 }
 
 /// Decode the pixels of an image XObject, without its soft mask.
-fn decode_image_pixels(
+pub(crate) fn decode_image_pixels(
     doc: &Document,
     stream: &lopdf::Stream,
     fill: [f32; 4],
