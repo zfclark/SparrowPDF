@@ -27,7 +27,7 @@ medpdf-image = { version = "0.2.2", default-features = false }
 kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-allsorts = { version = "0.16", default-features = false, features = ["flate2_rust"] }
+allsorts = { version = "0.17", default-features = false, features = ["flate2_rust"] }
 
 # Image codecs the software rasterizer needs and `image` cannot provide:
 # LZW (PDF /LZWDecode), CCITT G3/G4 (/CCITTFaxDecode) and JBIG2 (/JBIG2Decode).
