@@ -658,11 +658,33 @@ fn as_u32(object: &Object) -> Option<u32> {
 /// Replaced image streams and page-operation leftovers are the usual bulk.
 /// Reachability follows every reference in dictionaries and arrays; stream
 /// payloads carry no references, so their dictionaries are the frontier.
+///
+/// The traversal is iterative: a bookmark chain (`/Next` after `/Next`) or a
+/// linear page tree makes the graph as deep as the file is long, and the worker
+/// thread runs on Rust's default stack. Recursing one frame per hop would turn
+/// a crafted file into a stack overflow, which aborts the process before any
+/// `ToolError` can be reported.
 fn collect_orphans(doc: &lopdf::Document) -> BTreeSet<ObjectId> {
     let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut stack: Vec<&Object> = Vec::new();
     for key in [&b"Root"[..], b"Info"] {
-        if let Ok(Object::Reference(id)) = doc.trailer.get(key) {
-            visit(doc, *id, &mut seen);
+        if let Ok(object) = doc.trailer.get(key) {
+            stack.push(object);
+        }
+    }
+    while let Some(object) = stack.pop() {
+        match object {
+            Object::Reference(id) => {
+                if seen.insert(*id) {
+                    if let Some(next) = doc.objects.get(id) {
+                        stack.push(next);
+                    }
+                }
+            }
+            Object::Array(items) => stack.extend(items.iter()),
+            Object::Dictionary(dict) => stack.extend(dict.iter().map(|(_, value)| value)),
+            Object::Stream(stream) => stack.extend(stream.dict.iter().map(|(_, value)| value)),
+            _ => {}
         }
     }
     doc.objects
@@ -670,38 +692,6 @@ fn collect_orphans(doc: &lopdf::Document) -> BTreeSet<ObjectId> {
         .filter(|id| !seen.contains(id))
         .copied()
         .collect()
-}
-
-fn visit(doc: &lopdf::Document, id: ObjectId, seen: &mut BTreeSet<ObjectId>) {
-    if !seen.insert(id) {
-        return;
-    }
-    let Some(object) = doc.objects.get(&id) else {
-        return;
-    };
-    walk_object(doc, object, seen);
-}
-
-fn walk_object(doc: &lopdf::Document, object: &Object, seen: &mut BTreeSet<ObjectId>) {
-    match object {
-        Object::Reference(id) => visit(doc, *id, seen),
-        Object::Array(items) => {
-            for item in items {
-                walk_object(doc, item, seen);
-            }
-        }
-        Object::Dictionary(dict) => {
-            for (_, value) in dict.iter() {
-                walk_object(doc, value, seen);
-            }
-        }
-        Object::Stream(stream) => {
-            for (_, value) in stream.dict.iter() {
-                walk_object(doc, value, seen);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Human-readable size for the summary line.
