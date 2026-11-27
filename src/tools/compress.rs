@@ -104,9 +104,14 @@ impl Tool for Compress {
         }
 
         progress.report(0.05, "分析图片".to_string());
+        // Objects nothing references are dropped before the file is written, so
+        // working on them first would spend a JPEG round-trip on bytes that
+        // never reach the output — and it made the summary report more images
+        // than the document shows.
+        let stale = collect_orphans(&doc);
         let drawn = scan_drawn_sizes(&doc);
         let (replaced, skipped) =
-            compress_images(&mut doc, &drawn, level, progress, cancel)?;
+            compress_images(&mut doc, &drawn, &stale, level, progress, cancel)?;
 
         progress.report(0.8, "清理未引用对象".to_string());
         check_cancel(cancel)?;
@@ -121,12 +126,25 @@ impl Tool for Compress {
         // A "compressed" file that grew would be worse than useless: fall back
         // to the original bytes and say so. Both branches keep the page count,
         // which is the invariant the assertion checks.
+        //
+        // The page count leads the sentence on purpose: the image count is per
+        // XObject, and a page that carries two images (a merged half-page scan)
+        // makes the two numbers differ — reporting only "13 张" read like "13
+        // 页" and looked like a wrong page count.
         let (payload, summary) = if compressed_len < original.len() {
             let gain = 100.0 - compressed_len as f64 / original.len() as f64 * 100.0;
+            // A page can carry two images (a merged half-page scan), so the
+            // image count legitimately exceeds the page count; say so instead
+            // of letting "13 张" read as "13 页".
+            let mixed = if replaced > total as usize {
+                "（有页面含多张图片）"
+            } else {
+                ""
+            };
             (
                 compressed,
                 format!(
-                    "已压缩：{} → {}（−{gain:.0}%）；重编码图片 {replaced} 张、跳过 {skipped} 张，清理未引用对象 {} 个",
+                    "已压缩：{} → {}（−{gain:.0}%）；{total} 页，重编码图片 {replaced} 张{mixed}、跳过 {skipped} 张，清理未引用对象 {} 个",
                     fmt_size(original.len()),
                     fmt_size(compressed_len),
                     orphans.len(),
@@ -136,7 +154,7 @@ impl Tool for Compress {
             (
                 original,
                 format!(
-                    "未能进一步减小体积（原文件已充分优化），已按原样保存；重编码图片 {replaced} 张，清理未引用对象 {} 个",
+                    "未能进一步减小体积（原文件已充分优化），已按原样保存；{total} 页，重编码图片 {replaced} 张，清理未引用对象 {} 个",
                     orphans.len(),
                 ),
             )
@@ -150,40 +168,19 @@ impl Tool for Compress {
 }
 
 /// Re-encode every compressible image XObject; returns (replaced, skipped).
+///
+/// `stale` holds the objects the orphan sweep is about to delete: an image
+/// nothing references is not part of the document, so decoding and re-encoding
+/// it would waste a round-trip and inflate the reported image count.
 fn compress_images(
     doc: &mut lopdf::Document,
     drawn: &BTreeMap<ObjectId, (f32, f32)>,
+    stale: &BTreeSet<ObjectId>,
     level: CompressLevel,
     progress: &Progress,
     cancel: &CancelFlag,
 ) -> Result<(usize, usize), ToolError> {
-    // Masks are optimised alongside the image that references them (a JPEG
-    // round-trip would blur what is usually a bilevel alpha shape).
-    let masks: BTreeSet<ObjectId> = doc
-        .objects
-        .values()
-        .filter_map(|object| object.as_stream().ok())
-        .filter(|stream| is_image_object(&stream.dict))
-        .filter_map(|stream| {
-            for key in [&b"SMask"[..], b"Mask"] {
-                if let Ok(Object::Reference(id)) = stream.dict.get(key) {
-                    return Some(*id);
-                }
-            }
-            None
-        })
-        .collect();
-    let images: Vec<ObjectId> = doc
-        .objects
-        .iter()
-        .filter(|(id, object)| {
-            !masks.contains(id)
-                && object
-                    .as_stream()
-                    .is_ok_and(|stream| is_image_object(&stream.dict))
-        })
-        .map(|(id, _)| *id)
-        .collect();
+    let images = compressible_images(doc, stale);
 
     let mut replaced = 0usize;
     let mut skipped = 0usize;
@@ -563,6 +560,44 @@ fn page_xobjects(
     Some(map)
 }
 
+/// Image XObjects worth re-encoding: still reachable, and not a mask.
+///
+/// Masks are optimised alongside the image that references them (a JPEG
+/// round-trip would blur what is usually a bilevel alpha shape). `stale` is the
+/// orphan set — an image nothing references is about to be deleted, so it must
+/// not be decoded, re-encoded or counted.
+fn compressible_images(doc: &lopdf::Document, stale: &BTreeSet<ObjectId>) -> Vec<ObjectId> {
+    let masks = mask_ids(doc);
+    doc.objects
+        .iter()
+        .filter(|(id, object)| {
+            !stale.contains(id)
+                && !masks.contains(id)
+                && object
+                    .as_stream()
+                    .is_ok_and(|stream| is_image_object(&stream.dict))
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Objects an image uses as its soft mask / mask.
+fn mask_ids(doc: &lopdf::Document) -> BTreeSet<ObjectId> {
+    doc.objects
+        .values()
+        .filter_map(|object| object.as_stream().ok())
+        .filter(|stream| is_image_object(&stream.dict))
+        .filter_map(|stream| {
+            for key in [&b"SMask"[..], b"Mask"] {
+                if let Ok(Object::Reference(id)) = stream.dict.get(key) {
+                    return Some(*id);
+                }
+            }
+            None
+        })
+        .collect()
+}
+
 /// The page's parsed content operations: `/Contents` may be one reference or an
 /// array of them, each stream optionally filtered.
 fn page_content_operations(
@@ -730,6 +765,54 @@ mod tests {
             drawn.get(&image_id),
             Some(&(400.0, 400.0)),
             "the scan must find the drawn rectangle, got {drawn:?}"
+        );
+    }
+
+    /// Leftovers must not be decoded, re-encoded or counted: an unreferenced
+    /// image is deleted by the orphan sweep, and a mask is optimised with the
+    /// image it masks. Either one showing up here made the summary report more
+    /// images than the document contains.
+    #[test]
+    fn compressible_images_skip_orphans_and_masks() {
+        use lopdf::{dictionary, ObjectId, Stream};
+
+        let mut doc = lopdf::Document::with_version("1.5");
+        let image = |doc: &mut lopdf::Document, width: i64| {
+            doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => width,
+                    "Height" => width,
+                    "ColorSpace" => "DeviceRGB",
+                    "BitsPerComponent" => 8i64,
+                },
+                vec![0u8; 16],
+            ))
+        };
+        let used = image(&mut doc, 100);
+        let orphan = image(&mut doc, 200);
+        let mask = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 100i64,
+                "Height" => 100i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8i64,
+            },
+            vec![0u8; 8],
+        ));
+        if let Ok(lopdf::Object::Stream(stream)) = doc.get_object_mut(used) {
+            stream.dict.set("SMask", lopdf::Object::Reference(mask));
+        }
+
+        let stale: BTreeSet<ObjectId> = BTreeSet::from([orphan]);
+        let images = compressible_images(&doc, &stale);
+        assert_eq!(
+            images,
+            vec![used],
+            "只有被引用的非蒙版图片参与重编码：{images:?}"
         );
     }
 }
